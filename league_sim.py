@@ -10,7 +10,7 @@ from state import (
     set_current_date,
     update_state_with_game,
 )
-from trades_ai import _run_ai_gm_tick_if_needed
+from trade_ai import _run_ai_gm_tick_if_needed
 from match_engine import Team, MatchEngine
 
 
@@ -159,3 +159,4 @@ def simulate_single_game(
     )
 
     return result
+
