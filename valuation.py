@@ -1,52 +1,53 @@
 from __future__ import annotations
 
-"""
-valuation.py
+"""valuation.py
 
 Trade valuation layer.
 
-Key principle:
+Key principle
 - valuation.py produces numeric "utility/value" signals.
-- trade_engine.py (later) uses those values + rules to accept/decline/iterate offers.
+- trade_engine.py uses those values + rules to accept/decline/iterate offers.
 
-This module is intentionally conservative: it uses simple heuristics with clear knobs,
-and relies on external context when available.
+This module intentionally uses clear, debuggable heuristics. You'll tune it over time.
 
-Inputs it can consume:
-- GAME_STATE["players"][pid]  (from team_utils._init_players_and_teams_if_needed)
-- GAME_STATE["teams"][tid]    (tendency/window/market/patience)
-- contracts.get_contract(pid) (years_left, salary curve, etc.)
-- assets.get_pick(pick_id)    (draft pick metadata)
-- team_utils._evaluate_team_needs(...) output (status/need_positions/surplus_positions)
+This revision adds:
+- GM profiles (team meta -> gm_profile dict) and relationships scaffold
+- draft pick valuation using a probability distribution + protection "chain"
 
-You will likely expand:
-- a real projection model for pick ranges
-- better "fit" metrics using playstyle tags
-- market scarcity and deadline dynamics
+Notes
+- We try to avoid mutating state in valuation, but we *do* setdefault missing GM/relationship
+  fields because other modules depend on them being present.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import math
+import random
+import zlib
 
 try:
-    from state import GAME_STATE
+    from state import GAME_STATE, _ensure_league_state
 except Exception:  # pragma: no cover
     GAME_STATE: Dict[str, Any] = {"league": {}, "players": {}, "teams": {}}
 
+    def _ensure_league_state() -> Dict[str, Any]:
+        return GAME_STATE.setdefault("league", {})
+
 from contracts import ensure_contracts_initialized, salary_of_player, get_contract
-from assets import DraftPick, get_pick, ensure_draft_picks_initialized
+from assets import DraftPick, get_pick, ensure_draft_picks_initialized, protection_chain
 
 
-# -------------------------
-# Context models (lightweight)
-# -------------------------
+# ---------------------------------------------------------------------
+# Context models
+# ---------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class MarketContext:
     """League-wide modifiers (scarcity, deadline, etc.)."""
-    deadline_pressure: float = 0.0   # 0..1 (0=none, 1=deadline day)
-    scarcity_by_role: Optional[Dict[str, float]] = None  # role -> premium multiplier
+
+    deadline_pressure: float = 0.0  # 0..1 (0=none, 1=deadline day)
+    scarcity_by_role: Optional[Dict[str, float]] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,8 @@ class TeamContext:
     team_id: str
     status: str  # contender | neutral | rebuild
     win_pct: float
+    games_played: int
+    point_diff: float
     need_positions: Tuple[str, ...]
     surplus_positions: Tuple[str, ...]
     gm_profile: Dict[str, Any]
@@ -72,18 +75,149 @@ class PlayerContext:
     years_left: int
 
 
-# -------------------------
-# Building contexts
-# -------------------------
-def build_team_contexts(*, force_recompute: bool = False) -> Dict[str, TeamContext]:
-    """
-    Build per-team context once and reuse during a trade tick.
+# ---------------------------------------------------------------------
+# GM + relationship scaffolding
+# ---------------------------------------------------------------------
 
-    Uses team_utils helpers when available; otherwise falls back to GAME_STATE meta.
+_DEFAULT_GM_KEYS = (
+    "aggressiveness",
+    "risk_aversion",
+    "pick_hoarder",
+    "youth_bias",
+    "hardball",
+    "rival_penalty",
+    "trust_baseline",
+)
+
+
+def _stable_team_seed(team_id: str, *, global_seed: int = 0) -> int:
+    tid = str(team_id or "").upper().encode("utf-8")
+    return int(global_seed) ^ int(zlib.crc32(tid) & 0xFFFFFFFF)
+
+
+def ensure_gm_profiles_initialized(*, force: bool = False) -> None:
+    """Ensure GAME_STATE['teams'][tid]['gm_profile'] exists.
+
+    Creates deterministic pseudo-random profiles using league rng_seed (if any).
     """
-    # Ensure state is at least initialized
+
+    teams = GAME_STATE.get("teams")
+    if not isinstance(teams, dict):
+        return
+
+    league = _ensure_league_state()
+    global_seed = 0
+    if league.get("rng_seed") is not None:
+        try:
+            global_seed = int(league.get("rng_seed") or 0)
+        except Exception:
+            global_seed = 0
+
+    for tid, meta in teams.items():
+        if not isinstance(meta, dict):
+            continue
+        if ("gm_profile" in meta) and isinstance(meta.get("gm_profile"), dict) and not force:
+            # fill missing keys only
+            prof = meta["gm_profile"]
+            for k in _DEFAULT_GM_KEYS:
+                prof.setdefault(k, 0.5)
+            meta["gm_profile"] = prof
+            continue
+
+        rng = random.Random(_stable_team_seed(str(tid), global_seed=global_seed))
+        # Values are 0..1 but not extreme by default.
+        prof = {
+            "aggressiveness": float(rng.uniform(0.25, 0.75)),
+            "risk_aversion": float(rng.uniform(0.25, 0.75)),
+            "pick_hoarder": float(rng.uniform(0.20, 0.80)),
+            "youth_bias": float(rng.uniform(0.20, 0.80)),
+            "hardball": float(rng.uniform(0.25, 0.75)),
+            "rival_penalty": float(rng.uniform(0.30, 0.80)),
+            "trust_baseline": float(rng.uniform(0.40, 0.60)),
+        }
+        # Keep any existing patience key in the top-level meta (team_utils uses it)
+        meta.setdefault("patience", 0.5)
+        meta["gm_profile"] = prof
+
+
+def ensure_relationships_initialized(*, force: bool = False) -> None:
+    """Ensure GAME_STATE['relationships'][A][B] entries exist for all teams."""
+
+    ensure_gm_profiles_initialized()
+
+    rel = GAME_STATE.setdefault("relationships", {})
+    if not isinstance(rel, dict):
+        GAME_STATE["relationships"] = {}
+        rel = GAME_STATE["relationships"]
+
+    teams = GAME_STATE.get("teams")
+    if not isinstance(teams, dict) or not teams:
+        return
+
+    # rival heuristic: same division => rival
+    div_map: Dict[str, str] = {}
+    for tid, meta in teams.items():
+        if isinstance(meta, dict) and meta.get("division"):
+            div_map[str(tid).upper()] = str(meta.get("division"))
+
+    for a in teams.keys():
+        a_u = str(a).upper()
+        rel.setdefault(a_u, {})
+        if not isinstance(rel[a_u], dict):
+            rel[a_u] = {}
+        for b in teams.keys():
+            b_u = str(b).upper()
+            if a_u == b_u:
+                continue
+            if (not force) and isinstance(rel[a_u], dict) and isinstance(rel[a_u].get(b_u), dict):
+                # fill missing keys only
+                entry = rel[a_u][b_u]
+                entry.setdefault("trust", float(teams[a].get("gm_profile", {}).get("trust_baseline", 0.5)))
+                entry.setdefault("trade_count", 0)
+                entry.setdefault("last_trade_date", None)
+                entry.setdefault("rival", bool(div_map.get(a_u) and div_map.get(a_u) == div_map.get(b_u)))
+                continue
+
+            trust0 = float(teams[a].get("gm_profile", {}).get("trust_baseline", 0.5)) if isinstance(teams.get(a), dict) else 0.5
+            rel[a_u][b_u] = {
+                "trust": trust0,
+                "trade_count": 0,
+                "last_trade_date": None,
+                "rival": bool(div_map.get(a_u) and div_map.get(a_u) == div_map.get(b_u)),
+            }
+
+
+def get_relationship(team_id: str, other_team_id: str) -> Dict[str, Any]:
+    """Return relationship entry (ensuring it exists)."""
+
+    ensure_relationships_initialized()
+    rel = GAME_STATE.get("relationships")
+    if not isinstance(rel, dict):
+        return {"trust": 0.5, "trade_count": 0, "last_trade_date": None, "rival": False}
+    a = str(team_id).upper()
+    b = str(other_team_id).upper()
+    a_map = rel.get(a)
+    if not isinstance(a_map, dict):
+        return {"trust": 0.5, "trade_count": 0, "last_trade_date": None, "rival": False}
+    entry = a_map.get(b)
+    if not isinstance(entry, dict):
+        return {"trust": 0.5, "trade_count": 0, "last_trade_date": None, "rival": False}
+    return entry
+
+
+# ---------------------------------------------------------------------
+# Building contexts
+# ---------------------------------------------------------------------
+
+def build_team_contexts(*, force_recompute: bool = False) -> Dict[str, TeamContext]:
+    """Build per-team context once and reuse during a trade tick."""
+
+    ensure_gm_profiles_initialized()
+
+    # Use team_utils if available (records + needs)
     try:
         from team_utils import _init_players_and_teams_if_needed, _compute_team_records, _evaluate_team_needs
+
         _init_players_and_teams_if_needed()
         records = _compute_team_records()
         needs = _evaluate_team_needs(records)
@@ -93,22 +227,45 @@ def build_team_contexts(*, force_recompute: bool = False) -> Dict[str, TeamConte
 
     contexts: Dict[str, TeamContext] = {}
     teams_meta = GAME_STATE.get("teams") or {}
-    for tid, meta in (teams_meta.items() if isinstance(teams_meta, dict) else []):
+    if not isinstance(teams_meta, dict):
+        return contexts
+
+    for tid, meta in teams_meta.items():
         tid_u = str(tid).upper()
         need = needs.get(tid_u) or {}
-        status = str(need.get("status") or meta.get("tendency") or "neutral")
-        win_pct = float(need.get("win_pct") or 0.0)
+
+        rec = records.get(tid_u) or {}
+        wins = int(rec.get("wins", 0) or 0)
+        losses = int(rec.get("losses", 0) or 0)
+        gp = wins + losses
+        win_pct = float(need.get("win_pct") or (wins / gp if gp else 0.0))
+        pf = float(rec.get("pf", 0) or 0)
+        pa = float(rec.get("pa", 0) or 0)
+        point_diff = float(pf - pa)
+
+        status = str(need.get("status") or (meta.get("tendency") if isinstance(meta, dict) else None) or "neutral")
         need_pos = tuple(need.get("need_positions") or ())
         surplus_pos = tuple(need.get("surplus_positions") or ())
-        gm_profile = dict(meta) if isinstance(meta, dict) else {}
+
+        gm_profile = {}
+        if isinstance(meta, dict):
+            gp_meta = meta.get("gm_profile")
+            if isinstance(gp_meta, dict):
+                gm_profile = dict(gp_meta)
+            else:
+                gm_profile = {}
+
         contexts[tid_u] = TeamContext(
             team_id=tid_u,
-            status=status,
-            win_pct=win_pct,
+            status=str(status).lower(),
+            win_pct=float(win_pct),
+            games_played=int(gp),
+            point_diff=float(point_diff),
             need_positions=need_pos,
             surplus_positions=surplus_pos,
             gm_profile=gm_profile,
         )
+
     return contexts
 
 
@@ -135,26 +292,20 @@ def build_player_context(player_id: int) -> Optional[PlayerContext]:
     )
 
 
-# -------------------------
+# ---------------------------------------------------------------------
 # Core valuation functions
-# -------------------------
+# ---------------------------------------------------------------------
+
 def value_player_for_team(
     player_id: int,
     receiving_team_id: str,
     *,
     team_contexts: Optional[Dict[str, TeamContext]] = None,
     market: Optional[MarketContext] = None,
+    trade_partner_id: Optional[str] = None,
 ) -> float:
-    """
-    Returns a numeric value. Higher means more desirable for receiving_team_id.
+    """Return numeric value (higher = better) of player for receiving_team_id."""
 
-    This is intentionally simple (MVP):
-    - base: overall
-    - add: potential (more for rebuild teams)
-    - age curve: win-now prefers prime, rebuild prefers youth
-    - contract penalty/bonus (salary vs ovr, years_left)
-    - fit bonus if the player's position is in need_positions
-    """
     receiving_team_id = str(receiving_team_id).upper()
     ctxs = team_contexts or build_team_contexts()
     team_ctx = ctxs.get(receiving_team_id)
@@ -163,6 +314,8 @@ def value_player_for_team(
             team_id=receiving_team_id,
             status="neutral",
             win_pct=0.0,
+            games_played=0,
+            point_diff=0.0,
             need_positions=tuple(),
             surplus_positions=tuple(),
             gm_profile={},
@@ -172,19 +325,17 @@ def value_player_for_team(
     if not pctx:
         return 0.0
 
-    status = team_ctx.status
+    status = str(team_ctx.status or "neutral").lower()
 
     # --- Base basketball value ---
     v = float(pctx.overall)
 
     # --- Potential/age curves ---
-    if status == "contender":
+    if status.startswith("cont"):
         v += pctx.potential * 4.0
-        # Prime preference: 26-30
         v -= abs(pctx.age - 28) * 0.6
-    elif status == "rebuild":
+    elif status.startswith("reb"):
         v += pctx.potential * 8.0
-        # Youth preference: 19-24
         v -= max(0, pctx.age - 24) * 0.9
     else:
         v += pctx.potential * 6.0
@@ -193,12 +344,11 @@ def value_player_for_team(
     # --- Contract value (very rough) ---
     salary = float(salary_of_player(pctx.player_id))
     years_left = max(0, int(pctx.years_left))
-    # "Cost per OVR point" proxy; higher is worse
     cost_per_point = salary / max(1.0, pctx.overall)
-    v -= (cost_per_point / 1_000_000.0) * 0.9  # tune later
-    # Expiring premium: contenders like expirings a bit (flexibility); rebuilders don't mind longer if young
+    v -= (cost_per_point / 1_000_000.0) * 0.9
+
     if years_left <= 1:
-        v += 1.5 if status == "contender" else 0.5
+        v += 1.5 if status.startswith("cont") else 0.5
 
     # --- Fit bonus ---
     pos_group = _pos_group(pctx.pos)
@@ -207,10 +357,9 @@ def value_player_for_team(
     if pos_group and pos_group in team_ctx.surplus_positions:
         v -= 1.0
 
-    # --- GM personality nudge (uses existing team meta keys if present) ---
-    patience = float(team_ctx.gm_profile.get("patience", 0.5) or 0.5)
-    # Low patience teams overvalue immediate help
-    if status == "contender":
+    # --- GM personality nudge (still small; big levers live in trade_ai thresholds) ---
+    patience = float(GAME_STATE.get("teams", {}).get(receiving_team_id, {}).get("patience", 0.5) or 0.5)  # type: ignore[arg-type]
+    if status.startswith("cont"):
         v += (0.5 - patience) * 2.0
 
     # --- Market deadline pressure (small) ---
@@ -220,55 +369,178 @@ def value_player_for_team(
     return float(v)
 
 
+# -------------------------
+# Pick valuation (distribution + protection chain)
+# -------------------------
+
+def pick_position_distribution(
+    original_team_ctx: TeamContext,
+    *,
+    draft_year: int,
+) -> List[float]:
+    """Return probability distribution over pick number 1..30 for original_team in draft_year."""
+
+    # year_offset: 0 means next upcoming draft (league_season_year + 1)
+    base_draft_year = _league_season_year() + 1
+    year_offset = max(0, int(draft_year) - int(base_draft_year))
+
+    status = str(original_team_ctx.status or "neutral").lower()
+    tau = 2.0
+    if status.startswith("cont"):
+        tau = 3.0
+    elif status.startswith("reb"):
+        tau = 1.2
+
+    wp = max(0.0, min(1.0, float(original_team_ctx.win_pct)))
+    proj_win = 0.5 + (wp - 0.5) * math.exp(-float(year_offset) / max(0.5, tau))
+
+    mu = 1.0 + proj_win * 29.0  # high win -> later pick (near 30)
+
+    gp = max(0, int(original_team_ctx.games_played))
+    early_bonus = max(0.0, (20 - gp) * 0.08)
+
+    sigma = 3.5 + year_offset * 1.2 + early_bonus
+    sigma = max(1.8, float(sigma))
+
+    weights: List[float] = []
+    for k in range(1, 31):
+        z = (float(k) - mu) / sigma
+        weights.append(math.exp(-0.5 * z * z))
+
+    s = sum(weights)
+    if s <= 0:
+        return [1.0 / 30.0] * 30
+    return [w / s for w in weights]
+
+
+def _value_unprotected_from_dist(dist: List[float], *, round: int) -> float:
+    """Expected pick value from a distribution over 1..30."""
+
+    if not dist or len(dist) != 30:
+        return 0.0
+
+    v = 0.0
+    for i, p in enumerate(dist):
+        pick_num = i + 1
+        v += float(p) * _pick_value_from_expected_number(pick_num, round=round)
+    return float(v)
+
+
+def _conditional_tail(dist: List[float], start_pick_num: int) -> List[float]:
+    """Return conditional distribution for picks >= start_pick_num."""
+
+    start_pick_num = max(1, min(30, int(start_pick_num)))
+    idx = start_pick_num - 1
+    tail = dist[idx:]
+    s = sum(tail)
+    if s <= 1e-12:
+        # if tail is impossible, return a flat distribution on the tail domain
+        n = len(tail)
+        return [1.0 / max(1, n)] * n
+    return [x / s for x in tail]
+
+
 def value_pick_for_team(
     pick_id: str,
     receiving_team_id: str,
     *,
     team_contexts: Optional[Dict[str, TeamContext]] = None,
     market: Optional[MarketContext] = None,
+    trade_partner_id: Optional[str] = None,
 ) -> float:
+    """Value a draft pick for a receiving team.
+
+    This version:
+    - projects the original owner's pick range using a probability distribution
+    - applies protection chains via expectation over convey probability
+    - time-discounts future picks
+    - scales for team direction and GM preferences
     """
-    Value a draft pick for a receiving team.
-    Depends on:
-    - original owner's outlook (win_pct/status) -> expected pick range
-    - protection -> discount
-    - time discount for far future
-    - rebuild teams weight picks higher
-    """
+
     ensure_draft_picks_initialized()
     receiving_team_id = str(receiving_team_id).upper()
-    p = get_pick(pick_id)
-    if not p:
+
+    pick = get_pick(pick_id)
+    if not pick:
         return 0.0
 
     ctxs = team_contexts or build_team_contexts()
-    recv_ctx = ctxs.get(receiving_team_id)
-    if not recv_ctx:
-        recv_ctx = TeamContext(receiving_team_id, "neutral", 0.0, tuple(), tuple(), {})
+    recv_ctx = ctxs.get(receiving_team_id) or TeamContext(receiving_team_id, "neutral", 0.0, 0, 0.0, tuple(), tuple(), {})
+    orig_ctx = ctxs.get(str(pick.original_owner).upper()) or TeamContext(str(pick.original_owner).upper(), "neutral", 0.5, 0, 0.0, tuple(), tuple(), {})
 
-    orig_ctx = ctxs.get(str(p.original_owner).upper())
-    if not orig_ctx:
-        # fallback: use whatever team meta is available
-        orig_ctx = TeamContext(str(p.original_owner).upper(), "neutral", 0.5, tuple(), tuple(), {})
+    chain = protection_chain(pick)
+    if not chain:
+        chain = [{"year": int(pick.season_year), "type": "none"}]
 
-    expected_pick = _expected_pick_number_from_win_pct(orig_ctx.win_pct)
-    base = _pick_value_from_expected_number(expected_pick, round=int(p.round))
+    # chain length penalty (very small, keeps multi-hop protection from being overvalued)
+    chain_penalty = 0.97 ** max(0, len(chain) - 1)
 
-    # Protection discount
-    base *= _protection_multiplier(p.protection)
+    reach_prob = 1.0
+    ev = 0.0
 
-    # Time discount
-    years_out = max(0, int(p.season_year) - (_league_season_year() + 1))
-    base *= (0.92 ** years_out)
+    for step in chain:
+        year = int(step.get("year", pick.season_year) or pick.season_year)
+        year_offset = max(0, year - (_league_season_year() + 1))
+        dist = pick_position_distribution(orig_ctx, draft_year=year)
+        disc = 0.92 ** year_offset
 
-    # Team direction scaling (rebuild wants picks)
-    if recv_ctx.status == "rebuild":
+        t = str(step.get("type", "none") or "none").lower()
+        if t in ("none", "unprotected", "unprot"):
+            ev += reach_prob * disc * _value_unprotected_from_dist(dist, round=int(pick.round))
+            reach_prob = 0.0
+            break
+
+        if t == "top_n":
+            n = int(step.get("n", 10) or 10)
+            n = max(1, min(30, n))
+            p_protected = float(sum(dist[:n]))
+            p_convey = max(0.0, 1.0 - p_protected)
+
+            if p_convey > 1e-9:
+                tail_cond = _conditional_tail(dist, n + 1)  # distribution over (n+1..30)
+                # expand tail_cond back to len=30 for valuation helper
+                tail_dist = [0.0] * n + tail_cond
+                ev += reach_prob * p_convey * disc * _value_unprotected_from_dist(tail_dist, round=int(pick.round))
+
+            reach_prob *= p_protected
+            continue
+
+        # Unknown types: apply conservative discount and end.
+        ev += reach_prob * disc * _value_unprotected_from_dist(dist, round=int(pick.round)) * 0.75
+        reach_prob = 0.0
+        break
+
+    # If never conveys, apply convert_to if present
+    if reach_prob > 1e-9:
+        convert_to = pick.protection.get("convert_to") if isinstance(pick.protection, dict) else None
+        if isinstance(convert_to, dict):
+            cy = int(convert_to.get("year", pick.season_year + 1) or (pick.season_year + 1))
+            cr = int(convert_to.get("round", 2) or 2)
+            year_offset = max(0, cy - (_league_season_year() + 1))
+            disc = 0.92 ** year_offset
+            # approximate converted pick as a late-ish pick in that round
+            conv_val = _pick_value_from_expected_number(26, round=cr)
+            ev += reach_prob * disc * conv_val
+        else:
+            ev += reach_prob * 0.0
+
+    base = float(ev) * float(chain_penalty)
+
+    # Team direction scaling
+    status = str(recv_ctx.status or "neutral").lower()
+    if status.startswith("reb"):
         base *= 1.25
-    elif recv_ctx.status == "contender":
+    elif status.startswith("cont"):
         base *= 0.90
 
-    # Deadline pressure: contenders may pay more for "win-now" and less for picks
-    if market and recv_ctx.status == "contender":
+    # GM preferences (small but meaningful)
+    pick_hoarder = float(recv_ctx.gm_profile.get("pick_hoarder", 0.5) or 0.5)
+    youth_bias = float(recv_ctx.gm_profile.get("youth_bias", 0.5) or 0.5)
+    base *= (1.0 + (pick_hoarder - 0.5) * 0.30)
+    base *= (1.0 + (youth_bias - 0.5) * 0.12)
+
+    # Deadline pressure: contenders value picks slightly less near deadline
+    if market and status.startswith("cont"):
         base *= (1.0 - 0.05 * float(market.deadline_pressure))
 
     return float(base)
@@ -281,30 +553,30 @@ def package_value_for_team(
     pick_ids: Optional[List[str]] = None,
     team_contexts: Optional[Dict[str, TeamContext]] = None,
     market: Optional[MarketContext] = None,
+    trade_partner_id: Optional[str] = None,
 ) -> float:
     """Convenience: value a bundle of assets for a team."""
+
     total = 0.0
     for pid in (player_ids or []):
-        total += value_player_for_team(pid, receiving_team_id, team_contexts=team_contexts, market=market)
+        total += value_player_for_team(pid, receiving_team_id, team_contexts=team_contexts, market=market, trade_partner_id=trade_partner_id)
     for pk in (pick_ids or []):
-        total += value_pick_for_team(pk, receiving_team_id, team_contexts=team_contexts, market=market)
+        total += value_pick_for_team(pk, receiving_team_id, team_contexts=team_contexts, market=market, trade_partner_id=trade_partner_id)
     return float(total)
 
 
-# -------------------------
+# ---------------------------------------------------------------------
 # Internal helpers
-# -------------------------
+# ---------------------------------------------------------------------
+
 def _league_season_year() -> int:
-    try:
-        from state import _ensure_league_state
-        league = _ensure_league_state()
-        y = league.get("season_year")
-        if isinstance(y, int) and y > 0:
-            return y
-    except Exception:
-        pass
+    league = _ensure_league_state()
+    y = league.get("season_year")
+    if isinstance(y, int) and y > 0:
+        return y
     try:
         from datetime import date
+
         return date.today().year
     except Exception:  # pragma: no cover
         return 2025
@@ -312,58 +584,25 @@ def _league_season_year() -> int:
 
 def _pos_group(pos: str) -> str:
     """Use the existing team_utils mapping if available; otherwise a simple fallback."""
+
     try:
         from team_utils import _position_group  # type: ignore
+
         return str(_position_group(pos))
     except Exception:
         p = str(pos).upper()
-        if "G" in p and "F" in p:
-            return "G"
-        if p.startswith("P") or "C" in p:
-            return "C"
-        if "F" in p:
-            return "F"
-        return "G"
+        if p in ("PG", "SG"):
+            return "guard"
+        if p in ("SF", "PF"):
+            return "wing"
+        return "big"
 
 
-def _expected_pick_number_from_win_pct(win_pct: float) -> int:
-    """
-    Rough mapping: win_pct -> expected pick number (1..30).
-    - win_pct 0.0 -> ~1
-    - win_pct 0.5 -> ~15-16
-    - win_pct 1.0 -> ~30
-    """
-    wp = max(0.0, min(1.0, float(win_pct)))
-    # invert: better team => later pick
-    pick = int(round(1 + wp * 29))
-    return max(1, min(30, pick))
+def _pick_value_from_expected_number(expected_pick: int, *, round: int = 1) -> float:
+    """Convert expected pick number into a value signal."""
 
-
-def _pick_value_from_expected_number(expected_pick: int, round: int = 1) -> float:
-    """
-    Convert expected pick number into a value signal.
-    Higher value for earlier picks. Round 2 is discounted.
-    """
     n = max(1, min(30, int(expected_pick)))
-    # convex curve: top picks are disproportionately valuable
     v = (31 - n) ** 1.15
     if int(round) == 2:
         v *= 0.35
     return float(v)
-
-
-def _protection_multiplier(protection: Optional[Dict[str, Any]]) -> float:
-    """Very rough discount for protected/conditional picks."""
-    if not protection:
-        return 1.0
-    t = str(protection.get("type", "")).lower()
-    if t == "top_n":
-        n = int(protection.get("n", 10) or 10)
-        n = max(1, min(30, n))
-        # more protection => less valuable
-        return float(max(0.35, 1.0 - (n / 30.0) * 0.8))
-    if t == "lottery":
-        return 0.65
-    if t == "heavily_protected":
-        return 0.45
-    return 0.75
