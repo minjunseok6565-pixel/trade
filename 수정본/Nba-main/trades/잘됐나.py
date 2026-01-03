@@ -57,6 +57,31 @@ def _get_pick(game_state: dict, pick_id: str) -> dict:
     return pick
 
 
+def get_current_draft_year(game_state: dict, season_year_fallback: Optional[int] = None) -> int:
+    """
+    Return the *draft year* for the current season (e.g., 2025-26 season => 2026).
+
+    Source of truth priority:
+    1) game_state["league"]["draft_year"] if present
+    2) game_state["league"]["season_year"] + 1 (season_year is season-start year)
+    3) season_year_fallback + 1 (fallback treated as season-start year)
+
+    Raises ValueError if none are available.
+    """
+    league = (game_state.get("league") or {})
+
+    if league.get("draft_year") is not None:
+        return int(league["draft_year"])
+
+    if league.get("season_year") is not None:
+        return int(league["season_year"]) + 1
+
+    if season_year_fallback is not None:
+        return int(season_year_fallback) + 1
+
+    raise ValueError("Cannot determine draft_year: set league.draft_year or league.season_year")
+
+
 # -----------------------------
 # Draft pick creation / ensuring
 # -----------------------------
@@ -164,17 +189,18 @@ def transfer_pick(game_state: dict, pick_id: str, from_team: str, to_team: str) 
 def validate_pick_year_window(
     game_state: dict,
     pick_ids: Iterable[str],
-    current_season_year: int,
+    current_season_year: Optional[int] = None,
     max_years_ahead: int = 7,
 ) -> None:
     """
     7-year rule:
-    You may not trade a pick with pick.year > current_season_year + max_years_ahead.
+    You may not trade a pick with pick.year > (draft_year + max_years_ahead).
     """
     if max_years_ahead < 0:
         raise ValueError("max_years_ahead must be >= 0")
 
-    limit_year = int(current_season_year) + int(max_years_ahead)
+    draft_year = get_current_draft_year(game_state, season_year_fallback=current_season_year)
+    limit_year = int(draft_year) + int(max_years_ahead)
     draft_picks = game_state.get("draft_picks") or {}
 
     for pick_id in pick_ids:
@@ -202,7 +228,7 @@ def validate_pick_year_window(
 def validate_stepien_rule_after_transfers(
     game_state: dict,
     pick_transfers: List[Tuple[str, str, str]],
-    current_season_year: int,
+    current_season_year: Optional[int] = None,
     lookahead_years: int = 7,
     teams_to_check: Optional[Set[str]] = None,
 ) -> None:
@@ -257,8 +283,9 @@ def validate_stepien_rule_after_transfers(
     if not teams:
         return  # no picks moved => no Stepien impact
 
-    start_year = int(current_season_year) + 1
-    end_year = int(current_season_year) + int(lookahead_years)  # inclusive
+    draft_year = get_current_draft_year(game_state, season_year_fallback=current_season_year)
+    start_year = int(draft_year) + 1
+    end_year = int(draft_year) + int(lookahead_years)  # inclusive
 
     for team in teams:
         first_round_count: Dict[int, int] = {y: 0 for y in range(start_year, end_year + 1)}
