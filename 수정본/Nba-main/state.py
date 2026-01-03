@@ -46,6 +46,7 @@ GAME_STATE: Dict[str, Any] = {
     "postseason": {},  # 플레이-인/플레이오프 시뮬레이션 결과 캐시
     "league": {
         "season_year": None,
+        "draft_year": None,  # 드래프트 연도(예: 2025-26 시즌이면 2026)
         "season_start": None,  # YYYY-MM-DD
         "current_date": None,  # 마지막으로 리그를 진행한 인게임 날짜
         "master_schedule": {
@@ -139,6 +140,7 @@ def _ensure_league_state() -> Dict[str, Any]:
     trade_rules.setdefault("hard_cap", HARD_CAP)
     trade_rules.setdefault("trade_deadline", None)
     league.setdefault("season_year", None)
+    league.setdefault("draft_year", None)
     league.setdefault("season_start", None)
     league.setdefault("current_date", None)
     league.setdefault("last_gm_tick_date", None)
@@ -173,6 +175,12 @@ def _build_master_schedule(season_year: int) -> None:
     """
     league = _ensure_league_state()
     from trades.picks import init_draft_picks_if_needed
+
+    # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
+    # draft_year는 "드래프트 연도" (예: 2025-26 시즌이면 2026)
+    # 픽 생성/Stepien/7년 룰은 draft_year를 기준으로 맞추기 위해 미리 저장해 둔다.
+    league["season_year"] = season_year
+    league["draft_year"] = season_year + 1
 
     init_draft_picks_if_needed(GAME_STATE, season_year, list(ALL_TEAM_IDS))
 
@@ -335,6 +343,7 @@ def _build_master_schedule(season_year: int) -> None:
     master_schedule["by_date"] = by_date
 
     league["season_year"] = season_year
+    league["draft_year"] = season_year + 1
     league["season_start"] = season_start.isoformat()
     trade_deadline_date = date(season_year + 1, 2, 5)
     league["trade_rules"]["trade_deadline"] = trade_deadline_date.isoformat()
@@ -586,3 +595,4 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
