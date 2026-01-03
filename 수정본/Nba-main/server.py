@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, List
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,12 @@ from team_utils import (
     get_team_detail,
 )
 from season_report_ai import generate_season_report
+from trades.errors import TradeError
+from trades.models import canonicalize_deal, parse_deal, serialize_deal
+from trades.validator import validate_deal
+from trades.apply import apply_deal
+from trades import agreements
+from trades import negotiation_store
 
 
 # -------------------------------------------------------------------------
@@ -114,6 +120,24 @@ class ApiKeyRequest(BaseModel):
 class SeasonReportRequest(BaseModel):
     apiKey: str
     user_team_id: str
+
+
+class TradeSubmitRequest(BaseModel):
+    deal: Dict[str, Any]
+
+
+class TradeSubmitCommittedRequest(BaseModel):
+    deal_id: str
+
+
+class TradeNegotiationStartRequest(BaseModel):
+    user_team_id: str
+    other_team_id: str
+
+
+class TradeNegotiationCommitRequest(BaseModel):
+    session_id: str
+    deal: Dict[str, Any]
 
 
 # -------------------------------------------------------------------------
@@ -373,6 +397,86 @@ async def chat_main(req: ChatMainRequest):
 async def chat_main_legacy(req: ChatMainRequest):
     """프론트 JS가 /api/main-llm, userMessage 필드로 호출하던 버전을 위한 호환 엔드포인트."""
     return await chat_main(req)
+
+
+# -------------------------------------------------------------------------
+# 트레이드 API
+# -------------------------------------------------------------------------
+def _trade_error_response(error: TradeError) -> JSONResponse:
+    payload = {
+        "ok": False,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "details": error.details,
+        },
+    }
+    return JSONResponse(status_code=400, content=payload)
+
+
+@app.post("/api/trade/submit")
+async def api_trade_submit(req: TradeSubmitRequest):
+    try:
+        deal = canonicalize_deal(parse_deal(req.deal))
+        validate_deal(deal)
+        transaction = apply_deal(deal, source="menu")
+        return {
+            "ok": True,
+            "deal": serialize_deal(deal),
+            "transaction": transaction,
+        }
+    except TradeError as exc:
+        return _trade_error_response(exc)
+
+
+@app.post("/api/trade/submit-committed")
+async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
+    try:
+        agreements.gc_expired_agreements()
+        deal = agreements.verify_committed_deal(req.deal_id)
+        validate_deal(deal, allow_locked_by_deal_id=req.deal_id)
+        transaction = apply_deal(deal, source="negotiation", deal_id=req.deal_id)
+        agreements.mark_executed(req.deal_id)
+        return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
+    except TradeError as exc:
+        return _trade_error_response(exc)
+
+
+@app.post("/api/trade/negotiation/start")
+async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
+    try:
+        session = negotiation_store.create_session(
+            user_team_id=req.user_team_id, other_team_id=req.other_team_id
+        )
+        return {"ok": True, "session": session}
+    except TradeError as exc:
+        return _trade_error_response(exc)
+
+
+@app.post("/api/trade/negotiation/commit")
+async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
+    try:
+        session = negotiation_store.get_session(req.session_id)
+        deal = canonicalize_deal(parse_deal(req.deal))
+        team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
+        if set(deal.teams) != team_ids or len(deal.teams) != 2:
+            raise TradeError(
+                "DEAL_INVALIDATED",
+                "Deal teams must match negotiation session",
+                {"session_id": req.session_id, "teams": deal.teams},
+            )
+        validate_deal(deal)
+        committed = agreements.create_committed_deal(deal, valid_days=2)
+        negotiation_store.set_draft_deal(req.session_id, serialize_deal(deal))
+        negotiation_store.set_committed(req.session_id, committed["deal_id"])
+        return {
+            "ok": True,
+            "deal_id": committed["deal_id"],
+            "expires_at": committed["expires_at"],
+            "deal": serialize_deal(deal),
+        }
+    except TradeError as exc:
+        return _trade_error_response(exc)
 
 
 # -------------------------------------------------------------------------

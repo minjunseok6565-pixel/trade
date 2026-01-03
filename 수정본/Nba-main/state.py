@@ -19,7 +19,7 @@ from config import (
 # 1. 전역 GAME_STATE 및 스케줄/리그 상태 유틸
 # -------------------------------------------------------------------------
 GAME_STATE: Dict[str, Any] = {
-    "schema_version": "1.1",
+    "schema_version": "1.2",
     "turn": 0,
     "games": [],  # 각 경기의 메타 데이터
     "player_stats": {},  # player_id -> 시즌 누적 스탯
@@ -62,6 +62,10 @@ GAME_STATE: Dict[str, Any] = {
     "teams": {},      # 팀 성향 / 메타 정보
     "players": {},    # 선수 메타 정보
     "transactions": [],  # 트레이드 등 기록
+    "trade_agreements": {},  # deal_id -> committed deal data
+    "negotiations": {},  # session_id -> negotiation sessions
+    "draft_picks": {},  # Phase 3 later
+    "asset_locks": {},  # asset_key -> {deal_id, expires_at}
 }
 
 
@@ -118,7 +122,19 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("season_start", None)
     league.setdefault("current_date", None)
     league.setdefault("last_gm_tick_date", None)
+    _ensure_trade_state()
     return league
+
+
+def _ensure_trade_state() -> None:
+    """트레이드 관련 GAME_STATE 키를 보장한다."""
+    GAME_STATE.setdefault("trade_agreements", {})
+    GAME_STATE.setdefault("negotiations", {})
+    GAME_STATE.setdefault("draft_picks", {})
+    GAME_STATE.setdefault("asset_locks", {})
+
+
+_ensure_league_state()
 
 
 def _build_master_schedule(season_year: int) -> None:
@@ -136,6 +152,9 @@ def _build_master_schedule(season_year: int) -> None:
       * 한 팀은 하루에 최대 1경기
     """
     league = _ensure_league_state()
+    from trades.picks import init_draft_picks_if_needed
+
+    init_draft_picks_if_needed(GAME_STATE, season_year, list(ALL_TEAM_IDS))
 
     season_start = date(season_year, SEASON_START_MONTH, SEASON_START_DAY)
     teams = list(ALL_TEAM_IDS)
