@@ -16,6 +16,7 @@ from state import (
     GAME_STATE,
     _ensure_league_state,
     get_current_date,
+    get_current_date_as_date,
     get_schedule_summary,
     initialize_master_schedule_if_needed,
 )
@@ -417,8 +418,9 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
 @app.post("/api/trade/submit")
 async def api_trade_submit(req: TradeSubmitRequest):
     try:
+        in_game_date = get_current_date_as_date()
         deal = canonicalize_deal(parse_deal(req.deal))
-        validate_deal(deal)
+        validate_deal(deal, current_date=in_game_date)
         transaction = apply_deal(deal, source="menu")
         return {
             "ok": True,
@@ -432,9 +434,14 @@ async def api_trade_submit(req: TradeSubmitRequest):
 @app.post("/api/trade/submit-committed")
 async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
     try:
-        agreements.gc_expired_agreements()
-        deal = agreements.verify_committed_deal(req.deal_id)
-        validate_deal(deal, allow_locked_by_deal_id=req.deal_id)
+        in_game_date = get_current_date_as_date()
+        agreements.gc_expired_agreements(current_date=in_game_date)
+        deal = agreements.verify_committed_deal(req.deal_id, current_date=in_game_date)
+        validate_deal(
+            deal,
+            current_date=in_game_date,
+            allow_locked_by_deal_id=req.deal_id,
+        )
         transaction = apply_deal(deal, source="negotiation", deal_id=req.deal_id)
         agreements.mark_executed(req.deal_id)
         return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
@@ -456,6 +463,7 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
 @app.post("/api/trade/negotiation/commit")
 async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
     try:
+        in_game_date = get_current_date_as_date()
         session = negotiation_store.get_session(req.session_id)
         deal = canonicalize_deal(parse_deal(req.deal))
         team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
@@ -465,8 +473,12 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
                 "Deal teams must match negotiation session",
                 {"session_id": req.session_id, "teams": deal.teams},
             )
-        validate_deal(deal)
-        committed = agreements.create_committed_deal(deal, valid_days=2)
+        validate_deal(deal, current_date=in_game_date)
+        committed = agreements.create_committed_deal(
+            deal,
+            valid_days=2,
+            current_date=in_game_date,
+        )
         negotiation_store.set_draft_deal(req.session_id, serialize_deal(deal))
         negotiation_store.set_committed(req.session_id, committed["deal_id"])
         return {

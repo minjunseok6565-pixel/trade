@@ -86,6 +86,26 @@ def get_current_date() -> Optional[str]:
     return None
 
 
+def get_current_date_as_date() -> date:
+    """Return the league's current in-game date as a date object."""
+    current = get_current_date()
+    if current:
+        try:
+            return date.fromisoformat(str(current))
+        except ValueError:
+            pass
+
+    league = _ensure_league_state()
+    season_start = league.get("season_start")
+    if season_start:
+        try:
+            return date.fromisoformat(str(season_start))
+        except ValueError:
+            pass
+
+    return date.today()
+
+
 def set_current_date(date_str: Optional[str]) -> None:
     """Update the league's current date and mirror it at the legacy location."""
     league = _ensure_league_state()

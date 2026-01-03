@@ -4,7 +4,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from config import ALL_TEAM_IDS, ROSTER_DF
-from state import GAME_STATE, _ensure_league_state
+from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
 from salary_cap import HARD_CAP, compute_payroll_after_player_moves
 
 from .errors import (
@@ -17,6 +17,7 @@ from .errors import (
     HARD_CAP_EXCEEDED,
     ASSET_LOCKED,
     MISSING_TO_TEAM,
+    DUPLICATE_ASSET,
 )
 from .models import Deal, PlayerAsset, PickAsset
 
@@ -50,15 +51,29 @@ def validate_deal(
     trade_deadline = league.get("trade_rules", {}).get("trade_deadline")
     if trade_deadline:
         deadline_date = date.fromisoformat(str(trade_deadline))
-        today = current_date or date.today()
-        if isinstance(today, str):
-            today = date.fromisoformat(today)
+        today = current_date or get_current_date_as_date()
         if today > deadline_date:
             raise TradeError(
                 TRADE_DEADLINE_PASSED,
                 "Trade deadline has passed",
                 {"deadline": trade_deadline},
             )
+
+    seen_assets: Dict[str, str] = {}
+    for team_id, assets in deal.legs.items():
+        for asset in assets:
+            asset_key = _asset_key(asset)
+            if asset_key in seen_assets:
+                raise TradeError(
+                    DUPLICATE_ASSET,
+                    "Duplicate asset in deal",
+                    {
+                        "asset_key": asset_key,
+                        "first_sender": seen_assets[asset_key],
+                        "duplicate_sender": team_id,
+                    },
+                )
+            seen_assets[asset_key] = team_id
 
     for team_id in deal.teams:
         if team_id not in ALL_TEAM_IDS:

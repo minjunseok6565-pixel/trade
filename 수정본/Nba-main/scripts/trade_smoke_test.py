@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
+import sys
 from typing import List, Tuple
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, PROJECT_ROOT)
 
 from config import ROSTER_DF
 from state import GAME_STATE, initialize_master_schedule_if_needed
 from team_utils import _init_players_and_teams_if_needed
 from trades.apply import apply_deal
-from trades.errors import TradeError, ASSET_LOCKED
+from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
 from trades.models import canonicalize_deal, parse_deal
 from trades.validator import validate_deal
 from trades import agreements
@@ -109,6 +115,24 @@ def main() -> None:
     if entry:
         entry["status"] = "INVALIDATED"
 
+    # Test C2: duplicate asset validation
+    payload_dup = {
+        "teams": [team_a, team_b],
+        "legs": {
+            team_a: [
+                {"kind": "player", "player_id": player_c},
+                {"kind": "player", "player_id": player_c},
+            ],
+            team_b: [],
+        },
+    }
+    deal_dup = canonicalize_deal(parse_deal(payload_dup))
+    try:
+        validate_deal(deal_dup)
+        raise AssertionError("Expected duplicate asset error did not occur")
+    except TradeError as exc:
+        assert exc.code == DUPLICATE_ASSET
+
     # Test D: multi-team 3-team trade
     team_x, team_y, team_z = _pick_three_teams()
     player_x = _first_player_for_team(team_x)
@@ -130,6 +154,30 @@ def main() -> None:
     assert str(ROSTER_DF.at[player_x, "Team"]).upper() == team_y
     assert str(ROSTER_DF.at[player_y, "Team"]).upper() == team_z
     assert str(ROSTER_DF.at[player_z, "Team"]).upper() == team_x
+
+    # Test E: pick ownership in committed deal hash
+    picks = GAME_STATE.get("draft_picks", {})
+    pick_candidates = [
+        pick for pick in picks.values() if pick.get("owner_team") == team_a
+    ]
+    if pick_candidates:
+        pick_id = pick_candidates[0]["pick_id"]
+        payload_pick = {
+            "teams": [team_a, team_b],
+            "legs": {
+                team_a: [{"kind": "pick", "pick_id": pick_id}],
+                team_b: [],
+            },
+        }
+        deal_pick = canonicalize_deal(parse_deal(payload_pick))
+        committed_pick = agreements.create_committed_deal(deal_pick)
+        picks[pick_id]["owner_team"] = team_b
+        try:
+            agreements.verify_committed_deal(committed_pick["deal_id"])
+            raise AssertionError("Expected invalidated deal due to pick ownership change")
+        except TradeError as exc:
+            assert exc.code == DEAL_INVALIDATED
+        agreements.release_locks_for_deal(committed_pick["deal_id"])
 
     print("OK")
 

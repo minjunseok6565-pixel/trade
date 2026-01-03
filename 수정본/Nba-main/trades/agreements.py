@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from config import ROSTER_DF
-from state import GAME_STATE
+from state import GAME_STATE, get_current_date_as_date
 
 from .errors import (
     TradeError,
@@ -27,30 +27,36 @@ def _asset_key(asset: PlayerAsset | PickAsset) -> str:
 
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, str] = {}
+    draft_picks = GAME_STATE.get("draft_picks", {})
     for assets in deal.legs.values():
         for asset in assets:
+            asset_key = _asset_key(asset)
             if isinstance(asset, PlayerAsset):
                 try:
-                    ownership_snapshot[str(asset.player_id)] = str(
+                    ownership_snapshot[asset_key] = str(
                         ROSTER_DF.at[asset.player_id, "Team"]
                     ).upper()
                 except Exception:
-                    ownership_snapshot[str(asset.player_id)] = ""
+                    ownership_snapshot[asset_key] = ""
+            if isinstance(asset, PickAsset):
+                pick = draft_picks.get(asset.pick_id, {})
+                ownership_snapshot[asset_key] = str(pick.get("owner_team", "")).upper()
 
-    payload = {
-        "deal": serialize_deal(deal),
-        "ownership": ownership_snapshot,
-    }
+    payload = {"deal": serialize_deal(deal), "ownership": ownership_snapshot}
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def create_committed_deal(deal: Deal, valid_days: int = 2) -> Dict[str, Any]:
+def create_committed_deal(
+    deal: Deal,
+    valid_days: int = 2,
+    current_date: Optional[date] = None,
+) -> Dict[str, Any]:
     canonical = canonicalize_deal(deal)
-    validate_deal(canonical)
+    validate_deal(canonical, current_date=current_date or get_current_date_as_date())
     deal_id = str(uuid4())
     assets_hash = _compute_assets_hash(canonical)
-    today = date.today()
+    today = current_date or get_current_date_as_date()
     expires_at = today + timedelta(days=valid_days)
 
     entry = {
@@ -74,7 +80,7 @@ def _lock_assets_for_deal(deal: Deal, deal_id: str, expires_at: str) -> None:
             locks[_asset_key(asset)] = {"deal_id": deal_id, "expires_at": expires_at}
 
 
-def verify_committed_deal(deal_id: str) -> Deal:
+def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> Deal:
     agreements = GAME_STATE.setdefault("trade_agreements", {})
     entry = agreements.get(deal_id)
     if not entry:
@@ -89,7 +95,8 @@ def verify_committed_deal(deal_id: str) -> Deal:
         raise TradeError(DEAL_INVALIDATED, "Deal invalidated")
 
     expires_at = entry.get("expires_at")
-    if expires_at and date.today() > date.fromisoformat(str(expires_at)):
+    today = current_date or get_current_date_as_date()
+    if expires_at and today > date.fromisoformat(str(expires_at)):
         entry["status"] = "EXPIRED"
         release_locks_for_deal(deal_id)
         raise TradeError(DEAL_EXPIRED, "Deal expired")
@@ -132,7 +139,7 @@ def release_locks_for_deal(deal_id: str) -> None:
 
 def gc_expired_agreements(current_date: Optional[date] = None) -> None:
     agreements = GAME_STATE.setdefault("trade_agreements", {})
-    today = current_date or date.today()
+    today = current_date or get_current_date_as_date()
     for deal_id, entry in list(agreements.items()):
         if entry.get("status") != "ACTIVE":
             continue

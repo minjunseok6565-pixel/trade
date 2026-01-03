@@ -6,7 +6,7 @@ from typing import Optional
 import random
 
 from config import ROSTER_DF
-from state import GAME_STATE, _ensure_league_state
+from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
 from trades.apply import apply_deal
 from trades.errors import TradeError
@@ -66,7 +66,9 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     random.shuffle(contenders)
     random.shuffle(rebuilders)
 
-    current_year = league.get("season_year") or (target_date.year if target_date else date.today().year)
+    current_year = league.get("season_year") or (
+        target_date.year if target_date else get_current_date_as_date().year
+    )
 
     for contender in contenders:
         for rebuild in rebuilders:
