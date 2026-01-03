@@ -9,7 +9,6 @@ from salary_cap import HARD_CAP, compute_payroll_after_player_moves
 
 from .errors import (
     TradeError,
-    TRADE_DEADLINE_PASSED,
     INVALID_TEAM,
     PLAYER_NOT_OWNED,
     PICK_NOT_OWNED,
@@ -20,6 +19,7 @@ from .errors import (
     DUPLICATE_ASSET,
 )
 from .models import Deal, PlayerAsset, PickAsset
+from .rules import build_trade_context, validate_all
 
 
 def _asset_key(asset: PlayerAsset | PickAsset) -> str:
@@ -47,102 +47,27 @@ def validate_deal(
     current_date: Optional[date] = None,
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
-    league = _ensure_league_state()
-    trade_deadline = league.get("trade_rules", {}).get("trade_deadline")
-    if trade_deadline:
-        deadline_date = date.fromisoformat(str(trade_deadline))
-        today = current_date or get_current_date_as_date()
-        if today > deadline_date:
-            raise TradeError(
-                TRADE_DEADLINE_PASSED,
-                "Trade deadline has passed",
-                {"deadline": trade_deadline},
-            )
+    _ensure_league_state()
 
-    seen_assets: Dict[str, str] = {}
-    for team_id, assets in deal.legs.items():
-        for asset in assets:
-            asset_key = _asset_key(asset)
-            if asset_key in seen_assets:
-                raise TradeError(
-                    DUPLICATE_ASSET,
-                    "Duplicate asset in deal",
-                    {
-                        "asset_key": asset_key,
-                        "first_sender": seen_assets[asset_key],
-                        "duplicate_sender": team_id,
-                    },
-                )
-            seen_assets[asset_key] = team_id
+    # RULES ENGINE CHECKS (migrated): deadline
+    ctx = build_trade_context(current_date=current_date)
+    validate_all(deal, ctx)
 
-    for team_id in deal.teams:
-        if team_id not in ALL_TEAM_IDS:
-            raise TradeError(INVALID_TEAM, f"Invalid team {team_id}")
+    # LEGACY CHECKS (to be migrated later): locks/ownership/roster/cap/...
+    # === MIGRATE:DUPLICATE_ASSET:START ===
+    # migrated to rules engine: DuplicateAssetRule
+    # === MIGRATE:DUPLICATE_ASSET:END ===
 
-    asset_locks = GAME_STATE.get("asset_locks", {})
-    for team_id, assets in deal.legs.items():
-        for asset in assets:
-            asset_key = _asset_key(asset)
-            lock = asset_locks.get(asset_key)
-            if not lock:
-                continue
-            locked_deal_id = lock.get("deal_id")
-            expires_at = lock.get("expires_at")
-            if expires_at is not None:
-                try:
-                    if isinstance(expires_at, date):
-                        expires_at_date = expires_at
-                    else:
-                        expires_at_date = date.fromisoformat(str(expires_at))
-                except ValueError:
-                    raise TradeError(
-                        ASSET_LOCKED,
-                        "Asset lock expiry could not be parsed",
-                        {
-                            "asset_key": asset_key,
-                            "deal_id": locked_deal_id,
-                            "expires_at": expires_at,
-                        },
-                    )
-                today = current_date or get_current_date_as_date()
-                if today > expires_at_date:
-                    asset_locks.pop(asset_key, None)
-                    continue
-            if allow_locked_by_deal_id and locked_deal_id == allow_locked_by_deal_id:
-                continue
-            raise TradeError(
-                ASSET_LOCKED,
-                "Asset is locked",
-                {"asset_key": asset_key, "deal_id": locked_deal_id},
-            )
+    # === MIGRATE:TEAM_LEGS:START ===
+    # migrated to rules engine: TeamLegsRule
+    # === MIGRATE:TEAM_LEGS:END ===
+    # === MIGRATE:ASSET_LOCKS:START ===
+    # migrated to rules engine: AssetLockRule
+    # === MIGRATE:ASSET_LOCKS:END ===
 
-        for asset in assets:
-            if isinstance(asset, PlayerAsset):
-                try:
-                    current_team = str(ROSTER_DF.at[asset.player_id, "Team"]).upper()
-                except Exception:
-                    current_team = ""
-                if current_team != team_id:
-                    raise TradeError(
-                        PLAYER_NOT_OWNED,
-                        "Player not owned by team",
-                        {"player_id": asset.player_id, "team_id": team_id},
-                    )
-            if isinstance(asset, PickAsset):
-                draft_picks = GAME_STATE.get("draft_picks", {})
-                pick = draft_picks.get(asset.pick_id)
-                if not pick:
-                    raise TradeError(
-                        PICK_NOT_OWNED,
-                        "Pick not found",
-                        {"pick_id": asset.pick_id, "team_id": team_id},
-                    )
-                if str(pick.get("owner_team", "")).upper() != team_id:
-                    raise TradeError(
-                        PICK_NOT_OWNED,
-                        "Pick not owned by team",
-                        {"pick_id": asset.pick_id, "team_id": team_id},
-                    )
+        # === MIGRATE:OWNERSHIP:START ===
+        # migrated to rules engine: OwnershipRule
+        # === MIGRATE:OWNERSHIP:END ===
 
     roster_counts: Dict[str, int] = {
         team_id: int((ROSTER_DF["Team"] == team_id).sum()) for team_id in deal.teams
@@ -184,25 +109,13 @@ def validate_deal(
                     )
 
     for team_id in deal.teams:
-        new_count = roster_counts[team_id] - len(players_out[team_id]) + len(players_in[team_id])
-        if new_count > 15:
-            raise TradeError(
-                ROSTER_LIMIT,
-                "Roster limit exceeded",
-                {"team_id": team_id, "count": new_count},
-            )
+        # === MIGRATE:ROSTER_LIMIT:START ===
+        # migrated to rules engine: RosterLimitRule
+        # === MIGRATE:ROSTER_LIMIT:END ===
 
-        payroll_after = compute_payroll_after_player_moves(
-            team_id,
-            players_out[team_id],
-            players_in[team_id],
-        )
-        if payroll_after > HARD_CAP:
-            raise TradeError(
-                HARD_CAP_EXCEEDED,
-                "Hard cap exceeded",
-                {"team_id": team_id, "payroll": payroll_after, "hard_cap": HARD_CAP},
-            )
+        # === MIGRATE:HARD_CAP:START ===
+        # migrated to rules engine: HardCapRule
+        # === MIGRATE:HARD_CAP:END ===
 
 
 if __name__ == "__main__":
