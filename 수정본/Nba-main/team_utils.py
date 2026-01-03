@@ -419,3 +419,20 @@ def _player_value_for_team(player_row: pd.Series, team_status: str) -> float:
     value -= (salary / 10_000_000.0)
 
     return float(value)
+
+
+def get_team_status_map() -> Dict[str, str]:
+    """팀별 상태(contender/rebuild/neutral)를 반환."""
+    records = _compute_team_records()
+    team_needs = _evaluate_team_needs(records)
+    return {tid: info.get("status", "neutral") for tid, info in team_needs.items()}
+
+
+def estimate_player_value(player_id: int, team_id: str) -> float:
+    """team_id 기준으로 player_id의 대략적인 가치를 계산."""
+    team_status_map = get_team_status_map()
+    status = team_status_map.get(team_id, "neutral")
+    if player_id not in ROSTER_DF.index:
+        return 0.0
+    row = ROSTER_DF.loc[player_id]
+    return _player_value_for_team(row, status)

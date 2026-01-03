@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from config import ROSTER_DF
+from team_utils import _init_players_and_teams_if_needed
+from state import GAME_STATE
+
+from .errors import TradeError, APPLY_FAILED
+from .models import Deal, PlayerAsset, PickAsset
+from .picks import transfer_pick
+from .transaction_log import append_trade_transaction
+
+
+def _collect_player_ids(deal: Deal) -> List[int]:
+    player_ids: List[int] = []
+    for assets in deal.legs.values():
+        for asset in assets:
+            if isinstance(asset, PlayerAsset):
+                player_ids.append(asset.player_id)
+    return player_ids
+
+
+def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset | PickAsset) -> str:
+    if asset.to_team:
+        return asset.to_team
+    if len(deal.teams) == 2:
+        other_team = [team for team in deal.teams if team != sender_team]
+        if other_team:
+            return other_team[0]
+    raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
+
+
+def apply_deal(deal: Deal, source: str, deal_id: Optional[str] = None) -> Dict[str, Any]:
+    _init_players_and_teams_if_needed()
+    player_ids = _collect_player_ids(deal)
+    original_teams: Dict[int, str] = {}
+    original_pick_owners: Dict[str, str] = {}
+
+    try:
+        for player_id in player_ids:
+            try:
+                original_teams[player_id] = str(ROSTER_DF.at[player_id, "Team"]).upper()
+            except Exception:
+                original_teams[player_id] = ""
+
+        for from_team, assets in deal.legs.items():
+            for asset in assets:
+                to_team = _resolve_receiver(deal, from_team, asset)
+                if isinstance(asset, PlayerAsset):
+                    if asset.player_id not in ROSTER_DF.index:
+                        raise KeyError(f"Player {asset.player_id} not found")
+                    ROSTER_DF.at[asset.player_id, "Team"] = to_team
+                    player_state = GAME_STATE.get("players", {}).get(asset.player_id)
+                    if player_state is not None:
+                        player_state["team_id"] = to_team
+                if isinstance(asset, PickAsset):
+                    draft_picks = GAME_STATE.get("draft_picks", {})
+                    pick = draft_picks.get(asset.pick_id)
+                    if pick and asset.pick_id not in original_pick_owners:
+                        original_pick_owners[asset.pick_id] = str(
+                            pick.get("owner_team", "")
+                        ).upper()
+                    transfer_pick(GAME_STATE, asset.pick_id, from_team, to_team)
+
+        transaction = append_trade_transaction(deal, source=source, deal_id=deal_id)
+        return transaction
+    except Exception as exc:
+        for player_id, team_id in original_teams.items():
+            if player_id in ROSTER_DF.index:
+                ROSTER_DF.at[player_id, "Team"] = team_id
+            player_state = GAME_STATE.get("players", {}).get(player_id)
+            if player_state is not None:
+                player_state["team_id"] = team_id
+        draft_picks = GAME_STATE.get("draft_picks", {})
+        for pick_id, owner_team in original_pick_owners.items():
+            pick = draft_picks.get(pick_id)
+            if pick is not None:
+                pick["owner_team"] = owner_team
+        raise TradeError(APPLY_FAILED, "Failed to apply trade", {"error": str(exc)}) from exc
