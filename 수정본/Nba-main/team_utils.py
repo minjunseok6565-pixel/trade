@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from config import HARD_CAP, ROSTER_DF, ALL_TEAM_IDS, TEAM_TO_CONF_DIV
+from config import ROSTER_DF, ALL_TEAM_IDS, TEAM_TO_CONF_DIV
 from state import GAME_STATE, _ensure_league_state, initialize_master_schedule_if_needed
 
 
@@ -97,7 +97,10 @@ def _compute_team_payroll(team_id: str) -> float:
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
-    return HARD_CAP - payroll
+    league = _ensure_league_state()
+    trade_rules = league.get("trade_rules", {})
+    salary_cap = float(trade_rules.get("salary_cap") or 0.0)
+    return salary_cap - payroll
 
 
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:

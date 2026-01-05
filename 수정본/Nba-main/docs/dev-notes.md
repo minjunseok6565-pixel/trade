@@ -15,8 +15,8 @@
 - Team card/detail APIs (`/api/teams`, `/api/team-detail/{id}`) include meta, record, payroll/cap, and per-player season averages; front-end tabs consume them directly.
 - Weekly news flow: `refresh_weekly_news` caches Gemini-generated summaries; front-end `loadWeeklyNewsIfNeeded` renders them when an API key is present.
 
-## AI Trades / Cap & Deadline
-- `HARD_CAP` enforced via `_would_break_hard_cap`; `_run_ai_gm_tick_if_needed` keeps weekly cadence and respects the Feb 5 trade deadline.
+## AI Trades / Deadline
+- `_run_ai_gm_tick_if_needed` keeps weekly cadence and respects the Feb 5 trade deadline.
 - Trades mutate `ROSTER_DF`-backed state and append both transaction logs and news feed items.
 
 ## Observations / Potential Follow-ups

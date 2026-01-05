@@ -5,7 +5,6 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from config import (
-    HARD_CAP,
     ALL_TEAM_IDS,
     TEAM_TO_CONF_DIV,
     SEASON_START_MONTH,
@@ -14,6 +13,23 @@ from config import (
     MAX_GAMES_PER_DAY,
     DIVISIONS,
 )
+
+DEFAULT_TRADE_RULES: Dict[str, Any] = {
+    "trade_deadline": None,
+    "salary_cap": 0.0,
+    "first_apron": 0.0,
+    "second_apron": 0.0,
+    "match_small_out_max": 7_500_000,
+    "match_mid_out_max": 29_000_000,
+    "match_mid_add": 7_500_000,
+    "match_buffer": 250_000,
+    "first_apron_mult": 1.10,
+    "second_apron_mult": 1.00,
+    "new_fa_sign_ban_days": 90,
+    "aggregation_ban_days": 60,
+    "max_pick_years_ahead": 7,
+    "stepien_lookahead": 7,
+}
 
 # -------------------------------------------------------------------------
 # 1. 전역 GAME_STATE 및 스케줄/리그 상태 유틸
@@ -54,10 +70,7 @@ GAME_STATE: Dict[str, Any] = {
             "by_team": {},  # team_id -> [game_id, ...]
             "by_date": {},  # date_str -> [game_id, ...]
         },
-        "trade_rules": {
-            "hard_cap": HARD_CAP,
-            "trade_deadline": None,  # YYYY-MM-DD
-        },
+        "trade_rules": {**DEFAULT_TRADE_RULES},
         "last_gm_tick_date": None,  # 마지막 AI GM 트레이드 시도 날짜
     },
     "teams": {},      # 팀 성향 / 메타 정보
@@ -137,8 +150,8 @@ def _ensure_league_state() -> Dict[str, Any]:
     master_schedule.setdefault("by_team", {})
     master_schedule.setdefault("by_date", {})
     trade_rules = league.setdefault("trade_rules", {})
-    trade_rules.setdefault("hard_cap", HARD_CAP)
-    trade_rules.setdefault("trade_deadline", None)
+    for key, value in DEFAULT_TRADE_RULES.items():
+        trade_rules.setdefault(key, value)
     league.setdefault("season_year", None)
     league.setdefault("draft_year", None)
     league.setdefault("season_start", None)
@@ -182,7 +195,7 @@ def _build_master_schedule(season_year: int) -> None:
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
 
-    init_draft_picks_if_needed(GAME_STATE, season_year, list(ALL_TEAM_IDS))
+    init_draft_picks_if_needed(GAME_STATE, league["draft_year"], list(ALL_TEAM_IDS))
 
     season_start = date(season_year, SEASON_START_MONTH, SEASON_START_DAY)
     teams = list(ALL_TEAM_IDS)

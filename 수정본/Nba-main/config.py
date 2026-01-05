@@ -17,10 +17,6 @@ if not os.path.exists(ROSTER_PATH):
 
 ROSTER_DF = pd.read_excel(ROSTER_PATH)
 
-# 샐러리 하드캡 (단위: 달러)
-HARD_CAP = 195_945_000.0  # US$ 195.945 million
-
-
 # Salary 문자열을 숫자(달러)로 변환
 def _parse_salary(value: Any) -> float:
     if value is None:
