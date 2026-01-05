@@ -3,10 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from config import HARD_CAP as CONFIG_HARD_CAP
-from salary_cap import compute_payroll_after_player_moves
-
 from ...errors import HARD_CAP_EXCEEDED, TradeError
-from ..base import TradeContext, build_player_moves
+from ..base import TradeContext, build_team_payrolls, build_team_trade_totals
 
 
 @dataclass
@@ -19,13 +17,10 @@ class HardCapRule:
         league_rules = ctx.game_state.get("league", {}).get("trade_rules", {})
         hard_cap = league_rules.get("hard_cap", CONFIG_HARD_CAP)
 
-        players_out, players_in = build_player_moves(deal)
+        trade_totals = build_team_trade_totals(deal, ctx)
+        payrolls = build_team_payrolls(deal, ctx, trade_totals)
         for team_id in deal.teams:
-            payroll_after = compute_payroll_after_player_moves(
-                team_id,
-                players_out[team_id],
-                players_in[team_id],
-            )
+            payroll_after = payrolls[team_id]["payroll_after"]
             if payroll_after > hard_cap:
                 raise TradeError(
                     HARD_CAP_EXCEEDED,
