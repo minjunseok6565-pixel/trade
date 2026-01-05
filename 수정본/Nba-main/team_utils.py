@@ -53,6 +53,10 @@ def _init_players_and_teams_if_needed() -> None:
             "overall": ovr,
             "salary": salary,
             "potential": potential,
+            "signed_date": "1900-01-01",
+            "signed_via_free_agency": False,
+            "acquired_date": "1900-01-01",
+            "acquired_via_trade": False,
         }
 
     GAME_STATE["players"] = players
