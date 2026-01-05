@@ -112,8 +112,9 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
             }
 
             deal = canonicalize_deal(parse_deal(payload))
-            validate_deal(deal)
-            apply_deal(deal, source="ai_gm")
+            trade_date = target_date or get_current_date_as_date()
+            validate_deal(deal, current_date=trade_date)
+            apply_deal(deal, source="ai_gm", trade_date=trade_date)
             return True
 
     return False

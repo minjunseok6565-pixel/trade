@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from config import ROSTER_DF
@@ -31,14 +32,19 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset | PickAss
     raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
 
 
-def apply_deal(deal: Deal, source: str, deal_id: Optional[str] = None) -> Dict[str, Any]:
+def apply_deal(
+    deal: Deal,
+    source: str,
+    deal_id: Optional[str] = None,
+    trade_date: Optional[date] = None,
+) -> Dict[str, Any]:
     _init_players_and_teams_if_needed()
     player_ids = _collect_player_ids(deal)
     original_teams: Dict[int, str] = {}
     original_pick_owners: Dict[str, str] = {}
 
     try:
-        acquired_date = get_current_date_as_date().isoformat()
+        acquired_date = (trade_date or get_current_date_as_date()).isoformat()
         for player_id in player_ids:
             try:
                 original_teams[player_id] = str(ROSTER_DF.at[player_id, "Team"]).upper()

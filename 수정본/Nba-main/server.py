@@ -422,7 +422,7 @@ async def api_trade_submit(req: TradeSubmitRequest):
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = canonicalize_deal(parse_deal(req.deal))
         validate_deal(deal, current_date=in_game_date)
-        transaction = apply_deal(deal, source="menu")
+        transaction = apply_deal(deal, source="menu", trade_date=in_game_date)
         return {
             "ok": True,
             "deal": serialize_deal(deal),
@@ -443,7 +443,12 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
             current_date=in_game_date,
             allow_locked_by_deal_id=req.deal_id,
         )
-        transaction = apply_deal(deal, source="negotiation", deal_id=req.deal_id)
+        transaction = apply_deal(
+            deal,
+            source="negotiation",
+            deal_id=req.deal_id,
+            trade_date=in_game_date,
+        )
         agreements.mark_executed(req.deal_id)
         return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
     except TradeError as exc:

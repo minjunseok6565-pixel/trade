@@ -48,6 +48,7 @@ def _pick_three_teams() -> Tuple[str, str, str]:
 def main() -> None:
     _init_players_and_teams_if_needed()
     initialize_master_schedule_if_needed()
+    current_date = get_current_date_as_date()
 
     # Test A: basic 2-team player trade
     team_a, team_b = _pick_two_teams()
@@ -64,8 +65,8 @@ def main() -> None:
         },
     }
     deal = canonicalize_deal(parse_deal(payload))
-    validate_deal(deal)
-    apply_deal(deal, source="menu")
+    validate_deal(deal, current_date=current_date)
+    apply_deal(deal, source="menu", trade_date=current_date)
 
     assert str(ROSTER_DF.at[player_a, "Team"]).upper() == team_b
     assert str(ROSTER_DF.at[player_b, "Team"]).upper() == team_a
@@ -82,10 +83,21 @@ def main() -> None:
         },
     }
     deal_b = canonicalize_deal(parse_deal(payload_b))
-    committed = agreements.create_committed_deal(deal_b)
-    deal_verified = agreements.verify_committed_deal(committed["deal_id"])
-    validate_deal(deal_verified, allow_locked_by_deal_id=committed["deal_id"])
-    apply_deal(deal_verified, source="menu", deal_id=committed["deal_id"])
+    committed = agreements.create_committed_deal(deal_b, current_date=current_date)
+    deal_verified = agreements.verify_committed_deal(
+        committed["deal_id"], current_date=current_date
+    )
+    validate_deal(
+        deal_verified,
+        current_date=current_date,
+        allow_locked_by_deal_id=committed["deal_id"],
+    )
+    apply_deal(
+        deal_verified,
+        source="menu",
+        deal_id=committed["deal_id"],
+        trade_date=current_date,
+    )
     agreements.mark_executed(committed["deal_id"])
 
     for assets in deal_verified.legs.values():
@@ -103,10 +115,10 @@ def main() -> None:
         },
     }
     deal_c = canonicalize_deal(parse_deal(payload_c))
-    committed_c = agreements.create_committed_deal(deal_c)
+    committed_c = agreements.create_committed_deal(deal_c, current_date=current_date)
 
     try:
-        validate_deal(deal_c)
+        validate_deal(deal_c, current_date=current_date)
         raise AssertionError("Expected lock conflict did not occur")
     except TradeError as exc:
         assert exc.code == ASSET_LOCKED
@@ -135,13 +147,15 @@ def main() -> None:
         assert exc.code == DUPLICATE_ASSET
 
     # Test C3: expired lock should not block validation
-    committed_expired = agreements.create_committed_deal(deal_c)
+    committed_expired = agreements.create_committed_deal(
+        deal_c, current_date=current_date
+    )
     asset_lock_key = f"player:{player_c}"
     lock = GAME_STATE.get("asset_locks", {}).get(asset_lock_key)
     if lock:
         lock["expires_at"] = (get_current_date_as_date() - timedelta(days=1)).isoformat()
     try:
-        validate_deal(deal_c)
+        validate_deal(deal_c, current_date=current_date)
     except TradeError as exc:
         assert exc.code != ASSET_LOCKED
     agreements.release_locks_for_deal(committed_expired["deal_id"])
@@ -161,8 +175,8 @@ def main() -> None:
         },
     }
     deal_d = canonicalize_deal(parse_deal(payload_d))
-    validate_deal(deal_d)
-    apply_deal(deal_d, source="menu")
+    validate_deal(deal_d, current_date=current_date)
+    apply_deal(deal_d, source="menu", trade_date=current_date)
 
     assert str(ROSTER_DF.at[player_x, "Team"]).upper() == team_y
     assert str(ROSTER_DF.at[player_y, "Team"]).upper() == team_z
@@ -183,7 +197,9 @@ def main() -> None:
             },
         }
         deal_pick = canonicalize_deal(parse_deal(payload_pick))
-        committed_pick = agreements.create_committed_deal(deal_pick)
+        committed_pick = agreements.create_committed_deal(
+            deal_pick, current_date=current_date
+        )
         picks[pick_id]["owner_team"] = team_b
         try:
             agreements.verify_committed_deal(committed_pick["deal_id"])
