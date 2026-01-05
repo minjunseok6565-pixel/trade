@@ -39,6 +39,54 @@ def build_player_moves(deal: Any) -> tuple[dict[str, list[int]], dict[str, list[
     return players_out, players_in
 
 
+def _sum_player_salaries(roster_df: Any, player_ids: list[int]) -> float:
+    if not player_ids:
+        return 0.0
+    return float(roster_df.reindex(player_ids)["SalaryAmount"].fillna(0.0).sum())
+
+
+def build_team_trade_totals(
+    deal: Any,
+    ctx: TradeContext,
+) -> dict[str, dict[str, float | int]]:
+    players_out, players_in = build_player_moves(deal)
+    totals: dict[str, dict[str, float | int]] = {}
+
+    for team_id in deal.teams:
+        outgoing_players = players_out.get(team_id, [])
+        incoming_players = players_in.get(team_id, [])
+        totals[team_id] = {
+            "outgoing_salary": _sum_player_salaries(ctx.roster_df, outgoing_players),
+            "incoming_salary": _sum_player_salaries(ctx.roster_df, incoming_players),
+            "outgoing_players_count": len(outgoing_players),
+            "incoming_players_count": len(incoming_players),
+        }
+
+    return totals
+
+
+def build_team_payrolls(
+    deal: Any,
+    ctx: TradeContext,
+    trade_totals: Optional[dict[str, dict[str, float | int]]] = None,
+) -> dict[str, dict[str, float]]:
+    totals = trade_totals or build_team_trade_totals(deal, ctx)
+    payrolls: dict[str, dict[str, float]] = {}
+
+    for team_id in deal.teams:
+        payroll_before = float(
+            ctx.roster_df.loc[ctx.roster_df["Team"] == team_id, "SalaryAmount"].sum()
+        )
+        outgoing_salary = float(totals[team_id]["outgoing_salary"])
+        incoming_salary = float(totals[team_id]["incoming_salary"])
+        payrolls[team_id] = {
+            "payroll_before": payroll_before,
+            "payroll_after": payroll_before - outgoing_salary + incoming_salary,
+        }
+
+    return payrolls
+
+
 def _resolve_receiver(deal: Any, sender_team: str, asset: Any) -> str:
     if getattr(asset, "to_team", None):
         return asset.to_team
@@ -61,6 +109,20 @@ def build_trade_context(
 ) -> TradeContext:
     from config import ROSTER_DF
     import state as state_module
+
+    player_meta_defaults = {
+        "signed_date": "1900-01-01",
+        "signed_via_free_agency": False,
+        "acquired_date": "1900-01-01",
+        "acquired_via_trade": False,
+    }
+    players = state_module.GAME_STATE.get("players")
+    if isinstance(players, dict):
+        for player in players.values():
+            if not isinstance(player, dict):
+                continue
+            for key, value in player_meta_defaults.items():
+                player.setdefault(key, value)
 
     if current_date is None:
         get_current_date_as_date = getattr(state_module, "get_current_date_as_date", None)
