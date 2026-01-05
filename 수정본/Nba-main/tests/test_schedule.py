@@ -2,7 +2,7 @@ import pytest
 
 pytest.importorskip("pandas")
 
-from config import ALL_TEAM_IDS, HARD_CAP
+from config import ALL_TEAM_IDS
 from state import GAME_STATE, _build_master_schedule, _ensure_league_state
 
 
@@ -11,8 +11,9 @@ def _reset_schedule_state():
     GAME_STATE["player_stats"] = {}
     GAME_STATE["league"] = {
         "master_schedule": {"games": [], "by_team": {}, "by_date": {}},
-        "trade_rules": {"hard_cap": HARD_CAP, "trade_deadline": None},
+        "trade_rules": {"trade_deadline": None},
         "season_year": None,
+        "draft_year": None,
         "season_start": None,
         "current_date": None,
         "last_gm_tick_date": None,

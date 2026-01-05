@@ -7,7 +7,7 @@ from .errors import TradeError, PICK_NOT_OWNED
 
 def init_draft_picks_if_needed(
     game_state: dict,
-    season_year: int,
+    draft_year: int,
     all_team_ids: List[str],
     years_ahead: int = 7,
 ) -> None:
@@ -15,7 +15,7 @@ def init_draft_picks_if_needed(
     if draft_picks:
         return
 
-    for year in range(season_year, season_year + years_ahead + 1):
+    for year in range(draft_year, draft_year + years_ahead + 1):
         for round_num in (1, 2):
             for team_id in all_team_ids:
                 pick_id = f"{year}_R{round_num}_{team_id}"

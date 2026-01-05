@@ -66,9 +66,10 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     random.shuffle(contenders)
     random.shuffle(rebuilders)
 
-    current_year = league.get("season_year") or (
-        target_date.year if target_date else get_current_date_as_date().year
-    )
+    current_year = league.get("draft_year")
+    if not current_year:
+        base_year = target_date.year if target_date else get_current_date_as_date().year
+        current_year = base_year + 1
 
     for contender in contenders:
         for rebuild in rebuilders:

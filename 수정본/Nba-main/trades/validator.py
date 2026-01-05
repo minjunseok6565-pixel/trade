@@ -5,15 +5,12 @@ from typing import Dict, List, Optional
 
 from config import ALL_TEAM_IDS, ROSTER_DF
 from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
-from salary_cap import HARD_CAP, compute_payroll_after_player_moves
-
 from .errors import (
     TradeError,
     INVALID_TEAM,
     PLAYER_NOT_OWNED,
     PICK_NOT_OWNED,
     ROSTER_LIMIT,
-    HARD_CAP_EXCEEDED,
     ASSET_LOCKED,
     MISSING_TO_TEAM,
     DUPLICATE_ASSET,
@@ -112,10 +109,6 @@ def validate_deal(
         # === MIGRATE:ROSTER_LIMIT:START ===
         # migrated to rules engine: RosterLimitRule
         # === MIGRATE:ROSTER_LIMIT:END ===
-
-        # === MIGRATE:HARD_CAP:START ===
-        # migrated to rules engine: HardCapRule
-        # === MIGRATE:HARD_CAP:END ===
 
 
 if __name__ == "__main__":
