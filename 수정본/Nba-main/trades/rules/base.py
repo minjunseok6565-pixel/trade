@@ -110,6 +110,20 @@ def build_trade_context(
     from config import ROSTER_DF
     import state as state_module
 
+    player_meta_defaults = {
+        "signed_date": "1900-01-01",
+        "signed_via_free_agency": False,
+        "acquired_date": "1900-01-01",
+        "acquired_via_trade": False,
+    }
+    players = state_module.GAME_STATE.get("players")
+    if isinstance(players, dict):
+        for player in players.values():
+            if not isinstance(player, dict):
+                continue
+            for key, value in player_meta_defaults.items():
+                player.setdefault(key, value)
+
     if current_date is None:
         get_current_date_as_date = getattr(state_module, "get_current_date_as_date", None)
         if callable(get_current_date_as_date):

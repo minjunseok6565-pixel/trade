@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from config import ROSTER_DF
 from team_utils import _init_players_and_teams_if_needed
-from state import GAME_STATE
+from state import GAME_STATE, get_current_date_as_date
 
 from .errors import TradeError, APPLY_FAILED
 from .models import Deal, PlayerAsset, PickAsset
@@ -38,6 +38,7 @@ def apply_deal(deal: Deal, source: str, deal_id: Optional[str] = None) -> Dict[s
     original_pick_owners: Dict[str, str] = {}
 
     try:
+        acquired_date = get_current_date_as_date().isoformat()
         for player_id in player_ids:
             try:
                 original_teams[player_id] = str(ROSTER_DF.at[player_id, "Team"]).upper()
@@ -54,6 +55,10 @@ def apply_deal(deal: Deal, source: str, deal_id: Optional[str] = None) -> Dict[s
                     player_state = GAME_STATE.get("players", {}).get(asset.player_id)
                     if player_state is not None:
                         player_state["team_id"] = to_team
+                        player_state.setdefault("signed_date", "1900-01-01")
+                        player_state.setdefault("signed_via_free_agency", False)
+                        player_state["acquired_date"] = acquired_date
+                        player_state["acquired_via_trade"] = True
                 if isinstance(asset, PickAsset):
                     draft_picks = GAME_STATE.get("draft_picks", {})
                     pick = draft_picks.get(asset.pick_id)
