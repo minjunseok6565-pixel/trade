@@ -4,7 +4,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from config import ALL_TEAM_IDS, ROSTER_DF
-from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
+from state import ensure_trade_prereqs_initialized
 from salary_cap import HARD_CAP, compute_payroll_after_player_moves
 
 from .errors import (
@@ -47,7 +47,7 @@ def validate_deal(
     current_date: Optional[date] = None,
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
-    _ensure_league_state()
+    ensure_trade_prereqs_initialized(current_date=current_date)
 
     # RULES ENGINE CHECKS (migrated): deadline
     ctx = build_trade_context(current_date=current_date)

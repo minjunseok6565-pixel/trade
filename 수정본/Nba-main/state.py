@@ -156,6 +156,42 @@ def _ensure_trade_state() -> None:
     GAME_STATE.setdefault("asset_locks", {})
 
 
+def _estimate_season_year(current_date: date) -> int:
+    season_start_month = SEASON_START_MONTH or 10
+    season_start_day = SEASON_START_DAY or 1
+    try:
+        season_start = date(current_date.year, int(season_start_month), int(season_start_day))
+    except Exception:
+        season_start = date(current_date.year, 10, 1)
+    if current_date < season_start:
+        return current_date.year - 1
+    return current_date.year
+
+
+def ensure_trade_prereqs_initialized(current_date: Optional[date] = None) -> None:
+    """트레이드 검증에 필요한 시즌/픽 상태를 스케줄 없이 보장한다."""
+    league = _ensure_league_state()
+    _ensure_trade_state()
+
+    if current_date is None:
+        current_date = get_current_date_as_date()
+
+    if league.get("season_year") is None:
+        league["season_year"] = _estimate_season_year(current_date)
+
+    if league.get("draft_year") is None:
+        league["draft_year"] = int(league["season_year"]) + 1
+
+    trade_rules = league.setdefault("trade_rules", {})
+    if trade_rules.get("trade_deadline") is None:
+        trade_deadline_date = date(int(league["season_year"]) + 1, 2, 5)
+        trade_rules["trade_deadline"] = trade_deadline_date.isoformat()
+
+    from trades.pick import init_draft_picks_if_needed
+
+    init_draft_picks_if_needed(GAME_STATE, int(league["season_year"]), list(ALL_TEAM_IDS))
+
+
 _ensure_league_state()
 
 
@@ -174,7 +210,7 @@ def _build_master_schedule(season_year: int) -> None:
       * 한 팀은 하루에 최대 1경기
     """
     league = _ensure_league_state()
-    from trades.picks import init_draft_picks_if_needed
+    from trades.pick import init_draft_picks_if_needed
 
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
     # draft_year는 "드래프트 연도" (예: 2025-26 시즌이면 2026)

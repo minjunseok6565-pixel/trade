@@ -20,16 +20,13 @@ New additions:
 
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from .errors import TradeError, PICK_NOT_OWNED
+from .errors import (
+    TradeError,
+    PICK_NOT_OWNED,
+    PICK_TOO_FAR_IN_FUTURE,
+    STEPIEN_RULE_VIOLATION,
+)
 from typing import Any
-
-# These may not exist yet in your errors.py; provide safe fallbacks so the module
-# remains importable until you add them centrally.
-try:
-    from .errors import PICK_TOO_FAR_IN_FUTURE, STEPIEN_RULE_VIOLATION
-except Exception:  # pragma: no cover
-    PICK_TOO_FAR_IN_FUTURE = "PICK_TOO_FAR_IN_FUTURE"
-    STEPIEN_RULE_VIOLATION = "STEPIEN_RULE_VIOLATION"
 
 
 # -----------------------------
@@ -55,6 +52,12 @@ def _get_pick(game_state: dict, pick_id: str) -> dict:
     if not pick:
         raise TradeError(PICK_NOT_OWNED, "Pick not found", {"pick_id": pick_id})
     return pick
+
+
+def _get_trade_date(game_state: dict) -> Optional[str]:
+    league = game_state.get("league") or {}
+    trade_date = league.get("current_date")
+    return str(trade_date) if trade_date else None
 
 
 def get_current_draft_year(game_state: dict, season_year_fallback: Optional[int] = None) -> int:
@@ -214,14 +217,32 @@ def validate_pick_year_window(
             raise TradeError(
                 PICK_TOO_FAR_IN_FUTURE,
                 "Pick year is invalid",
-                {"pick_id": pick_id, "year": pick.get("year")},
+                {
+                    "rule": "PICK_7_YEAR",
+                    "team_id": _norm_team(pick.get("owner_team", "")),
+                    "pick_id": pick_id,
+                    "pick_year": pick.get("year"),
+                    "limit_year": limit_year,
+                    "current_draft_year": int(draft_year),
+                    "max_years_ahead": int(max_years_ahead),
+                    "trade_date": _get_trade_date(game_state),
+                },
             )
 
         if year > limit_year:
             raise TradeError(
                 PICK_TOO_FAR_IN_FUTURE,
                 "Pick is too far in the future",
-                {"pick_id": pick_id, "pick_year": year, "limit_year": limit_year},
+                {
+                    "rule": "PICK_7_YEAR",
+                    "team_id": _norm_team(pick.get("owner_team", "")),
+                    "pick_id": pick_id,
+                    "pick_year": year,
+                    "limit_year": limit_year,
+                    "current_draft_year": int(draft_year),
+                    "max_years_ahead": int(max_years_ahead),
+                    "trade_date": _get_trade_date(game_state),
+                },
             )
 
 
@@ -311,10 +332,13 @@ def validate_stepien_rule_after_transfers(
                     STEPIEN_RULE_VIOLATION,
                     "Stepien Rule violation: no 1st-round pick in consecutive years",
                     {
+                        "rule": "STEPIEN",
                         "team_id": team,
                         "year_a": y,
                         "year_b": y + 1,
                         "lookahead_years": int(lookahead_years),
+                        "first_round_count": dict(first_round_count),
+                        "trade_date": _get_trade_date(game_state),
                     },
                 )
 
