@@ -108,7 +108,7 @@ def bootstrap_contracts_from_roster_excel(
     import team_utils
 
     ensure_contract_state(game_state)
-    team_utils._init_players_and_teams_if_needed(game_state)
+    team_utils._init_players_and_teams_if_needed()
 
     if roster_df is None:
         from config import ROSTER_DF
@@ -116,7 +116,13 @@ def bootstrap_contracts_from_roster_excel(
         roster_df = ROSTER_DF
 
     if not overwrite and game_state.get("contracts"):
-        return {"skipped": True, "reason": "contracts already exist"}
+        return {
+            "skipped": True,
+            "reason": "contracts already exist",
+            "initial_free_agents": [],
+            "skipped_contracts_for_fa": 0,
+            "created": 0,
+        }
 
     league_season_year = get_league_season_year(game_state)
 
@@ -131,11 +137,27 @@ def bootstrap_contracts_from_roster_excel(
     players = game_state.get("players", {})
     missing_players = []
     created = 0
+    skipped_contracts_for_fa = 0
+    initial_free_agents: list[int] = []
+    has_team_column = "Team" in roster_df.columns
 
     for player_id in roster_df.index:
         player_key = str(player_id)
         if player_key not in players:
             missing_players.append(player_id)
+            continue
+
+        is_free_agent = False
+        if has_team_column:
+            team_value = roster_df.at[player_id, "Team"]
+            if _is_blank(team_value):
+                is_free_agent = True
+            elif isinstance(team_value, str) and team_value.strip().upper() == "FA":
+                is_free_agent = True
+        if is_free_agent:
+            players[player_key]["team_id"] = ""
+            initial_free_agents.append(player_id)
+            skipped_contracts_for_fa += 1
             continue
 
         start_season_year = None
@@ -247,9 +269,23 @@ def bootstrap_contracts_from_roster_excel(
 
         created += 1
 
+    if len(initial_free_agents) != len(set(initial_free_agents)):
+        deduped: list[int] = []
+        seen: set[int] = set()
+        for player_id in initial_free_agents:
+            if player_id in seen:
+                continue
+            deduped.append(player_id)
+            seen.add(player_id)
+        initial_free_agents = deduped
+
+    game_state["free_agents"] = list(initial_free_agents)
+
     return {
         "skipped": False,
         "created": created,
         "missing_players": missing_players,
         "used_salary_columns": used_salary_columns,
+        "initial_free_agents": list(initial_free_agents),
+        "skipped_contracts_for_fa": skipped_contracts_for_fa,
     }

@@ -75,9 +75,13 @@ class PlayerEligibilityRule:
 
 
 def _parse_player_date(value: object) -> date:
+    """Parse player date strings like '2026-01-05T10:11:12' as 2026-01-05."""
     if value:
-        try:
-            return date.fromisoformat(str(value))
-        except ValueError:
-            pass
+        s = str(value).strip()
+        if len(s) >= 10:
+            try:
+                # Slice first 10 chars to accept ISO datetimes with time components.
+                return date.fromisoformat(s[:10])
+            except ValueError:
+                pass
     return date(1900, 1, 1)

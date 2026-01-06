@@ -14,6 +14,10 @@ class PickRulesRule:
     enabled: bool = False
 
     def validate(self, deal, ctx: TradeContext) -> None:
+        def _norm_team_id(x) -> str:
+            """Normalize team ids for comparisons (e.g., owner_team="lal" == receiver="LAL")."""
+            return str(x).strip().upper() if x and str(x).strip() else ""
+
         trade_rules = ctx.game_state.get("league", {}).get("trade_rules", {})
         max_pick_years_ahead = int(trade_rules.get("max_pick_years_ahead") or 7)
         stepien_lookahead = int(trade_rules.get("stepien_lookahead") or 7)
@@ -66,7 +70,7 @@ class PickRulesRule:
                     )
 
         owner_after = {
-            pick_id: str(pick.get("owner_team") or "")
+            pick_id: _norm_team_id(pick.get("owner_team"))
             for pick_id, pick in draft_picks.items()
         }
         for team_id, assets in deal.legs.items():
@@ -74,21 +78,21 @@ class PickRulesRule:
                 if not isinstance(asset, PickAsset):
                     continue
                 receiver = _resolve_receiver(deal, team_id, asset)
-                owner_after[asset.pick_id] = receiver
+                owner_after[asset.pick_id] = _norm_team_id(receiver)
 
         if stepien_lookahead <= 0:
             return
 
         for team_id in deal.teams:
-            for year in range(
-                current_season_year + 1,
-                current_season_year + stepien_lookahead,
-            ):
+            normalized_team_id = _norm_team_id(team_id)
+            start = current_season_year + 1
+            end = current_season_year + stepien_lookahead
+            for year in range(start, end + 1):  # Inclusive to check (end, end + 1) pair.
                 count_year = _count_first_round_picks_for_year(
-                    draft_picks, owner_after, team_id, year
+                    draft_picks, owner_after, normalized_team_id, year
                 )
                 count_next = _count_first_round_picks_for_year(
-                    draft_picks, owner_after, team_id, year + 1
+                    draft_picks, owner_after, normalized_team_id, year + 1
                 )
                 if count_year == 0 and count_next == 0:
                     raise TradeError(
