@@ -54,6 +54,59 @@ def sync_roster_teams_from_state(game_state: dict, roster_df=None) -> None:
             roster_df.at[player_id, "Team"] = normalized_team_id
 
 
+def sync_contract_team_ids_from_players(game_state: dict) -> None:
+    from contracts.store import ensure_contract_state
+
+    ensure_contract_state(game_state)
+
+    for player_id_str, contract_id in game_state.get(
+        "active_contract_id_by_player", {}
+    ).items():
+        try:
+            player_id = int(player_id_str)
+        except (TypeError, ValueError):
+            continue
+        contract = game_state.get("contracts", {}).get(contract_id)
+        if not contract:
+            continue
+        player_meta = game_state.get("players", {}).get(player_id)
+        if not player_meta:
+            contract["team_id"] = ""
+            continue
+        team_id = player_meta.get("team_id")
+        if team_id is None or team_id == "":
+            normalized_team_id = ""
+        else:
+            normalized_team_id = str(team_id).strip().upper()
+        contract["team_id"] = normalized_team_id
+
+
+def sync_players_salary_from_active_contract(
+    game_state: dict, season_year: int
+) -> None:
+    from contracts import models
+    from contracts.store import ensure_contract_state
+
+    ensure_contract_state(game_state)
+
+    for player_id_str, contract_id in game_state.get(
+        "active_contract_id_by_player", {}
+    ).items():
+        try:
+            player_id = int(player_id_str)
+        except (TypeError, ValueError):
+            continue
+        player_meta = game_state.get("players", {}).get(player_id)
+        if not player_meta:
+            continue
+        contract = game_state.get("contracts", {}).get(contract_id)
+        if not contract:
+            player_meta["salary"] = 0.0
+            continue
+        expected_salary = models.get_active_salary_for_season(contract, season_year)
+        player_meta["salary"] = float(expected_salary)
+
+
 def assert_state_vs_roster_consistency(
     game_state: dict,
     season_year: int | None = None,
@@ -125,6 +178,24 @@ def assert_state_vs_roster_consistency(
                     break
                 continue
             expected_salary = get_active_salary_for_season(contract, season_year)
+            player_meta = game_state.get("players", {}).get(player_id)
+            if not player_meta:
+                errors.append(f"Player {player_id} missing from state for salary check")
+                if len(errors) >= max_errors:
+                    break
+                continue
+            actual_player_salary = player_meta.get("salary", 0.0)
+            if actual_player_salary is None or (
+                isinstance(actual_player_salary, float) and isnan(actual_player_salary)
+            ):
+                actual_player_salary = 0.0
+            if abs(float(expected_salary) - float(actual_player_salary)) > 0.01:
+                errors.append(
+                    f"Salary mismatch for player {player_id}: "
+                    f"state={expected_salary} player={actual_player_salary}"
+                )
+                if len(errors) >= max_errors:
+                    break
             if player_id not in roster_df.index:
                 errors.append(
                     f"Player {player_id} missing from roster for salary check"
