@@ -57,12 +57,17 @@ def release_to_free_agents(
 
     from contracts.store import get_league_season_year
     from contracts.sync import (
+        sync_contract_team_ids_from_players,
+        sync_players_salary_from_active_contract,
         sync_roster_salaries_for_season,
         sync_roster_teams_from_state,
     )
 
+    season_year = get_league_season_year(game_state)
+    sync_contract_team_ids_from_players(game_state)
+    sync_players_salary_from_active_contract(game_state, season_year)
     sync_roster_teams_from_state(game_state)
-    sync_roster_salaries_for_season(game_state, get_league_season_year(game_state))
+    sync_roster_salaries_for_season(game_state, season_year)
 
     return {
         "event": "RELEASE_TO_FREE_AGENTS",
@@ -137,12 +142,17 @@ def sign_free_agent(
 
     from contracts.store import get_league_season_year
     from contracts.sync import (
+        sync_contract_team_ids_from_players,
+        sync_players_salary_from_active_contract,
         sync_roster_salaries_for_season,
         sync_roster_teams_from_state,
     )
 
+    season_year = get_league_season_year(game_state)
+    sync_contract_team_ids_from_players(game_state)
+    sync_players_salary_from_active_contract(game_state, season_year)
     sync_roster_teams_from_state(game_state)
-    sync_roster_salaries_for_season(game_state, get_league_season_year(game_state))
+    sync_roster_salaries_for_season(game_state, season_year)
 
     return {
         "event": "SIGN_FREE_AGENT",
@@ -214,12 +224,17 @@ def re_sign_or_extend(
 
     from contracts.store import get_league_season_year
     from contracts.sync import (
+        sync_contract_team_ids_from_players,
+        sync_players_salary_from_active_contract,
         sync_roster_salaries_for_season,
         sync_roster_teams_from_state,
     )
 
+    season_year = get_league_season_year(game_state)
+    sync_contract_team_ids_from_players(game_state)
+    sync_players_salary_from_active_contract(game_state, season_year)
     sync_roster_teams_from_state(game_state)
-    sync_roster_salaries_for_season(game_state, get_league_season_year(game_state))
+    sync_roster_salaries_for_season(game_state, season_year)
 
     return {
         "event": "RE_SIGN_OR_EXTEND",

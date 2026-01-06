@@ -77,14 +77,17 @@ def apply_deal(
         transaction = append_trade_transaction(deal, source=source, deal_id=deal_id)
         from contracts.store import get_league_season_year
         from contracts.sync import (
+            sync_contract_team_ids_from_players,
+            sync_players_salary_from_active_contract,
             sync_roster_salaries_for_season,
             sync_roster_teams_from_state,
         )
 
+        season_year = get_league_season_year(GAME_STATE)
+        sync_contract_team_ids_from_players(GAME_STATE)
+        sync_players_salary_from_active_contract(GAME_STATE, season_year)
         sync_roster_teams_from_state(GAME_STATE)
-        sync_roster_salaries_for_season(
-            GAME_STATE, get_league_season_year(GAME_STATE)
-        )
+        sync_roster_salaries_for_season(GAME_STATE, season_year)
         return transaction
     except Exception as exc:
         for player_id, team_id in original_teams.items():

@@ -161,6 +161,27 @@ def _ensure_league_state() -> Dict[str, Any]:
     from contracts.store import ensure_contract_state
 
     ensure_contract_state(GAME_STATE)
+    from team_utils import _init_players_and_teams_if_needed
+
+    _init_players_and_teams_if_needed()
+
+    from contracts.bootstrap import bootstrap_contracts_from_roster_excel
+
+    bootstrap_contracts_from_roster_excel(GAME_STATE, overwrite=False)
+
+    from contracts.store import get_league_season_year
+    from contracts.sync import (
+        sync_contract_team_ids_from_players,
+        sync_players_salary_from_active_contract,
+        sync_roster_salaries_for_season,
+        sync_roster_teams_from_state,
+    )
+
+    season_year = get_league_season_year(GAME_STATE)
+    sync_contract_team_ids_from_players(GAME_STATE)
+    sync_players_salary_from_active_contract(GAME_STATE, season_year)
+    sync_roster_teams_from_state(GAME_STATE)
+    sync_roster_salaries_for_season(GAME_STATE, season_year)
     return league
 
 
@@ -195,6 +216,7 @@ def _build_master_schedule(season_year: int) -> None:
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
     # draft_year는 "드래프트 연도" (예: 2025-26 시즌이면 2026)
     # 픽 생성/Stepien/7년 룰은 draft_year를 기준으로 맞추기 위해 미리 저장해 둔다.
+    previous_season_year = league.get("season_year")
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
 
@@ -365,6 +387,18 @@ def _build_master_schedule(season_year: int) -> None:
     league["trade_rules"]["trade_deadline"] = trade_deadline_date.isoformat()
     set_current_date(None)
     league["last_gm_tick_date"] = None
+    try:
+        previous_season = int(previous_season_year or 0)
+    except (TypeError, ValueError):
+        previous_season = 0
+    try:
+        next_season = int(season_year or 0)
+    except (TypeError, ValueError):
+        next_season = 0
+    if previous_season and next_season and previous_season != next_season:
+        from contracts.offseason import process_offseason
+
+        process_offseason(GAME_STATE, previous_season, next_season)
 
 
 def initialize_master_schedule_if_needed() -> None:
