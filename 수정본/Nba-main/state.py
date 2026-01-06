@@ -158,6 +158,9 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("current_date", None)
     league.setdefault("last_gm_tick_date", None)
     _ensure_trade_state()
+    from contracts.store import ensure_contract_state
+
+    ensure_contract_state(GAME_STATE)
     return league
 
 

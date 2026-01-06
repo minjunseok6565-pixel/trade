@@ -75,6 +75,16 @@ def apply_deal(
                     transfer_pick(GAME_STATE, asset.pick_id, from_team, to_team)
 
         transaction = append_trade_transaction(deal, source=source, deal_id=deal_id)
+        from contracts.store import get_league_season_year
+        from contracts.sync import (
+            sync_roster_salaries_for_season,
+            sync_roster_teams_from_state,
+        )
+
+        sync_roster_teams_from_state(GAME_STATE)
+        sync_roster_salaries_for_season(
+            GAME_STATE, get_league_season_year(GAME_STATE)
+        )
         return transaction
     except Exception as exc:
         for player_id, team_id in original_teams.items():

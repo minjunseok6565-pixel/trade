@@ -42,7 +42,15 @@ else:
     ROSTER_DF["SalaryAmount"] = 0.0
 
 # 리그/디비전 설정 (프론트 script.js 의 DIVISIONS와 동일하게 맞춤)
-ALL_TEAM_IDS: List[str] = sorted(ROSTER_DF["Team"].unique())
+ALL_TEAM_IDS: List[str] = sorted(
+    {
+        str(team).strip()
+        for team in ROSTER_DF["Team"].unique()
+        if team
+        and str(team).strip()
+        and str(team).strip().upper() != "FA"
+    }
+)
 
 DIVISIONS: Dict[str, Dict[str, List[str]]] = {
     "West": {
