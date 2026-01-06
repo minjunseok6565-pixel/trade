@@ -118,6 +118,7 @@ def validate_deal(
         # === MIGRATE:ROSTER_LIMIT:START ===
         # migrated to rules engine: RosterLimitRule
         # === MIGRATE:ROSTER_LIMIT:END ===
+        Pass
 
 
 if __name__ == "__main__":
