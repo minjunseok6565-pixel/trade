@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import uuid
+import math
 
 
 def new_contract_id() -> str:
     return uuid.uuid4().hex
+
+
+def _safe_salary(value) -> float:
+    try:
+        salary = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(salary) or math.isinf(salary):
+        return 0.0
+    return salary
 
 
 def make_contract_record(
@@ -20,7 +31,9 @@ def make_contract_record(
     options: list | None = None,
     status: str = "ACTIVE",
 ) -> dict:
-    normalized_salary_by_year = {str(key): value for key, value in salary_by_year.items()}
+    normalized_salary_by_year = {
+        str(key): _safe_salary(value) for key, value in salary_by_year.items()
+    }
 
     return {
         "contract_id": contract_id,
@@ -36,4 +49,5 @@ def make_contract_record(
 
 
 def get_active_salary_for_season(contract: dict, season_year: int) -> float:
-    return float(contract.get("salary_by_year", {}).get(str(season_year), 0.0) or 0.0)
+    raw_salary = contract.get("salary_by_year", {}).get(str(season_year), 0.0)
+    return _safe_salary(raw_salary)

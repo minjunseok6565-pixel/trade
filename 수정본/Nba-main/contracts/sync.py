@@ -29,6 +29,8 @@ def sync_roster_salaries_for_season(
         contract = contracts.get(contract_id) if contract_id else None
         if contract:
             salary = get_active_salary_for_season(contract, season_year)
+            if isinstance(salary, float) and isnan(salary):
+                salary = 0.0
             roster_df.at[player_id, "SalaryAmount"] = float(salary)
         else:
             # Zero missing contracts to prevent stale payroll in cached roster data.
@@ -98,6 +100,8 @@ def sync_players_salary_from_active_contract(
         contract = contracts.get(contract_id) if contract_id else None
         if contract:
             expected_salary = models.get_active_salary_for_season(contract, season_year)
+            if isinstance(expected_salary, float) and isnan(expected_salary):
+                expected_salary = 0.0
             player_meta["salary"] = float(expected_salary)
         else:
             # Zero missing contracts to prevent stale payroll in cached player data.
@@ -166,9 +170,26 @@ def assert_state_vs_roster_consistency(
                     break
                 continue
             contract = contracts.get(contract_id) if contract_id else None
+            raw_salary = (
+                contract.get("salary_by_year", {}).get(str(season_year))
+                if contract
+                else 0.0
+            )
             expected_salary = (
                 get_active_salary_for_season(contract, season_year) if contract else 0.0
             )
+            if isinstance(raw_salary, float) and isnan(raw_salary):
+                errors.append(
+                    "Contract salary is NaN for player "
+                    f"{player_id} (contract_id={contract_id})"
+                )
+                expected_salary = 0.0
+            if isinstance(expected_salary, float) and isnan(expected_salary):
+                errors.append(
+                    "Contract salary is NaN for player "
+                    f"{player_id} (contract_id={contract_id})"
+                )
+                expected_salary = 0.0
             player_meta = game_state.get("players", {}).get(player_id)
             if not player_meta:
                 errors.append(f"Player {player_id} missing from state for salary check")

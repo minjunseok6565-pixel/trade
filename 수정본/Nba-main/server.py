@@ -50,6 +50,11 @@ from trades import negotiation_store
 # -------------------------------------------------------------------------
 app = FastAPI(title="느바 시뮬 GM 서버")
 
+@app.on_event("startup")
+def _startup_init_state() -> None:
+    _ensure_league_state()
+    initialize_master_schedule_if_needed()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
