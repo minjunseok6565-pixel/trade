@@ -147,12 +147,20 @@ def normalize_player_keys(game_state: dict) -> dict:
     Normalizes GAME_STATE player/free_agent identifiers.
     Returns a small report dict (counts + conflicts).
     """
+    try:
+        from config import ROSTER_DF
+    except Exception:
+        ROSTER_DF = None
+
     report = {
         "converted_players_keys_count": 0,
         "player_key_conflicts_count": 0,
         "non_numeric_player_keys_count": 0,
         "converted_free_agents_count": 0,
         "free_agents_non_numeric_count": 0,
+        "roster_index_int_count": 0,
+        "roster_index_numeric_str_count": 0,
+        "roster_index_other_count": 0,
     }
     players = game_state.get("players")
     if not isinstance(players, dict):
@@ -234,6 +242,30 @@ def normalize_player_keys(game_state: dict) -> dict:
     if non_numeric_free_agents:
         report["free_agents_non_numeric"] = non_numeric_free_agents[:10]
 
+    if ROSTER_DF is not None:
+        try:
+            sample_index = list(ROSTER_DF.index[:20])
+        except Exception:
+            sample_index = []
+        roster_index_int_count = 0
+        roster_index_numeric_str_count = 0
+        roster_index_other_count = 0
+        for value in sample_index:
+            if isinstance(value, int) and not isinstance(value, bool):
+                roster_index_int_count += 1
+            elif str(value).strip().isdigit():
+                roster_index_numeric_str_count += 1
+            else:
+                roster_index_other_count += 1
+        report["roster_index_int_count"] = roster_index_int_count
+        report["roster_index_numeric_str_count"] = roster_index_numeric_str_count
+        report["roster_index_other_count"] = roster_index_other_count
+        if roster_index_numeric_str_count > 0:
+            report.setdefault("warnings", []).append(
+                "ROSTER_DF.index contains numeric strings; players keys are normalized to int. "
+                "Ensure roster index is int to avoid lookup mismatches."
+            )
+
     debug = game_state.setdefault("debug", {})
     debug.setdefault("normalization", []).append(report)
     return report
@@ -262,10 +294,7 @@ def _ensure_league_state() -> Dict[str, Any]:
 
     _init_players_and_teams_if_needed()
     # Normalize player keys to int to prevent duplicate "12"/12 entries.
-    debug = GAME_STATE.setdefault("debug", {})
-    if not debug.get("players_keys_normalized"):
-        normalize_player_keys(GAME_STATE)
-        debug["players_keys_normalized"] = True
+    normalize_player_keys(GAME_STATE)
 
     from contracts.bootstrap import bootstrap_contracts_from_roster_excel
 
