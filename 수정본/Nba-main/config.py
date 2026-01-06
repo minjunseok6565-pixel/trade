@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,8 @@ def _parse_salary(value: Any) -> float:
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return 0.0
         return float(value)
     s = str(value).strip()
     if not s or s == "--":

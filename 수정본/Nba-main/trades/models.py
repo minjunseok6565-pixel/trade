@@ -38,7 +38,13 @@ def _parse_asset(raw: Dict[str, Any]) -> Asset:
         player_id = raw.get("player_id")
         if player_id is None:
             raise TradeError(DEAL_INVALIDATED, "Missing player_id in asset", raw)
-        return PlayerAsset(kind="player", player_id=int(player_id), to_team=to_team)
+        try:
+            pid = int(player_id)
+        except (TypeError, ValueError):
+            raise TradeError(DEAL_INVALIDATED, "Invalid player_id in asset", raw)
+        if pid < 0:
+            raise TradeError(DEAL_INVALIDATED, "Invalid player_id in asset", raw)
+        return PlayerAsset(kind="player", player_id=pid, to_team=to_team)
     if kind == "pick":
         pick_id = raw.get("pick_id")
         if not pick_id:

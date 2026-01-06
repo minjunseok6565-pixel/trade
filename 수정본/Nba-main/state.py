@@ -324,9 +324,6 @@ def _ensure_trade_state() -> None:
     GAME_STATE.setdefault("asset_locks", {})
 
 
-_ensure_league_state()
-
-
 def _build_master_schedule(season_year: int) -> None:
     """30개 팀 전체에 대한 마스터 스케줄(정규시즌)을 생성한다.
 
