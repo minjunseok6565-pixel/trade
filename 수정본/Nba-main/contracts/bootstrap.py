@@ -93,6 +93,15 @@ def _parse_iso_date(value) -> str | None:
     return None
 
 
+def _resolve_player_id(value) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    return None
+
+
 def bootstrap_contracts_from_roster_excel(
     game_state: dict,
     roster_df=None,
@@ -136,14 +145,19 @@ def bootstrap_contracts_from_roster_excel(
 
     players = game_state.get("players", {})
     missing_players = []
+    non_int_roster_ids = []
     created = 0
     skipped_contracts_for_fa = 0
     initial_free_agents: list[int] = []
+    initial_free_agents_seen: set[int] = set()
     has_team_column = "Team" in roster_df.columns
 
     for player_id in roster_df.index:
-        player_key = str(player_id)
-        if player_key not in players:
+        pid = _resolve_player_id(player_id)
+        if pid is None:
+            non_int_roster_ids.append(player_id)
+            continue
+        if pid not in players:
             missing_players.append(player_id)
             continue
 
@@ -155,8 +169,10 @@ def bootstrap_contracts_from_roster_excel(
             elif isinstance(team_value, str) and team_value.strip().upper() == "FA":
                 is_free_agent = True
         if is_free_agent:
-            players[player_key]["team_id"] = ""
-            initial_free_agents.append(player_id)
+            players[pid]["team_id"] = ""
+            if pid not in initial_free_agents_seen:
+                initial_free_agents.append(pid)
+                initial_free_agents_seen.add(pid)
             skipped_contracts_for_fa += 1
             continue
 
@@ -225,7 +241,7 @@ def bootstrap_contracts_from_roster_excel(
                 }
             )
 
-        team_id = players[player_key].get("team_id")
+        team_id = players[pid].get("team_id")
         if isinstance(team_id, str):
             team_id = team_id.upper()
         else:
@@ -240,7 +256,7 @@ def bootstrap_contracts_from_roster_excel(
         contract_id = models.new_contract_id()
         contract = models.make_contract_record(
             contract_id=contract_id,
-            player_id=player_id,
+            player_id=pid,
             team_id=team_id,
             signed_date_iso=signed_date_iso,
             start_season_year=start_season_year,
@@ -251,10 +267,10 @@ def bootstrap_contracts_from_roster_excel(
         )
 
         game_state["contracts"][contract_id] = contract
-        game_state.setdefault("player_contracts", {}).setdefault(player_key, []).append(
+        game_state.setdefault("player_contracts", {}).setdefault(str(pid), []).append(
             contract_id
         )
-        game_state.setdefault("active_contract_id_by_player", {})[player_key] = (
+        game_state.setdefault("active_contract_id_by_player", {})[str(pid)] = (
             contract_id
         )
 
@@ -263,21 +279,11 @@ def bootstrap_contracts_from_roster_excel(
                 roster_df.at[player_id, "SignedViaFreeAgency"]
             )
             if signed_via_free_agency is not None:
-                players[player_key]["signed_via_free_agency"] = signed_via_free_agency
+                players[pid]["signed_via_free_agency"] = signed_via_free_agency
         if "SignedDate" in roster_df.columns:
-            players[player_key]["signed_date"] = signed_date_iso
+            players[pid]["signed_date"] = signed_date_iso
 
         created += 1
-
-    if len(initial_free_agents) != len(set(initial_free_agents)):
-        deduped: list[int] = []
-        seen: set[int] = set()
-        for player_id in initial_free_agents:
-            if player_id in seen:
-                continue
-            deduped.append(player_id)
-            seen.add(player_id)
-        initial_free_agents = deduped
 
     game_state["free_agents"] = list(initial_free_agents)
 
@@ -285,6 +291,7 @@ def bootstrap_contracts_from_roster_excel(
         "skipped": False,
         "created": created,
         "missing_players": missing_players,
+        "non_int_roster_ids": non_int_roster_ids,
         "used_salary_columns": used_salary_columns,
         "initial_free_agents": list(initial_free_agents),
         "skipped_contracts_for_fa": skipped_contracts_for_fa,
