@@ -22,15 +22,17 @@ def sync_roster_salaries_for_season(
     if "SalaryAmount" not in roster_df.columns:
         return
 
-    for contract_id in game_state.get("active_contract_id_by_player", {}).values():
-        contract = game_state.get("contracts", {}).get(contract_id)
-        if not contract:
-            continue
-        player_id = contract.get("player_id")
-        if player_id not in roster_df.index:
-            continue
-        salary = get_active_salary_for_season(contract, season_year)
-        roster_df.at[player_id, "SalaryAmount"] = salary
+    active_contract_map = game_state.get("active_contract_id_by_player", {})
+    contracts = game_state.get("contracts", {})
+    for player_id in roster_df.index:
+        contract_id = active_contract_map.get(str(player_id))
+        contract = contracts.get(contract_id) if contract_id else None
+        if contract:
+            salary = get_active_salary_for_season(contract, season_year)
+            roster_df.at[player_id, "SalaryAmount"] = float(salary)
+        else:
+            # Zero missing contracts to prevent stale payroll in cached roster data.
+            roster_df.at[player_id, "SalaryAmount"] = 0.0
 
 
 def sync_roster_teams_from_state(game_state: dict, roster_df=None) -> None:
@@ -89,22 +91,17 @@ def sync_players_salary_from_active_contract(
 
     ensure_contract_state(game_state)
 
-    for player_id_str, contract_id in game_state.get(
-        "active_contract_id_by_player", {}
-    ).items():
-        try:
-            player_id = int(player_id_str)
-        except (TypeError, ValueError):
-            continue
-        player_meta = game_state.get("players", {}).get(player_id)
-        if not player_meta:
-            continue
-        contract = game_state.get("contracts", {}).get(contract_id)
-        if not contract:
+    active_contract_map = game_state.get("active_contract_id_by_player", {})
+    contracts = game_state.get("contracts", {})
+    for player_id, player_meta in game_state.get("players", {}).items():
+        contract_id = active_contract_map.get(str(player_id))
+        contract = contracts.get(contract_id) if contract_id else None
+        if contract:
+            expected_salary = models.get_active_salary_for_season(contract, season_year)
+            player_meta["salary"] = float(expected_salary)
+        else:
+            # Zero missing contracts to prevent stale payroll in cached player data.
             player_meta["salary"] = 0.0
-            continue
-        expected_salary = models.get_active_salary_for_season(contract, season_year)
-        player_meta["salary"] = float(expected_salary)
 
 
 def assert_state_vs_roster_consistency(
@@ -157,27 +154,21 @@ def assert_state_vs_roster_consistency(
     if not has_salary_column:
         errors.append("Roster missing SalaryAmount column for salary checks")
     else:
-        for player_id_str, contract_id in game_state.get(
-            "active_contract_id_by_player", {}
-        ).items():
+        active_contract_map = game_state.get("active_contract_id_by_player", {})
+        contracts = game_state.get("contracts", {})
+        for player_id in roster_df.index:
+            contract_id = active_contract_map.get(str(player_id))
             try:
-                player_id = int(player_id_str)
+                player_id = int(player_id)
             except (TypeError, ValueError):
-                errors.append(
-                    f"Invalid player id key in active contract map: {player_id_str}"
-                )
+                errors.append(f"Invalid player id in roster index: {player_id}")
                 if len(errors) >= max_errors:
                     break
                 continue
-            contract = game_state.get("contracts", {}).get(contract_id)
-            if not contract:
-                errors.append(
-                    f"Missing contract {contract_id} for player {player_id}"
-                )
-                if len(errors) >= max_errors:
-                    break
-                continue
-            expected_salary = get_active_salary_for_season(contract, season_year)
+            contract = contracts.get(contract_id) if contract_id else None
+            expected_salary = (
+                get_active_salary_for_season(contract, season_year) if contract else 0.0
+            )
             player_meta = game_state.get("players", {}).get(player_id)
             if not player_meta:
                 errors.append(f"Player {player_id} missing from state for salary check")
@@ -196,13 +187,6 @@ def assert_state_vs_roster_consistency(
                 )
                 if len(errors) >= max_errors:
                     break
-            if player_id not in roster_df.index:
-                errors.append(
-                    f"Player {player_id} missing from roster for salary check"
-                )
-                if len(errors) >= max_errors:
-                    break
-                continue
             actual_salary = roster_df.at[player_id, "SalaryAmount"]
             if actual_salary is None or (
                 isinstance(actual_salary, float) and isnan(actual_salary)

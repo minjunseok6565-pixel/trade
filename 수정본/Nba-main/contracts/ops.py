@@ -17,7 +17,7 @@ def _resolve_date_iso(game_state: dict, value: "date|str|None") -> str:
     if value is None:
         from state import get_current_date_as_date
 
-        resolved = get_current_date_as_date(game_state)
+        resolved = get_current_date_as_date()
     elif isinstance(value, str):
         resolved = date.fromisoformat(value)
     else:
@@ -29,7 +29,7 @@ def _resolve_date_iso(game_state: dict, value: "date|str|None") -> str:
 def _ensure_team_state(game_state: dict) -> None:
     from team_utils import _init_players_and_teams_if_needed
 
-    _init_players_and_teams_if_needed(game_state)
+    _init_players_and_teams_if_needed()
 
 
 def release_to_free_agents(

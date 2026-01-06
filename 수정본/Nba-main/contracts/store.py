@@ -15,4 +15,4 @@ def get_league_season_year(game_state: dict) -> int:
 def get_current_date_iso(game_state: dict) -> str:
     from state import get_current_date_as_date
 
-    return get_current_date_as_date(game_state).isoformat()
+    return get_current_date_as_date().isoformat()
