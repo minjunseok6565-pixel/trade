@@ -142,6 +142,103 @@ def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
     return teams[team_id]
 
 
+def normalize_player_keys(game_state: dict) -> dict:
+    """
+    Normalizes GAME_STATE player/free_agent identifiers.
+    Returns a small report dict (counts + conflicts).
+    """
+    report = {
+        "converted_players_keys_count": 0,
+        "player_key_conflicts_count": 0,
+        "non_numeric_player_keys_count": 0,
+        "converted_free_agents_count": 0,
+        "free_agents_non_numeric_count": 0,
+    }
+    players = game_state.get("players")
+    if not isinstance(players, dict):
+        return report
+
+    new_players: Dict[Any, Any] = {}
+    source_is_int: Dict[Any, bool] = {}
+    source_key_by_target: Dict[Any, Any] = {}
+    conflicts: List[Dict[str, Any]] = []
+    non_numeric_keys: List[Any] = []
+
+    for key, value in players.items():
+        is_int_key = isinstance(key, int) and not isinstance(key, bool)
+        target = key
+        if not is_int_key:
+            key_str = str(key).strip()
+            if key_str.isdigit():
+                target = int(key_str)
+                report["converted_players_keys_count"] += 1
+            else:
+                non_numeric_keys.append(key)
+
+        if target in new_players:
+            existing_is_int = source_is_int[target]
+            if existing_is_int and not is_int_key:
+                conflicts.append({"int_key": target, "dropped_key": key})
+                continue
+            if not existing_is_int and is_int_key:
+                conflicts.append(
+                    {"int_key": target, "dropped_key": source_key_by_target[target]}
+                )
+                new_players[target] = value
+                source_is_int[target] = True
+                source_key_by_target[target] = key
+                continue
+            conflicts.append({"int_key": target, "dropped_key": key})
+            continue
+
+        new_players[target] = value
+        source_is_int[target] = is_int_key
+        source_key_by_target[target] = key
+
+    game_state["players"] = new_players
+
+    fas_present = "free_agents" in game_state
+    fas = game_state.get("free_agents")
+    non_numeric_free_agents: List[Any] = []
+    if fas_present and isinstance(fas, list):
+        new_fas: List[int] = []
+        seen: set[int] = set()
+        for item in fas:
+            if isinstance(item, int) and not isinstance(item, bool):
+                value = item
+            else:
+                item_str = str(item).strip()
+                if not item_str.isdigit():
+                    non_numeric_free_agents.append(item)
+                    continue
+                value = int(item_str)
+                report["converted_free_agents_count"] += 1
+            if value in seen:
+                continue
+            new_fas.append(value)
+            seen.add(value)
+        game_state["free_agents"] = new_fas
+    elif fas_present:
+        game_state["free_agents"] = []
+
+    report["player_key_conflicts_count"] = len(conflicts)
+    report["non_numeric_player_keys_count"] = len(non_numeric_keys)
+    report["free_agents_non_numeric_count"] = len(non_numeric_free_agents)
+    if not fas_present:
+        report["free_agents_missing"] = True
+
+    if conflicts:
+        report["player_key_conflicts"] = conflicts[:10]
+    if non_numeric_keys:
+        report["non_numeric_player_keys"] = non_numeric_keys[:10]
+    if non_numeric_free_agents:
+        report["free_agents_non_numeric"] = non_numeric_free_agents[:10]
+
+    debug = game_state.setdefault("debug", {})
+    debug.setdefault("normalization", []).append(report)
+    return report
+
+
 def _ensure_league_state() -> Dict[str, Any]:
     """GAME_STATE 안에 league 상태 블록을 보장한다."""
     league = GAME_STATE.setdefault("league", {})
@@ -164,6 +261,11 @@ def _ensure_league_state() -> Dict[str, Any]:
     from team_utils import _init_players_and_teams_if_needed
 
     _init_players_and_teams_if_needed()
+    # Normalize player keys to int to prevent duplicate "12"/12 entries.
+    debug = GAME_STATE.setdefault("debug", {})
+    if not debug.get("players_keys_normalized"):
+        normalize_player_keys(GAME_STATE)
+        debug["players_keys_normalized"] = True
 
     from contracts.bootstrap import bootstrap_contracts_from_roster_excel
 
