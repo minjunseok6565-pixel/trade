@@ -348,7 +348,22 @@ def _build_master_schedule(season_year: int) -> None:
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
 
-    init_draft_picks_if_needed(GAME_STATE, league["draft_year"], list(ALL_TEAM_IDS))
+    # Stepien 룰은 (year, year+1) 쌍을 검사하기 때문에,
+    # lookahead=N이면 draft_year+N+1까지 "픽 데이터가 존재"해야 데이터 결측으로 인한 오판을 피할 수 있다.
+    trade_rules = league.get("trade_rules") or {}
+    try:
+        max_pick_years_ahead = int(trade_rules.get("max_pick_years_ahead") or 7)
+    except (TypeError, ValueError):
+        max_pick_years_ahead = 7
+    try:
+        stepien_lookahead = int(trade_rules.get("stepien_lookahead") or 7)
+    except (TypeError, ValueError):
+        stepien_lookahead = 7
+
+    years_ahead = max(max_pick_years_ahead, stepien_lookahead + 1)
+    init_draft_picks_if_needed(
+        GAME_STATE, league["draft_year"], list(ALL_TEAM_IDS), years_ahead=years_ahead
+    )
 
     season_start = date(season_year, SEASON_START_MONTH, SEASON_START_DAY)
     teams = list(ALL_TEAM_IDS)
@@ -773,4 +788,5 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
