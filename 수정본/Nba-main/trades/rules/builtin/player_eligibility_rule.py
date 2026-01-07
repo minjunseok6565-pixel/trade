@@ -26,21 +26,40 @@ class PlayerEligibilityRule:
                 player_state = ctx.game_state.get("players", {}).get(asset.player_id, {})
                 if not player_state:
                     continue
-                if not player_state.get("signed_via_free_agency"):
+                contract_action_type = player_state.get("last_contract_action_type")
+                is_recent_signing = contract_action_type in {
+                    "SIGN_FREE_AGENT",
+                    "RE_SIGN_OR_EXTEND",
+                }
+                if not is_recent_signing and not player_state.get("signed_via_free_agency"):
                     continue
-                signed_date = _parse_player_date(player_state.get("signed_date"))
-                banned_until = signed_date + timedelta(days=new_fa_sign_ban_days)
+                signed_date_value = player_state.get(
+                    "last_contract_action_date", player_state.get("signed_date")
+                )
+                signed_date = _parse_player_date(signed_date_value)
+                season_year_start = int(
+                    ctx.game_state.get("league", {}).get("season_year") or 0
+                )
+                if season_year_start <= 0:
+                    season_year_start = ctx.current_date.year
+                dec15 = date(season_year_start, 12, 15)
+                banned_until_days = signed_date + timedelta(days=new_fa_sign_ban_days)
+                banned_until = max(banned_until_days, dec15)
                 if ctx.current_date < banned_until:
                     raise TradeError(
                         DEAL_INVALIDATED,
-                        "Player recently signed via free agency",
+                        "Player recently signed or re-signed",
                         {
                             "rule": self.rule_id,
                             "team_id": team_id,
                             "player_id": asset.player_id,
-                            "reason": "recent_free_agent_signing",
+                            "reason": "recent_contract_signing",
                             "trade_date": ctx.current_date.isoformat(),
                             "signed_date": signed_date.isoformat(),
+                            "banned_until": banned_until.isoformat(),
+                            "dec15": dec15.isoformat(),
+                            "ban_days": new_fa_sign_ban_days,
+                            "contract_action_type": contract_action_type,
                         },
                     )
 
