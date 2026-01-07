@@ -12,7 +12,7 @@ from ..base import TradeContext
 class PlayerEligibilityRule:
     rule_id: str = "player_eligibility"
     priority: int = 70
-    enabled: bool = False
+    enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
         trade_rules = ctx.game_state.get("league", {}).get("trade_rules", {})
