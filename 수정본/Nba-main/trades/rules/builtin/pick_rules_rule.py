@@ -38,6 +38,19 @@ class PickRulesRule:
             )
 
         draft_picks = ctx.game_state.get("draft_picks", {})
+        # Safety guard: Stepien rule checks (year, year+1) pairs.
+        # If draft_picks data doesn't include year+1 at all (older saves / partial state),
+        # a missing year would be misread as "0 picks" and can cause false violations.
+        max_first_round_year_in_data = 0
+        for pick in draft_picks.values():
+            try:
+                if int(pick.get("round") or 0) != 1:
+                    continue
+                year_val = int(pick.get("year") or 0)
+            except (TypeError, ValueError):
+                continue
+            if year_val > max_first_round_year_in_data:
+                max_first_round_year_in_data = year_val
 
         for assets in deal.legs.values():
             for asset in assets:
@@ -87,6 +100,12 @@ class PickRulesRule:
             normalized_team_id = _norm_team_id(team_id)
             start = current_season_year + 1
             end = current_season_year + stepien_lookahead
+            # Clamp end so that (year+1) is still within available pick data.
+            # If max_first_round_year_in_data is 0, we can't clamp safely (no data), so keep original end.
+            if max_first_round_year_in_data > 0:
+                end = min(end, max_first_round_year_in_data - 1)
+            if end < start:
+                continue            
             for year in range(start, end + 1):  # Inclusive to check (end, end + 1) pair.
                 count_year = _count_first_round_picks_for_year(
                     draft_picks, owner_after, normalized_team_id, year
@@ -105,6 +124,7 @@ class PickRulesRule:
                             "trade_date": ctx.current_date.isoformat(),
                             "year": year,
                             "lookahead": stepien_lookahead,
+                            "data_max_first_round_year": max_first_round_year_in_data,
                         },
                     )
 
