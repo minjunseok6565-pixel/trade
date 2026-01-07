@@ -127,6 +127,8 @@ def sign_free_agent(
     player = game_state["players"][player_id]
     player["team_id"] = team_id
     player["signed_date"] = signed_date_iso
+    player["last_contract_action_date"] = signed_date_iso
+    player["last_contract_action_type"] = "SIGN_FREE_AGENT"
     player["signed_via_free_agency"] = True
     player["acquired_date"] = signed_date_iso
     player["acquired_via_trade"] = False
@@ -211,6 +213,8 @@ def re_sign_or_extend(
     player = game_state["players"][player_id]
     player["team_id"] = team_id
     player["signed_date"] = signed_date_iso
+    player["last_contract_action_date"] = signed_date_iso
+    player["last_contract_action_type"] = "RE_SIGN_OR_EXTEND"
     player["signed_via_free_agency"] = False
     player["acquired_date"] = signed_date_iso
     player["acquired_via_trade"] = False
