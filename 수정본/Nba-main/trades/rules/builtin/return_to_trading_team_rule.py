@@ -12,7 +12,7 @@ class ReturnToTradingTeamRule:
     rule_id: str = "return_to_trading_team_same_season"
     # Run after player eligibility but before salary matching.
     priority: int = 72
-    enabled: bool = False
+    enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
         season_year = int(ctx.game_state.get("league", {}).get("season_year") or 0)
