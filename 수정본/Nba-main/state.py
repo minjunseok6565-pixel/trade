@@ -12,6 +12,13 @@ from config import (
     SEASON_LENGTH_DAYS,
     MAX_GAMES_PER_DAY,
     DIVISIONS,
+    INITIAL_SEASON_YEAR,
+    CAP_BASE_SEASON_YEAR,
+    CAP_BASE_SALARY_CAP,
+    CAP_BASE_FIRST_APRON,
+    CAP_BASE_SECOND_APRON,
+    CAP_ANNUAL_GROWTH_RATE,
+    CAP_ROUND_UNIT,
 )
 
 DEFAULT_TRADE_RULES: Dict[str, Any] = {
@@ -19,6 +26,13 @@ DEFAULT_TRADE_RULES: Dict[str, Any] = {
     "salary_cap": 0.0,
     "first_apron": 0.0,
     "second_apron": 0.0,
+    "cap_auto_update": True,
+    "cap_base_season_year": CAP_BASE_SEASON_YEAR,
+    "cap_base_salary_cap": CAP_BASE_SALARY_CAP,
+    "cap_base_first_apron": CAP_BASE_FIRST_APRON,
+    "cap_base_second_apron": CAP_BASE_SECOND_APRON,
+    "cap_annual_growth_rate": CAP_ANNUAL_GROWTH_RATE,
+    "cap_round_unit": CAP_ROUND_UNIT,
     "match_small_out_max": 7_500_000,
     "match_mid_out_max": 29_000_000,
     "match_mid_add": 7_500_000,
@@ -286,6 +300,16 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("season_start", None)
     league.setdefault("current_date", None)
     league.setdefault("last_gm_tick_date", None)
+    season_year = league.get("season_year")
+    salary_cap = trade_rules.get("salary_cap")
+    if season_year:
+        try:
+            salary_cap_value = float(salary_cap or 0)
+        except (TypeError, ValueError):
+            salary_cap_value = 0
+        if salary_cap_value <= 0:
+            # Fix legacy saves so SalaryMatchingRule doesn't treat cap/aprons as zero.
+            _apply_cap_model_for_season(league, int(season_year))
     _ensure_trade_state()
     from contracts.store import ensure_contract_state
 
@@ -314,6 +338,68 @@ def _ensure_league_state() -> Dict[str, Any]:
     sync_roster_teams_from_state(GAME_STATE)
     sync_roster_salaries_for_season(GAME_STATE, season_year)
     return league
+
+
+def _apply_cap_model_for_season(league: Dict[str, Any], season_year: int) -> None:
+    """Apply the season-specific cap/apron values to trade rules."""
+    trade_rules = league.setdefault("trade_rules", {})
+    if trade_rules.get("cap_auto_update") is False:
+        return
+    try:
+        base_season_year = int(
+            trade_rules.get("cap_base_season_year", CAP_BASE_SEASON_YEAR)
+        )
+    except (TypeError, ValueError):
+        base_season_year = CAP_BASE_SEASON_YEAR
+    try:
+        base_salary_cap = float(
+            trade_rules.get("cap_base_salary_cap", CAP_BASE_SALARY_CAP)
+        )
+    except (TypeError, ValueError):
+        base_salary_cap = float(CAP_BASE_SALARY_CAP)
+    try:
+        base_first_apron = float(
+            trade_rules.get("cap_base_first_apron", CAP_BASE_FIRST_APRON)
+        )
+    except (TypeError, ValueError):
+        base_first_apron = float(CAP_BASE_FIRST_APRON)
+    try:
+        base_second_apron = float(
+            trade_rules.get("cap_base_second_apron", CAP_BASE_SECOND_APRON)
+        )
+    except (TypeError, ValueError):
+        base_second_apron = float(CAP_BASE_SECOND_APRON)
+    try:
+        annual_growth_rate = float(
+            trade_rules.get("cap_annual_growth_rate", CAP_ANNUAL_GROWTH_RATE)
+        )
+    except (TypeError, ValueError):
+        annual_growth_rate = float(CAP_ANNUAL_GROWTH_RATE)
+    try:
+        round_unit = int(trade_rules.get("cap_round_unit", CAP_ROUND_UNIT) or 1)
+    except (TypeError, ValueError):
+        round_unit = CAP_ROUND_UNIT
+    if round_unit <= 0:
+        round_unit = CAP_ROUND_UNIT or 1
+
+    years_passed = season_year - base_season_year
+    multiplier = (1.0 + annual_growth_rate) ** years_passed
+
+    def _round_to_unit(value: float) -> int:
+        return int(round(value / round_unit) * round_unit)
+
+    salary_cap = _round_to_unit(base_salary_cap * multiplier)
+    first_apron = _round_to_unit(base_first_apron * multiplier)
+    second_apron = _round_to_unit(base_second_apron * multiplier)
+
+    if first_apron < salary_cap:
+        first_apron = salary_cap
+    if second_apron < first_apron:
+        second_apron = first_apron
+
+    trade_rules["salary_cap"] = salary_cap
+    trade_rules["first_apron"] = first_apron
+    trade_rules["second_apron"] = second_apron
 
 
 def _ensure_trade_state() -> None:
@@ -347,6 +433,7 @@ def _build_master_schedule(season_year: int) -> None:
     previous_season_year = league.get("season_year")
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
+    _apply_cap_model_for_season(league, season_year)
 
     # Stepien 룰은 (year, year+1) 쌍을 검사하기 때문에,
     # lookahead=N이면 draft_year+N+1까지 "픽 데이터가 존재"해야 데이터 결측으로 인한 오판을 피할 수 있다.
@@ -551,8 +638,8 @@ def initialize_master_schedule_if_needed() -> None:
     if master_schedule.get("games"):
         return
 
-    today = date.today()
-    season_year = today.year
+    # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
+    season_year = INITIAL_SEASON_YEAR
     _build_master_schedule(season_year)
 
 
