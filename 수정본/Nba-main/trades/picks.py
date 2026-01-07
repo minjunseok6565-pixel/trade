@@ -12,13 +12,18 @@ def init_draft_picks_if_needed(
     years_ahead: int = 7,
 ) -> None:
     draft_picks = game_state.setdefault("draft_picks", {})
-    if draft_picks:
-        return
+    # NOTE:
+    # 기존 구현은 draft_picks가 조금이라도 있으면 return 하여,
+    # 규정(예: Stepien lookahead) 변경이나 버그 수정으로 "미래 연도 픽"이 더 필요해져도
+    # 기존 세이브 상태에서는 생성 범위를 확장할 수 없었다.
+    # 아래는 "누락된 픽만" 추가 생성하는 방식(idempotent)이라 기존 상태를 깨지 않으면서 확장 가능하다.
 
     for year in range(draft_year, draft_year + years_ahead + 1):
         for round_num in (1, 2):
             for team_id in all_team_ids:
                 pick_id = f"{year}_R{round_num}_{team_id}"
+                if pick_id in draft_picks:
+                    continue
                 draft_picks[pick_id] = {
                     "pick_id": pick_id,
                     "year": year,
