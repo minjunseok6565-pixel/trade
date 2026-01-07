@@ -11,7 +11,7 @@ from ..base import TradeContext
 class PickRulesRule:
     rule_id: str = "pick_rules"
     priority: int = 80
-    enabled: bool = False
+    enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
         def _norm_team_id(x) -> str:
