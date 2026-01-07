@@ -6,6 +6,7 @@ from .duplicate_asset_rule import DuplicateAssetRule
 from .ownership_rule import OwnershipRule
 from .pick_rules_rule import PickRulesRule
 from .player_eligibility_rule import PlayerEligibilityRule
+from .return_to_trading_team_rule import ReturnToTradingTeamRule
 from .roster_limit_rule import RosterLimitRule
 from .salary_matching_rule import SalaryMatchingRule
 from .team_legs_rule import TeamLegsRule
@@ -17,6 +18,7 @@ BUILTIN_RULES = [
     OwnershipRule(),
     RosterLimitRule(),
     PlayerEligibilityRule(),
+    ReturnToTradingTeamRule(),
     PickRulesRule(),
     SalaryMatchingRule(),
     TeamLegsRule(),

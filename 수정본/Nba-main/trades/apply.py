@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -41,10 +42,18 @@ def apply_deal(
     _init_players_and_teams_if_needed()
     player_ids = _collect_player_ids(deal)
     original_teams: Dict[int, str] = {}
+    original_trade_return_bans: Dict[int, Optional[Dict[str, List[str]]]] = {}
     original_pick_owners: Dict[str, str] = {}
 
     try:
         acquired_date = (trade_date or get_current_date_as_date()).isoformat()
+        season_year = int(GAME_STATE.get("league", {}).get("season_year") or 0)
+        if season_year <= 0:
+            try:
+                season_year = int(get_current_date_as_date().year)
+            except Exception:
+                season_year = 0
+        season_key = str(season_year) if season_year > 0 else None
         for player_id in player_ids:
             try:
                 original_teams[player_id] = str(ROSTER_DF.at[player_id, "Team"]).upper()
@@ -60,11 +69,25 @@ def apply_deal(
                     ROSTER_DF.at[asset.player_id, "Team"] = to_team
                     player_state = GAME_STATE.get("players", {}).get(asset.player_id)
                     if player_state is not None:
+                        if asset.player_id not in original_trade_return_bans:
+                            original_trade_return_bans[asset.player_id] = deepcopy(
+                                player_state.get("trade_return_bans")
+                            )
                         player_state["team_id"] = to_team
                         player_state.setdefault("signed_date", "1900-01-01")
                         player_state.setdefault("signed_via_free_agency", False)
                         player_state["acquired_date"] = acquired_date
                         player_state["acquired_via_trade"] = True
+                        if season_key:
+                            trade_return_bans = player_state.setdefault(
+                                "trade_return_bans", {}
+                            )
+                            season_bans = trade_return_bans.get(season_key)
+                            if not isinstance(season_bans, list):
+                                season_bans = []
+                            if str(from_team) not in season_bans:
+                                season_bans.append(str(from_team))
+                            trade_return_bans[season_key] = season_bans
                 if isinstance(asset, PickAsset):
                     draft_picks = GAME_STATE.get("draft_picks", {})
                     pick = draft_picks.get(asset.pick_id)
@@ -96,6 +119,12 @@ def apply_deal(
             player_state = GAME_STATE.get("players", {}).get(player_id)
             if player_state is not None:
                 player_state["team_id"] = team_id
+                if player_id in original_trade_return_bans:
+                    original_bans = original_trade_return_bans[player_id]
+                    if original_bans is None:
+                        player_state.pop("trade_return_bans", None)
+                    else:
+                        player_state["trade_return_bans"] = original_bans
         draft_picks = GAME_STATE.get("draft_picks", {})
         for pick_id, owner_team in original_pick_owners.items():
             pick = draft_picks.get(pick_id)
