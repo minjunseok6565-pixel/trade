@@ -11,7 +11,7 @@ from ..base import TradeContext, build_team_trade_totals, build_team_payrolls
 class SalaryMatchingRule:
     rule_id: str = "salary_matching"
     priority: int = 90
-    enabled: bool = False
+    enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
         trade_rules = ctx.game_state.get("league", {}).get("trade_rules", {})
