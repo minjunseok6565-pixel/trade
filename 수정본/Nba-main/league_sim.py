@@ -116,6 +116,7 @@ def advance_league_until(
     set_current_date(target_date_str)
 
     # AI GM 트레이드 틱 (트레이드 데드라인 및 7일 간격 체크 포함)
+    # AI trade tick entrypoint; keep this as the sole call site.
     _run_ai_gm_tick_if_needed(target_date)
 
     return simulated_game_objs
