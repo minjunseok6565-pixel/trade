@@ -10,7 +10,7 @@ from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
 from trades.apply import apply_deal
 from trades.errors import TradeError
-from trades.models import canonicalize_deal, parse_deal
+from trades.models import PickAsset, PlayerAsset, asset_key, canonicalize_deal, parse_deal
 from trades.validator import validate_deal
 from trades import agreements
 
@@ -87,7 +87,7 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
 
             vet_candidates = vet_candidates.sort_values(by="OVR", ascending=False)
             veteran_id = int(vet_candidates.index[0])
-            if f"player:{veteran_id}" in asset_locks:
+            if asset_key(PlayerAsset(kind="player", player_id=int(veteran_id))) in asset_locks:
                 continue
 
             pick_candidates = [
@@ -96,7 +96,9 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
                 if pick.get("owner_team") == contender
                 and pick.get("round") == 2
                 and int(pick.get("year", current_year)) >= current_year
-                and f"pick:{pick.get('pick_id')}" not in asset_locks
+                and pick.get("protection") is None
+                and asset_key(PickAsset(kind="pick", pick_id=str(pick.get("pick_id"))))
+                not in asset_locks
             ]
             if not pick_candidates:
                 continue

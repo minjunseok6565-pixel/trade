@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from ...errors import ASSET_LOCKED, TradeError
-from ...models import PickAsset, PlayerAsset
+from ...models import FixedAsset, PickAsset, PlayerAsset, SwapAsset, asset_key
 from ..base import TradeContext
 
 
@@ -20,14 +20,9 @@ class AssetLockRule:
 
         for team_id, assets in deal.legs.items():
             for asset in assets:
-                if isinstance(asset, PlayerAsset):
-                    asset_key = f"player:{asset.player_id}"
-                elif isinstance(asset, PickAsset):
-                    asset_key = f"pick:{asset.pick_id}"
-                else:
-                    continue
+                asset_key_value = asset_key(asset)
 
-                lock = asset_locks.get(asset_key)
+                lock = asset_locks.get(asset_key_value)
                 if not lock:
                     continue
 
@@ -45,14 +40,14 @@ class AssetLockRule:
                                 ASSET_LOCKED,
                                 "Asset lock expiry could not be parsed",
                                 {
-                                    "asset_key": asset_key,
+                                    "asset_key": asset_key_value,
                                     "deal_id": locked_deal_id,
                                     "expires_at": expires_at,
                                 },
                             )
 
                 if expires_at_date is not None and ctx.current_date > expires_at_date:
-                    asset_locks.pop(asset_key, None)
+                    asset_locks.pop(asset_key_value, None)
                     continue
 
                 if allow_locked_by_deal_id and locked_deal_id == allow_locked_by_deal_id:
@@ -62,7 +57,7 @@ class AssetLockRule:
                     ASSET_LOCKED,
                     "Asset is locked",
                     {
-                        "asset_key": asset_key,
+                        "asset_key": asset_key_value,
                         "deal_id": locked_deal_id,
                         "expires_at": expires_at,
                     },

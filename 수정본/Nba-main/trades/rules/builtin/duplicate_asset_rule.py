@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ...errors import DUPLICATE_ASSET, TradeError
-from ...models import PickAsset, PlayerAsset
+from ...models import FixedAsset, PickAsset, PlayerAsset, SwapAsset, asset_key
 from ..base import TradeContext
 
 
@@ -17,20 +17,15 @@ class DuplicateAssetRule:
         seen_assets: dict[str, str] = {}
         for team_id, assets in deal.legs.items():
             for asset in assets:
-                if isinstance(asset, PlayerAsset):
-                    asset_key = f"player:{asset.player_id}"
-                elif isinstance(asset, PickAsset):
-                    asset_key = f"pick:{asset.pick_id}"
-                else:
-                    continue
-                if asset_key in seen_assets:
+                key = asset_key(asset)
+                if key in seen_assets:
                     raise TradeError(
                         DUPLICATE_ASSET,
                         "Duplicate asset in deal",
                         {
-                            "asset_key": asset_key,
-                            "first_sender": seen_assets[asset_key],
+                            "asset_key": key,
+                            "first_sender": seen_assets[key],
                             "duplicate_sender": team_id,
                         },
                     )
-                seen_assets[asset_key] = team_id
+                seen_assets[key] = team_id
