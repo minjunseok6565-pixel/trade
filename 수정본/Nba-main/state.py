@@ -96,6 +96,17 @@ GAME_STATE: Dict[str, Any] = {
     "asset_locks": {},  # asset_key -> {deal_id, expires_at}
     "swap_rights": {},
     "fixed_assets": {},
+    "trade_market": {
+        "last_tick_date": None,
+        "listings": {},
+        "threads": {},
+        "cooldowns": {},
+        "events": [],
+    },
+    "trade_memory": {
+        "relationships": {},
+    },
+    "gm_profiles": {},
 }
 
 
@@ -406,12 +417,56 @@ def _apply_cap_model_for_season(league: Dict[str, Any], season_year: int) -> Non
 
 def _ensure_trade_state() -> None:
     """트레이드 관련 GAME_STATE 키를 보장한다."""
+    default_trade_market = {
+        "last_tick_date": None,
+        "listings": {},
+        "threads": {},
+        "cooldowns": {},
+        "events": [],
+    }
+    default_trade_memory = {
+        "relationships": {},
+    }
     GAME_STATE.setdefault("trade_agreements", {})
     GAME_STATE.setdefault("negotiations", {})
     GAME_STATE.setdefault("draft_picks", {})
     GAME_STATE.setdefault("asset_locks", {})
     GAME_STATE.setdefault("swap_rights", {})
     GAME_STATE.setdefault("fixed_assets", {})
+
+    trade_market = GAME_STATE.get("trade_market")
+    if not isinstance(trade_market, dict):
+        trade_market = dict(default_trade_market)
+        GAME_STATE["trade_market"] = trade_market
+    trade_market.setdefault("last_tick_date", None)
+    if trade_market["last_tick_date"] is not None and not isinstance(
+        trade_market["last_tick_date"], str
+    ):
+        trade_market["last_tick_date"] = None
+    trade_market.setdefault("listings", {})
+    if not isinstance(trade_market["listings"], dict):
+        trade_market["listings"] = {}
+    trade_market.setdefault("threads", {})
+    if not isinstance(trade_market["threads"], dict):
+        trade_market["threads"] = {}
+    trade_market.setdefault("cooldowns", {})
+    if not isinstance(trade_market["cooldowns"], dict):
+        trade_market["cooldowns"] = {}
+    trade_market.setdefault("events", [])
+    if not isinstance(trade_market["events"], list):
+        trade_market["events"] = []
+
+    trade_memory = GAME_STATE.get("trade_memory")
+    if not isinstance(trade_memory, dict):
+        trade_memory = dict(default_trade_memory)
+        GAME_STATE["trade_memory"] = trade_memory
+    trade_memory.setdefault("relationships", {})
+    if not isinstance(trade_memory["relationships"], dict):
+        trade_memory["relationships"] = {}
+
+    gm_profiles = GAME_STATE.get("gm_profiles")
+    if not isinstance(gm_profiles, dict):
+        GAME_STATE["gm_profiles"] = {}
 
 
 def _build_master_schedule(season_year: int) -> None:
