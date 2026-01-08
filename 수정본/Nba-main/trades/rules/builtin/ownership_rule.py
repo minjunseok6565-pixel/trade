@@ -45,6 +45,18 @@ class OwnershipRule:
                             "Pick not found",
                             {"pick_id": asset.pick_id, "team_id": team_id},
                         )
+                    # Ensure teams cannot trade picks they do not own.
+                    current_owner = str(pick.get("owner_team", "")).upper()
+                    if current_owner != team_id:
+                        raise TradeError(
+                            PICK_NOT_OWNED,
+                            "Pick not owned by team",
+                            {
+                                "pick_id": asset.pick_id,
+                                "team_id": team_id,
+                                "owner_team": current_owner,
+                            },
+                        )
                     if asset.protection is not None:
                         existing_protection = pick.get("protection")
                         if existing_protection is not None and existing_protection != asset.protection:
@@ -57,12 +69,6 @@ class OwnershipRule:
                                     "attempted_protection": asset.protection,
                                 },
                             )
-                    if str(pick.get("owner_team", "")).upper() != team_id:
-                        raise TradeError(
-                            PICK_NOT_OWNED,
-                            "Pick not owned by team",
-                            {"pick_id": asset.pick_id, "team_id": team_id},
-                        )
                 if isinstance(asset, FixedAsset):
                     fixed_assets = ctx.game_state.get("fixed_assets", {})
                     fixed = fixed_assets.get(asset.asset_id)
