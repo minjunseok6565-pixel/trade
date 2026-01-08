@@ -113,6 +113,7 @@ def settle_draft_year(
                     "draft_year": draft_year,
                 }
 
+        final_owner_team = str(pick.get("owner_team", "")).upper()
         events.append(
             {
                 "type": "pick_protection_settled",
@@ -121,7 +122,8 @@ def settle_draft_year(
                 "slot": slot,
                 "protected": protected,
                 "original_team": original_team,
-                "owner_team": pick.get("owner_team"),
+                "owner_team": owner_team,
+                "final_owner_team": final_owner_team,
                 "compensation_asset_id": compensation_asset_id,
             }
         )
@@ -198,6 +200,25 @@ def settle_draft_year(
             )
         owner_a = str(pick_a.get("owner_team", "")).upper()
         owner_b = str(pick_b.get("owner_team", "")).upper()
+        exercisable = owner_team == owner_a or owner_team == owner_b
+        if not exercisable:
+            swap["active"] = False
+            events.append(
+                {
+                    "type": "swap_unexercisable",
+                    "swap_id": swap_id,
+                    "draft_year": draft_year,
+                    "owner_team": owner_team,
+                    "pick_id_a": pick_id_a,
+                    "pick_id_b": pick_id_b,
+                    "owner_a": owner_a,
+                    "owner_b": owner_b,
+                    "slot_a": slot_a,
+                    "slot_b": slot_b,
+                    "swap_executed": False,
+                }
+            )
+            continue
 
         if slot_a == slot_b:
             swap["active"] = False
@@ -235,6 +256,8 @@ def settle_draft_year(
         worse_pick["owner_team"] = other_owner
         swap["active"] = False
 
+        owner_a_after = str(pick_a.get("owner_team", "")).upper()
+        owner_b_after = str(pick_b.get("owner_team", "")).upper()
         events.append(
             {
                 "type": "swap_settled",
@@ -247,6 +270,10 @@ def settle_draft_year(
                 "chosen_pick_id": chosen_pick_id,
                 "owner_team": owner_team,
                 "other_owner_team": other_owner,
+                "owner_a_before": owner_a,
+                "owner_b_before": owner_b,
+                "owner_a_after": owner_a_after,
+                "owner_b_after": owner_b_after,
                 "swap_executed": True,
             }
         )
