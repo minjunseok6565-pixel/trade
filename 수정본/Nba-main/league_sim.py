@@ -8,7 +8,7 @@ from state import (
     _ensure_league_state,
     initialize_master_schedule_if_needed,
     set_current_date,
-    update_state_with_game,
+    update_state_with_engine_result,
 )
 from trades_ai import _run_ai_gm_tick_if_needed
 from match_engine import Team, MatchEngine
@@ -25,8 +25,8 @@ def advance_league_until(
       * 유저 팀(user_team_id)이 포함되지 않은
       * 아직 status != 'final' 인 경기만
       매치 엔진으로 시뮬레이션한다.
-    - 각 경기 결과는 update_state_with_game(...)을 통해 GAME_STATE에 반영한다.
-    - 반환값: update_state_with_game가 반환한 game_obj 리스트
+    - 각 경기 결과는 update_state_with_engine_result(...)을 통해 GAME_STATE에 반영한다.
+    - 반환값: update_state_with_engine_result가 반환한 game_obj 리스트
 
     target_date_str 형식이 잘못된 경우 ValueError를 발생시킨다.
     """
@@ -92,15 +92,12 @@ def advance_league_until(
 
             home_team = Team(home_id, home_df)
             away_team = Team(away_id, away_df)
-            engine = MatchEngine(home_team, away_team)
             result = engine.simulate_game()
-            score = result.get("final_score", {})
 
-            game_obj = update_state_with_game(
+            game_obj = update_state_with_engine_result(
                 home_id=home_id,
                 away_id=away_id,
-                score=score,
-                boxscore=result.get("boxscore"),
+                engine_result=result,
                 game_date=day_str,
             )
 
@@ -151,12 +148,12 @@ def simulate_single_game(
     result = engine.simulate_game()
 
     # 인게임 날짜를 서버 STATE에도 반영
-    update_state_with_game(
-        home_id,
-        away_id,
-        result.get("final_score", {}),
-        boxscore=result.get("boxscore"),
+    update_state_with_engine_result(
+        home_id=home_id,
+        away_id=away_id,
+        engine_result=result,
         game_date=game_date,
     )
 
     return result
+
