@@ -8,6 +8,7 @@ def process_offseason(
     from_season_year: int,
     to_season_year: int,
     decision_policy=None,
+    draft_pick_order_by_pick_id: dict[str, int] | None = None,
 ) -> dict:
     from contracts.options import (
         apply_option_decision,
@@ -92,4 +93,59 @@ def process_offseason(
     sync_contract_team_ids_from_players(game_state)
     sync_roster_teams_from_state(game_state)
 
-    return {"expired": expired, "released": released}
+    try:
+        draft_year_to_settle = int(from_season_year) + 1
+    except (TypeError, ValueError):
+        draft_year_to_settle = None
+
+    pick_order = None
+    if draft_pick_order_by_pick_id:
+        pick_order = draft_pick_order_by_pick_id
+    else:
+        orders = game_state.get("draft_pick_orders") or {}
+        if draft_year_to_settle is not None:
+            pick_order_candidate = orders.get(draft_year_to_settle) or orders.get(
+                str(draft_year_to_settle)
+            )
+            if isinstance(pick_order_candidate, dict) and pick_order_candidate:
+                pick_order = pick_order_candidate
+
+    if draft_year_to_settle is None:
+        settlement_result = {
+            "draft_year": None,
+            "ok": False,
+            "skipped": True,
+            "reason": "invalid_draft_year",
+        }
+    elif not pick_order:
+        settlement_result = {
+            "draft_year": draft_year_to_settle,
+            "ok": False,
+            "skipped": True,
+            "reason": "missing_pick_order",
+        }
+    else:
+        from trades.errors import TradeError
+        from trades.pick_settlement import settle_draft_year
+
+        try:
+            events = settle_draft_year(game_state, draft_year_to_settle, pick_order)
+        except TradeError as exc:
+            settlement_result = {
+                "draft_year": draft_year_to_settle,
+                "ok": False,
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                },
+            }
+        else:
+            settlement_result = {
+                "draft_year": draft_year_to_settle,
+                "ok": True,
+                "events_count": len(events),
+                "events": events,
+            }
+
+    return {"expired": expired, "released": released, "trade_settlement": settlement_result}

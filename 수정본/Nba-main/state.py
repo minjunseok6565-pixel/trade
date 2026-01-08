@@ -94,6 +94,8 @@ GAME_STATE: Dict[str, Any] = {
     "negotiations": {},  # session_id -> negotiation sessions
     "draft_picks": {},  # Phase 3 later
     "asset_locks": {},  # asset_key -> {deal_id, expires_at}
+    "swap_rights": {},
+    "fixed_assets": {},
 }
 
 
@@ -408,6 +410,8 @@ def _ensure_trade_state() -> None:
     GAME_STATE.setdefault("negotiations", {})
     GAME_STATE.setdefault("draft_picks", {})
     GAME_STATE.setdefault("asset_locks", {})
+    GAME_STATE.setdefault("swap_rights", {})
+    GAME_STATE.setdefault("fixed_assets", {})
 
 
 def _build_master_schedule(season_year: int) -> None:

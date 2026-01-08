@@ -15,32 +15,52 @@ from .errors import (
     DEAL_INVALIDATED,
     DEAL_ALREADY_EXECUTED,
 )
-from .models import Deal, PlayerAsset, PickAsset, canonicalize_deal, parse_deal, serialize_deal
+from .models import (
+    Asset,
+    Deal,
+    FixedAsset,
+    PickAsset,
+    PlayerAsset,
+    SwapAsset,
+    asset_key,
+    canonicalize_deal,
+    parse_deal,
+    serialize_deal,
+)
 from .validator import validate_deal
 
 
-def _asset_key(asset: PlayerAsset | PickAsset) -> str:
-    if isinstance(asset, PlayerAsset):
-        return f"player:{asset.player_id}"
-    return f"pick:{asset.pick_id}"
-
-
 def _compute_assets_hash(deal: Deal) -> str:
-    ownership_snapshot: Dict[str, str] = {}
+    ownership_snapshot: Dict[str, Any] = {}
     draft_picks = GAME_STATE.get("draft_picks", {})
+    swap_rights = GAME_STATE.get("swap_rights", {})
+    fixed_assets = GAME_STATE.get("fixed_assets", {})
     for assets in deal.legs.values():
         for asset in assets:
-            asset_key = _asset_key(asset)
+            asset_key_value = asset_key(asset)
             if isinstance(asset, PlayerAsset):
                 try:
-                    ownership_snapshot[asset_key] = str(
+                    ownership_snapshot[asset_key_value] = str(
                         ROSTER_DF.at[asset.player_id, "Team"]
                     ).upper()
                 except Exception:
-                    ownership_snapshot[asset_key] = ""
-            if isinstance(asset, PickAsset):
+                    ownership_snapshot[asset_key_value] = ""
+            elif isinstance(asset, PickAsset):
                 pick = draft_picks.get(asset.pick_id, {})
-                ownership_snapshot[asset_key] = str(pick.get("owner_team", "")).upper()
+                ownership_snapshot[asset_key_value] = {
+                    "owner_team": str(pick.get("owner_team", "")).upper(),
+                    "protection": pick.get("protection"),
+                }
+            elif isinstance(asset, SwapAsset):
+                swap = swap_rights.get(asset.swap_id, {})
+                ownership_snapshot[asset_key_value] = {
+                    "owner_team": str(swap.get("owner_team", "")).upper()
+                }
+            elif isinstance(asset, FixedAsset):
+                fixed = fixed_assets.get(asset.asset_id, {})
+                ownership_snapshot[asset_key_value] = {
+                    "owner_team": str(fixed.get("owner_team", "")).upper()
+                }
 
     payload = {"deal": serialize_deal(deal), "ownership": ownership_snapshot}
     raw = json.dumps(payload, sort_keys=True)
@@ -77,7 +97,7 @@ def _lock_assets_for_deal(deal: Deal, deal_id: str, expires_at: str) -> None:
     locks = GAME_STATE.setdefault("asset_locks", {})
     for assets in deal.legs.values():
         for asset in assets:
-            locks[_asset_key(asset)] = {"deal_id": deal_id, "expires_at": expires_at}
+            locks[asset_key(asset)] = {"deal_id": deal_id, "expires_at": expires_at}
 
 
 def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> Deal:
@@ -112,7 +132,7 @@ def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> 
     locks = GAME_STATE.get("asset_locks", {})
     for assets in deal.legs.values():
         for asset in assets:
-            lock = locks.get(_asset_key(asset))
+            lock = locks.get(asset_key(asset))
             if not lock or lock.get("deal_id") != deal_id:
                 entry["status"] = "INVALIDATED"
                 release_locks_for_deal(deal_id)

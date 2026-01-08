@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from config import ALL_TEAM_IDS
 
 from ...errors import INVALID_TEAM, MISSING_TO_TEAM, TradeError
-from ...models import Deal, PickAsset, PlayerAsset
+from ...models import Deal
 from ..base import TradeContext
 
 
@@ -51,7 +51,7 @@ class TeamLegsRule:
 
         for team_id, assets in deal.legs.items():
             for asset in assets:
-                if isinstance(asset, (PlayerAsset, PickAsset)) and asset.to_team:
+                if asset.to_team:
                     if asset.to_team not in deal.teams:
                         raise TradeError(
                             INVALID_TEAM,
