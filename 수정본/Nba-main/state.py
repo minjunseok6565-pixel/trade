@@ -49,10 +49,14 @@ DEFAULT_TRADE_RULES: Dict[str, Any] = {
 # 1. 전역 GAME_STATE 및 스케줄/리그 상태 유틸
 # -------------------------------------------------------------------------
 GAME_STATE: Dict[str, Any] = {
-    "schema_version": "1.2",
+    "schema_version": "2.0",
     "turn": 0,
     "games": [],  # 각 경기의 메타 데이터
     "player_stats": {},  # player_id -> 시즌 누적 스탯
+    "team_stats": {},  # team_id -> 시즌 누적 팀 스탯(가공 팀 박스)
+    "game_results": {},  # game_id -> 매치엔진 원본 결과(신규 엔진 기준)
+    "active_season_year": None,  # 현재 누적이 쌓이는 시즌 시작 연도
+    "season_history": {},  # str(season_year) -> {games, player_stats, team_stats, game_results}
     "cached_views": {
         "scores": {
             "latest_date": None,
@@ -434,6 +438,75 @@ def _ensure_trade_state() -> None:
     GAME_STATE.setdefault("swap_rights", {})
     GAME_STATE.setdefault("fixed_assets", {})
 
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _reset_cached_views_for_new_season() -> None:
+    """정규시즌 누적이 새로 시작될 때 cached_views도 함께 초기화한다."""
+    cached = GAME_STATE.setdefault("cached_views", {})
+    scores = cached.setdefault("scores", {})
+    scores["latest_date"] = None
+    scores["games"] = []
+    schedule = cached.setdefault("schedule", {})
+    schedule["teams"] = {}
+    stats = cached.setdefault("stats", {})
+    stats["leaders"] = None
+    weekly = cached.setdefault("weekly_news", {})
+    weekly["last_generated_week_start"] = None
+    weekly["items"] = []
+    playoff_news = cached.setdefault("playoff_news", {})
+    playoff_news.setdefault("series_game_counts", {})
+    playoff_news["series_game_counts"] = {}
+    playoff_news["items"] = []
+
+
+def _archive_and_reset_season_accumulators(
+    previous_season_year: Optional[int],
+    next_season_year: Optional[int],
+) -> None:
+    """시즌이 바뀔 때 정규시즌 누적 데이터를 history로 옮기고 초기화한다.
+
+    - 이전 시즌 누적은 season_history[str(previous_season_year)]에 보관
+    - 새 시즌 누적은 빈 dict로 시작
+    """
+    if previous_season_year:
+        history = GAME_STATE.setdefault("season_history", {})
+        history[str(previous_season_year)] = {
+            "games": GAME_STATE.get("games", []),
+            "player_stats": GAME_STATE.get("player_stats", {}),
+            "team_stats": GAME_STATE.get("team_stats", {}),
+            "game_results": GAME_STATE.get("game_results", {}),
+        }
+
+    GAME_STATE["games"] = []
+    GAME_STATE["player_stats"] = {}
+    GAME_STATE["team_stats"] = {}
+    GAME_STATE["game_results"] = {}
+    GAME_STATE["postseason"] = {}
+
+    GAME_STATE["active_season_year"] = next_season_year
+    _reset_cached_views_for_new_season()
+
+
+def _ensure_active_season_year(season_year: Optional[int]) -> None:
+    """리그 시즌과 누적 시즌이 불일치하면 새 시즌 누적으로 전환한다."""
+    if not season_year:
+        return
+    active = GAME_STATE.get("active_season_year")
+    try:
+        active_int = int(active) if active is not None else None
+    except (TypeError, ValueError):
+        active_int = None
+
+    if active_int is None:
+        GAME_STATE["active_season_year"] = int(season_year)
+        return
+
+    if int(season_year) != active_int:
+        _archive_and_reset_season_accumulators(active_int, int(season_year))
+
     trade_market = GAME_STATE.get("trade_market")
     if not isinstance(trade_market, dict):
         trade_market = dict(default_trade_market)
@@ -684,11 +757,15 @@ def _build_master_schedule(season_year: int) -> None:
         next_season = int(season_year or 0)
     except (TypeError, ValueError):
         next_season = 0
+    # 누적 스탯(정규시즌)은 시즌 단위로 끊는다.
+    # - 시즌이 바뀌면 기존 누적은 history로 보관하고, 새 시즌 누적을 새로 시작한다.
     if previous_season and next_season and previous_season != next_season:
         from contracts.offseason import process_offseason
 
         process_offseason(GAME_STATE, previous_season, next_season)
-
+        _archive_and_reset_season_accumulators(previous_season, next_season)
+    else:
+        _ensure_active_season_year(next_season or season_year)
 
 def initialize_master_schedule_if_needed() -> None:
     """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
@@ -729,6 +806,293 @@ def _mark_master_schedule_game_final(
 # -------------------------------------------------------------------------
 # 2. 경기를 상태에 반영 / STATE 업데이트 유틸
 # -------------------------------------------------------------------------
+def _merge_numeric_dict_sum(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    """dict 안의 숫자 필드를 누적(summation)으로 합친다(중첩 1레벨까지)."""
+    for k, v in (src or {}).items():
+        if isinstance(v, dict):
+            child = dst.setdefault(k, {})
+            if isinstance(child, dict):
+                _merge_numeric_dict_sum(child, v)
+            continue
+        if _is_number(v):
+            try:
+                dst[k] = float(dst.get(k, 0.0)) + float(v)
+            except (TypeError, ValueError):
+                continue
+
+
+def _extract_team_payload(engine_result: Dict[str, Any]) -> Any:
+    return (
+        engine_result.get("teams")
+        or engine_result.get("team_box")
+        or engine_result.get("team_boxscore")
+        or {}
+    )
+
+
+def _select_team_summary(
+    teams_payload: Any,
+    team_id: str,
+    role_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """신규 매치엔진의 teams payload에서 특정 팀 summary dict를 최대한 견고하게 찾는다."""
+    if isinstance(teams_payload, dict):
+        if team_id in teams_payload and isinstance(teams_payload[team_id], dict):
+            return teams_payload[team_id]
+        if role_hint and role_hint in teams_payload and isinstance(teams_payload[role_hint], dict):
+            return teams_payload[role_hint]
+
+        for _, v in teams_payload.items():
+            if not isinstance(v, dict):
+                continue
+            tid = v.get("team_id") or v.get("TeamID") or v.get("id") or v.get("Team")
+            if tid and str(tid).upper() == str(team_id).upper():
+                return v
+        return {}
+
+    if isinstance(teams_payload, list):
+        for v in teams_payload:
+            if not isinstance(v, dict):
+                continue
+            tid = v.get("team_id") or v.get("TeamID") or v.get("id") or v.get("Team")
+            if tid and str(tid).upper() == str(team_id).upper():
+                return v
+
+    return {}
+
+
+def _extract_player_box_payload(engine_result: Dict[str, Any]) -> Any:
+    return (
+        engine_result.get("player_box")
+        or engine_result.get("player_boxscore")
+        or engine_result.get("boxscore")
+        or {}
+    )
+
+
+def _normalize_player_rows_for_team(
+    player_box_payload: Any,
+    team_id: str,
+    role_hint: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """신규 매치엔진의 player box payload를 state.py가 누적할 수 있는 rows(list[dict])로 정규화."""
+    team_blob: Any = None
+
+    if isinstance(player_box_payload, dict):
+        if team_id in player_box_payload:
+            team_blob = player_box_payload[team_id]
+        elif role_hint and role_hint in player_box_payload:
+            team_blob = player_box_payload[role_hint]
+        else:
+            for _, v in player_box_payload.items():
+                if isinstance(v, dict):
+                    tid = v.get("team_id") or v.get("TeamID") or v.get("Team")
+                    if tid and str(tid).upper() == str(team_id).upper():
+                        team_blob = v
+                        break
+
+    rows: List[Dict[str, Any]] = []
+    if isinstance(team_blob, list):
+        rows = [r for r in team_blob if isinstance(r, dict)]
+    elif isinstance(team_blob, dict):
+        if all(isinstance(v, dict) for v in team_blob.values()):
+            rows = list(team_blob.values())
+        else:
+            rows = [team_blob]
+
+    normalized: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        if "PlayerID" not in rr:
+            pid = rr.get("player_id") or rr.get("id") or rr.get("PID")
+            if pid is not None:
+                rr["PlayerID"] = pid
+        if "Team" not in rr:
+            rr["Team"] = team_id
+        normalized.append(rr)
+
+    return normalized
+
+
+def _extract_final_score_from_engine(
+    engine_result: Dict[str, Any],
+    home_id: str,
+    away_id: str,
+    team_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """신규 매치엔진 결과에서 최종 점수를 dict(team_id -> int)로 추출."""
+    score_obj = (
+        engine_result.get("final_score")
+        or engine_result.get("finalScore")
+        or engine_result.get("score")
+        or {}
+    )
+
+    home_score: int = 0
+    away_score: int = 0
+
+    if isinstance(score_obj, dict):
+        if home_id in score_obj or away_id in score_obj:
+            try:
+                home_score = int(score_obj.get(home_id, 0) or 0)
+            except (TypeError, ValueError):
+                home_score = 0
+            try:
+                away_score = int(score_obj.get(away_id, 0) or 0)
+            except (TypeError, ValueError):
+                away_score = 0
+        elif "home" in score_obj and "away" in score_obj:
+            try:
+                home_score = int(score_obj.get("home", 0) or 0)
+            except (TypeError, ValueError):
+                home_score = 0
+            try:
+                away_score = int(score_obj.get("away", 0) or 0)
+            except (TypeError, ValueError):
+                away_score = 0
+
+    if (home_score == 0 and away_score == 0) and team_summaries:
+        try:
+            home_score = int((team_summaries.get(home_id) or {}).get("PTS") or 0)
+        except (TypeError, ValueError):
+            home_score = 0
+        try:
+            away_score = int((team_summaries.get(away_id) or {}).get("PTS") or 0)
+        except (TypeError, ValueError):
+            away_score = 0
+
+    return {home_id: home_score, away_id: away_score}
+
+
+def _update_team_stats_from_team_summaries(team_summaries: Dict[str, Dict[str, Any]]) -> None:
+    """신규 매치엔진의 team summary(가공 팀 박스)를 시즌 누적 team_stats에 반영."""
+    if not team_summaries:
+        return
+
+    season_team_stats = GAME_STATE.setdefault("team_stats", {})
+
+    for team_id, summary in team_summaries.items():
+        if not isinstance(summary, dict):
+            continue
+
+        entry = season_team_stats.setdefault(
+            team_id,
+            {
+                "team_id": team_id,
+                "games": 0,
+                "totals": {},
+                "breakdowns": {},
+            },
+        )
+
+        entry["games"] = int(entry.get("games", 0) or 0) + 1
+        totals = entry.setdefault("totals", {})
+        breakdowns = entry.setdefault("breakdowns", {})
+
+        for k, v in summary.items():
+            if k in {"team_id", "TeamID", "id", "Team", "Name"}:
+                continue
+
+            if isinstance(v, dict):
+                bd = breakdowns.setdefault(k, {})
+                if isinstance(bd, dict):
+                    _merge_numeric_dict_sum(bd, v)
+                continue
+
+            if _is_number(v):
+                try:
+                    totals[k] = float(totals.get(k, 0.0)) + float(v)
+                except (TypeError, ValueError):
+                    continue
+
+
+def update_state_with_engine_result(
+    home_id: str,
+    away_id: str,
+    engine_result: Dict[str, Any],
+    game_date: Optional[str] = None,
+    *,
+    store_raw_result: bool = True,
+) -> Dict[str, Any]:
+    """신규 매치엔진 결과(engine_result)를 GAME_STATE와 cached_views에 반영한다."""
+    league = _ensure_league_state()
+    _ensure_active_season_year(league.get("season_year"))
+
+    game_date_str = str(game_date) if game_date else date.today().isoformat()
+    game_id = f"{game_date_str}_{home_id}_{away_id}"
+
+    teams_payload = _extract_team_payload(engine_result or {})
+    home_team_summary = _select_team_summary(teams_payload, home_id, role_hint="home")
+    away_team_summary = _select_team_summary(teams_payload, away_id, role_hint="away")
+    team_summaries = {home_id: home_team_summary, away_id: away_team_summary}
+
+    score = _extract_final_score_from_engine(engine_result or {}, home_id, away_id, team_summaries=team_summaries)
+    home_score = int(score.get(home_id, 0) or 0)
+    away_score = int(score.get(away_id, 0) or 0)
+
+    GAME_STATE["turn"] = GAME_STATE.get("turn", 0) + 1
+
+    game_obj = {
+        "game_id": game_id,
+        "date": game_date_str,
+        "home_team_id": home_id,
+        "away_team_id": away_id,
+        "home_score": home_score,
+        "away_score": away_score,
+        "status": "final",
+        "is_overtime": bool(
+            (engine_result or {}).get("is_overtime")
+            or (engine_result or {}).get("overtime")
+            or (engine_result or {}).get("OT")
+            or False
+        ),
+        "engine": "new",
+    }
+    GAME_STATE.setdefault("games", []).append(game_obj)
+
+    if store_raw_result and engine_result is not None:
+        GAME_STATE.setdefault("game_results", {})[game_id] = engine_result
+
+    cached = GAME_STATE.setdefault("cached_views", {})
+    scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
+    scores_view["latest_date"] = game_date_str
+    scores_view.setdefault("games", [])
+    scores_view["games"].insert(0, game_obj)
+
+    for team_id, my_score, opp_score in [
+        (home_id, home_score, away_score),
+        (away_id, away_score, home_score),
+    ]:
+        schedule_entry = _ensure_schedule_team(team_id)
+        result_letter = "W" if my_score > opp_score else "L"
+        schedule_entry["past_games"].insert(0, {
+            "game_id": game_id,
+            "date": game_date_str,
+            "home_team_id": home_id,
+            "away_team_id": away_id,
+            "home_score": home_score,
+            "away_score": away_score,
+            "result_for_user_team": result_letter,
+        })
+
+    _mark_master_schedule_game_final(
+        game_id=game_id,
+        game_date_str=game_date_str,
+        home_id=home_id,
+        away_id=away_id,
+        home_score=home_score,
+        away_score=away_score,
+    )
+
+    player_box_payload = _extract_player_box_payload(engine_result or {})
+    normalized_boxscore = {
+        home_id: _normalize_player_rows_for_team(player_box_payload, home_id, role_hint="home"),
+        away_id: _normalize_player_rows_for_team(player_box_payload, away_id, role_hint="away"),
+    }
+    _update_player_stats_from_boxscore(normalized_boxscore)
+    _update_team_stats_from_team_summaries(team_summaries)
+
+    return game_obj
 def update_state_with_game(
     home_id: str,
     away_id: str,
@@ -805,12 +1169,16 @@ def update_state_with_game(
 
 
 def _update_player_stats_from_boxscore(boxscore: Dict[str, List[Dict[str, Any]]]) -> None:
-    """박스스코어를 시즌 누적 player_stats에 반영한다."""
+    """박스스코어를 시즌 누적 player_stats에 반영한다.
+
+    레거시에서는 ["PTS","AST","REB","3PM"]만 누적했지만,
+    신규 엔진 전환 이후에는 **row에 들어있는 숫자 필드 전체**를 누적한다.
+    """
     if not boxscore:
         return
 
     season_stats = GAME_STATE.setdefault("player_stats", {})
-    track_stats = ["PTS", "AST", "REB", "3PM"]
+    meta_keys = {"PlayerID", "player_id", "PID", "id", "Name", "Team", "TeamID", "Pos"}
 
     for team_rows in boxscore.values():
         if not isinstance(team_rows, list):
@@ -826,35 +1194,36 @@ def _update_player_stats_from_boxscore(boxscore: Dict[str, List[Dict[str, Any]]]
                 {
                     "player_id": player_id,
                     "name": row.get("Name"),
-                    "team_id": row.get("Team"),
+                    "team_id": row.get("Team") or row.get("TeamID"),
                     "games": 0,
-                    "totals": {s: 0.0 for s in track_stats},
+                    "totals": {},
                 },
             )
 
             stat_entry["name"] = row.get("Name", stat_entry.get("name"))
             stat_entry["team_id"] = row.get("Team", stat_entry.get("team_id"))
-            stat_entry["games"] = stat_entry.get("games", 0) + 1
+            stat_entry["games"] = int(stat_entry.get("games", 0) or 0) + 1
 
-            totals = stat_entry.setdefault("totals", {s: 0.0 for s in track_stats})
-            for stat_name in track_stats:
-                try:
-                    totals[stat_name] = float(totals.get(stat_name, 0.0)) + float(
-                        row.get(stat_name, 0) or 0
-                    )
-                except (TypeError, ValueError):
+            totals = stat_entry.setdefault("totals", {})
+            for k, v in row.items():
+                if k in meta_keys:
                     continue
+                if _is_number(v):
+                    try:
+                        totals[k] = float(totals.get(k, 0.0)) + float(v)
+                    except (TypeError, ValueError):
+                        continue
 
 
 
 def _update_playoff_player_stats_from_boxscore(boxscore: Dict[str, List[Dict[str, Any]]]) -> None:
-    """박스스코어를 포스트시즌 누적 player_stats에 반영한다."""
+    """박스스코어를 포스트시즌 누적 player_stats에 반영한다(숫자 필드 전체 누적)."""
     if not boxscore:
         return
 
     postseason = GAME_STATE.setdefault("postseason", {})
     playoff_stats = postseason.setdefault("playoff_player_stats", {})
-    track_stats = ["PTS", "AST", "REB", "3PM"]
+    meta_keys = {"PlayerID", "player_id", "PID", "id", "Name", "Team", "TeamID", "Pos"}
 
     for team_rows in boxscore.values():
         if not isinstance(team_rows, list):
@@ -870,24 +1239,23 @@ def _update_playoff_player_stats_from_boxscore(boxscore: Dict[str, List[Dict[str
                 {
                     "player_id": player_id,
                     "name": row.get("Name"),
-                    "team_id": row.get("Team"),
+                    "team_id": row.get("Team") or row.get("TeamID"),
                     "games": 0,
-                    "totals": {s: 0.0 for s in track_stats},
+                    "totals": {},
                 },
             )
 
-            stat_entry["name"] = row.get("Name", stat_entry.get("name"))
-            stat_entry["team_id"] = row.get("Team", stat_entry.get("team_id"))
-            stat_entry["games"] = stat_entry.get("games", 0) + 1
+            stat_entry["games"] = int(stat_entry.get("games", 0) or 0) + 1
 
-            totals = stat_entry.setdefault("totals", {s: 0.0 for s in track_stats})
-            for stat_name in track_stats:
-                try:
-                    totals[stat_name] = float(totals.get(stat_name, 0.0)) + float(
-                        row.get(stat_name, 0) or 0
-                    )
-                except (TypeError, ValueError):
+            totals = stat_entry.setdefault("totals", {})
+            for k, v in row.items():
+                if k in meta_keys:
                     continue
+                if _is_number(v):
+                    try:
+                        totals[k] = float(totals.get(k, 0.0)) + float(v)
+                    except (TypeError, ValueError):
+                        continue
 
 
 def get_schedule_summary() -> Dict[str, Any]:
