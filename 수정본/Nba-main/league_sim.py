@@ -12,6 +12,11 @@ from state import (
 )
 from trades_ai import _run_ai_gm_tick_if_needed
 from match_engine import Team, MatchEngine
+from matchengine_v2_adapter import (
+    adapt_matchengine_result_to_v2,
+    build_context_from_master_schedule_entry,
+    build_context_from_team_ids,
+)
 
 
 def advance_league_until(
@@ -95,8 +100,19 @@ def advance_league_until(
             engine = MatchEngine(home_team, away_team)
             game_result = engine.simulate_game()
 
+            ctx = build_context_from_master_schedule_entry(
+                entry=g,
+                league_state=league,
+                date_override=day_str,
+                phase="regular",
+            )
+            game_result_v2 = adapt_matchengine_result_to_v2(
+                raw_result=game_result,
+                context=ctx,
+            )
+
             game_obj = ingest_game_result(
-                game_result=game_result,
+                game_result=game_result_v2,
                 game_date=day_str,
             )
 
@@ -141,17 +157,30 @@ def simulate_single_game(
     if away_df.empty:
         raise ValueError(f"Away team '{away_id}' not found in roster excel")
 
+    # 단일 경기에서도 season_id/phase 컨텍스트를 만들 수 있도록 리그/스케줄 상태를 보장
+    initialize_master_schedule_if_needed()
+    league = _ensure_league_state()
+    resolved_date = str(game_date) if game_date else str(league.get("current_date") or date.today().isoformat())
+
+
     home_team = Team(home_id, home_df, tactics=home_tactics or {})
     away_team = Team(away_id, away_df, tactics=away_tactics or {})
     engine = MatchEngine(home_team, away_team)
     game_result = engine.simulate_game()
 
     # 인게임 날짜를 서버 STATE에도 반영
-    ingest_game_result(
-        game_result=game_result,
-        game_date=game_date,
+    ctx = build_context_from_team_ids(
+        game_id=f"{resolved_date}_{home_id}_{away_id}_SINGLE",
+        date_str=resolved_date,
+        home_team_id=home_id,
+        away_team_id=away_id,
+        league_state=league,
+        phase="regular",
     )
-
+    game_result_v2 = adapt_matchengine_result_to_v2(raw_result=game_result, context=ctx)
+    ingest_game_result(game_result=game_result_v2, game_date=resolved_date)
+ 
     return game_result
+
 
 
