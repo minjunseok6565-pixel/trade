@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from config import ROSTER_DF, ALL_TEAM_IDS, TEAM_TO_CONF_DIV
+from derived_formulas import compute_derived
 from state import GAME_STATE, _ensure_league_state, initialize_master_schedule_if_needed
 
 
@@ -44,6 +45,8 @@ def _init_players_and_teams_if_needed() -> None:
             except (TypeError, ValueError):
                 potential = 0.6
 
+        derived = compute_derived(row)
+
         players[idx] = {
             "player_id": idx,
             "name": player_name,
@@ -53,6 +56,7 @@ def _init_players_and_teams_if_needed() -> None:
             "overall": ovr,
             "salary": salary,
             "potential": potential,
+            "derived": derived,
             "signed_date": "1900-01-01",
             "signed_via_free_agency": False,
             "acquired_date": "1900-01-01",
@@ -423,6 +427,7 @@ def _player_value_for_team(player_row: pd.Series, team_status: str) -> float:
         value -= max(0, age - 26) * 0.8
 
     # 연봉 패널티 (10M당 -1 정도)
+
     value -= (salary / 10_000_000.0)
 
     return float(value)
