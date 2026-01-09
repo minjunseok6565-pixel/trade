@@ -735,7 +735,7 @@ def _build_master_schedule(season_year: int) -> None:
         process_offseason(GAME_STATE, previous_season, next_season)
         _archive_and_reset_season_accumulators(_season_id_from_year(previous_season), _season_id_from_year(next_season))
     else:
-        _ensure_active_season_year(next_season or season_year)
+        _ensure_active_season_id(_season_id_from_year(int(next_season or season_year)))
 
 def initialize_master_schedule_if_needed() -> None:
     """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
@@ -1070,6 +1070,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
