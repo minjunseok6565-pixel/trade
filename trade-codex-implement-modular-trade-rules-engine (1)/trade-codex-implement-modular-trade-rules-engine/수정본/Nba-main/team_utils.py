@@ -360,7 +360,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
 
     repo = _get_repo()
     roster_rows = repo.get_team_roster(tid)
-    season_stats = GAME_STATE.get("player_stats", {}) or {}{})
+    season_stats = GAME_STATE.get("player_stats", {}) or {}
     roster: List[Dict[str, Any]] = []
     for row in roster_rows:
         pid = str(row.get("player_id"))
@@ -394,4 +394,5 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
