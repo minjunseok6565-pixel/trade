@@ -14,17 +14,13 @@ def validate_deal(
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
     _ensure_league_state()
-    from contracts.store import get_league_season_year
-    from contracts.sync import (
-        sync_roster_salaries_for_season,
-        sync_roster_teams_from_state,
-    )
+    from league_repo import LeagueRepo
 
-    season_year = get_league_season_year(GAME_STATE)
-    sync_roster_teams_from_state(GAME_STATE)
-    sync_roster_salaries_for_season(GAME_STATE, season_year)
+    db_path = (GAME_STATE.get("league") or {}).get("db_path")
+    if db_path:
+        with LeagueRepo(db_path) as repo:
+            repo.validate_integrity()
 
     # RULES ENGINE CHECKS (migrated): deadline
     ctx = build_trade_context(current_date=current_date)
     validate_all(deal, ctx)
-

@@ -71,27 +71,19 @@ def process_offseason(
         if to_season_year >= end_exclusive:
             contract["status"] = "EXPIRED"
             active_map.pop(player_id_str, None)
-            try:
-                player_id = int(player_id_str)
-            except (TypeError, ValueError):
-                continue
             from contracts.ops import release_to_free_agents
 
-            release_to_free_agents(game_state, player_id, released_date=None)
+            release_to_free_agents(game_state, player_id_str, released_date=None)
             expired += 1
             released += 1
 
     from contracts.sync import (
         sync_contract_team_ids_from_players,
         sync_players_salary_from_active_contract,
-        sync_roster_salaries_for_season,
-        sync_roster_teams_from_state,
     )
 
-    sync_roster_salaries_for_season(game_state, to_season_year)
     sync_players_salary_from_active_contract(game_state, to_season_year)
     sync_contract_team_ids_from_players(game_state)
-    sync_roster_teams_from_state(game_state)
 
     try:
         draft_year_to_settle = int(from_season_year) + 1

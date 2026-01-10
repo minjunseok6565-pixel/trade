@@ -1,10 +1,14 @@
-"""Bootstrap contracts from roster Excel-derived data."""
+"""Bootstrap contracts from roster data."""
 
 from __future__ import annotations
 
+import json
 import math
 import re
-from datetime import date
+from datetime import date, datetime
+
+from league_repo import LeagueRepo
+from schema import normalize_player_id, normalize_team_id, season_id_from_year
 
 
 def _is_blank(value) -> bool:
@@ -102,11 +106,157 @@ def _resolve_player_id(value) -> int | None:
     return None
 
 
+def _utc_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _get_db_path(game_state: dict) -> str | None:
+    league_state = game_state.get("league") or {}
+    return league_state.get("db_path")
+
+
+def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) -> dict:
+    from contracts import models
+    from contracts.store import (
+        ensure_contract_state,
+        get_current_date_iso,
+        get_league_season_year,
+    )
+    from contracts.free_agents import FREE_AGENT_TEAM_ID
+    import team_utils
+
+    ensure_contract_state(game_state)
+    team_utils._init_players_and_teams_if_needed()
+
+    db_path = _get_db_path(game_state)
+    if not db_path:
+        raise ValueError("game_state['league']['db_path'] is required for repo bootstrap")
+
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        existing = repo._conn.execute(
+            "SELECT COUNT(*) AS c FROM contracts WHERE is_active=1;"
+        ).fetchone()
+        if not overwrite and existing and existing["c"] > 0:
+            return {
+                "skipped": True,
+                "reason": "contracts already exist",
+                "initial_free_agents": [],
+                "skipped_contracts_for_fa": 0,
+                "created": 0,
+            }
+
+        league_season_year = get_league_season_year(game_state)
+        players = game_state.get("players", {})
+        missing_players: list[str] = []
+        created = 0
+        skipped_contracts_for_fa = 0
+        initial_free_agents: list[str] = []
+        initial_free_agents_seen: set[str] = set()
+
+        with repo.transaction() as cur:
+            if overwrite:
+                cur.execute("DELETE FROM contracts;")
+
+            roster_rows = cur.execute(
+                "SELECT player_id, team_id, salary_amount FROM roster WHERE status='active';"
+            ).fetchall()
+            now_iso = _utc_now_iso()
+            for row in roster_rows:
+                player_id = str(normalize_player_id(row["player_id"], strict=True))
+                team_id = str(normalize_team_id(row["team_id"], strict=True))
+                if team_id == FREE_AGENT_TEAM_ID:
+                    if player_id not in initial_free_agents_seen:
+                        initial_free_agents.append(player_id)
+                        initial_free_agents_seen.add(player_id)
+                    skipped_contracts_for_fa += 1
+                    if player_id in players:
+                        players[player_id]["team_id"] = ""
+                    continue
+
+                salary_amount = row["salary_amount"]
+                salary_value = float(salary_amount or 0.0)
+                salary_by_year = {str(league_season_year): salary_value}
+                signed_date_iso = get_current_date_iso(game_state)
+
+                contract_id = models.new_contract_id()
+                contract = models.make_contract_record(
+                    contract_id=contract_id,
+                    player_id=player_id,
+                    team_id=team_id,
+                    signed_date_iso=signed_date_iso,
+                    start_season_year=league_season_year,
+                    years=1,
+                    salary_by_year=salary_by_year,
+                    options=[],
+                    status="ACTIVE",
+                )
+
+                game_state["contracts"][contract_id] = contract
+                game_state.setdefault("player_contracts", {}).setdefault(
+                    str(player_id), []
+                ).append(contract_id)
+                game_state.setdefault("active_contract_id_by_player", {})[
+                    str(player_id)
+                ] = contract_id
+
+                if player_id in players:
+                    players[player_id]["team_id"] = team_id
+                    players[player_id]["signed_date"] = signed_date_iso
+                else:
+                    missing_players.append(player_id)
+
+                cur.execute(
+                    """
+                    INSERT INTO contracts(
+                        contract_id,
+                        player_id,
+                        team_id,
+                        start_season_id,
+                        end_season_id,
+                        salary_by_season_json,
+                        contract_type,
+                        is_active,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        contract_id,
+                        player_id,
+                        team_id,
+                        season_id_from_year(league_season_year),
+                        season_id_from_year(league_season_year),
+                        json.dumps(salary_by_year),
+                        "STANDARD",
+                        1,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                created += 1
+
+        game_state["free_agents"] = list(initial_free_agents)
+        repo.validate_integrity()
+
+        return {
+            "skipped": False,
+            "created": created,
+            "missing_players": missing_players,
+            "initial_free_agents": list(initial_free_agents),
+            "skipped_contracts_for_fa": skipped_contracts_for_fa,
+        }
+
+
 def bootstrap_contracts_from_roster_excel(
     game_state: dict,
     roster_df=None,
     overwrite: bool = False,
 ) -> dict:
+    """Deprecated: prefer bootstrap_contracts_from_repo when DB is available."""
+    db_path = _get_db_path(game_state)
+    if db_path:
+        return bootstrap_contracts_from_repo(game_state, overwrite=overwrite)
     from contracts import models
     from contracts.options_policy import normalize_option_type
     from contracts.store import (

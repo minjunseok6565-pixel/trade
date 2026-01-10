@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from config import ROSTER_DF
+from league_repo import LeagueRepo
+from schema import normalize_player_id, normalize_team_id
 from team_utils import _init_players_and_teams_if_needed
 from state import GAME_STATE, get_current_date_as_date
 
@@ -23,13 +25,11 @@ from .picks import transfer_pick
 from .transaction_log import append_trade_transaction
 
 
-def _collect_player_ids(deal: Deal) -> List[int]:
-    player_ids: List[int] = []
-    for assets in deal.legs.values():
-        for asset in assets:
-            if isinstance(asset, PlayerAsset):
-                player_ids.append(asset.player_id)
-    return player_ids
+@dataclass(frozen=True)
+class _PlayerMove:
+    player_id: str
+    from_team: str
+    to_team: str
 
 
 def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
@@ -42,52 +42,129 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
     raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
 
 
+def _get_db_path(game_state: dict) -> str:
+    league_state = game_state.get("league") or {}
+    db_path = league_state.get("db_path")
+    if not db_path:
+        raise ValueError("game_state['league']['db_path'] is required to apply trades")
+    return db_path
+
+
+def _normalize_player_id_str(value: Any) -> str:
+    return str(normalize_player_id(value, strict=True))
+
+
+def _normalize_team_id_str(value: Any) -> str:
+    return str(normalize_team_id(value, strict=True))
+
+
+def _collect_player_moves(deal: Deal) -> list[_PlayerMove]:
+    moves: list[_PlayerMove] = []
+    seen: set[str] = set()
+    for from_team, assets in deal.legs.items():
+        normalized_from_team = _normalize_team_id_str(from_team)
+        for asset in assets:
+            if not isinstance(asset, PlayerAsset):
+                continue
+            player_id = _normalize_player_id_str(asset.player_id)
+            if player_id in seen:
+                raise ValueError(f"duplicate player in trade assets: {player_id}")
+            seen.add(player_id)
+            to_team = _resolve_receiver(deal, normalized_from_team, asset)
+            normalized_to_team = _normalize_team_id_str(to_team)
+            moves.append(
+                _PlayerMove(
+                    player_id=player_id,
+                    from_team=normalized_from_team,
+                    to_team=normalized_to_team,
+                )
+            )
+    return moves
+
+
+def _validate_player_moves(repo: LeagueRepo, moves: list[_PlayerMove]) -> None:
+    for move in moves:
+        try:
+            current_team = repo.get_team_id_by_player(move.player_id)
+        except KeyError as exc:
+            raise ValueError(
+                f"player_id not found in DB: {move.player_id}"
+            ) from exc
+        if current_team != move.from_team:
+            raise ValueError(
+                "player_id "
+                f"{move.player_id} expected team {move.from_team} "
+                f"but DB shows {current_team}"
+            )
+
+
 def apply_deal(
-    deal: Deal,
-    source: str,
+    game_state: dict | Deal,
+    deal: Deal | None = None,
+    source: str = "",
     deal_id: Optional[str] = None,
     trade_date: Optional[date] = None,
+    *,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
+    if deal is None:
+        if isinstance(game_state, Deal):
+            deal = game_state
+            game_state = GAME_STATE
+        else:
+            raise TypeError("apply_deal requires a Deal")
+
     _init_players_and_teams_if_needed()
-    player_ids = _collect_player_ids(deal)
-    original_teams: Dict[int, str] = {}
-    original_trade_return_bans: Dict[int, Optional[Dict[str, List[str]]]] = {}
+    original_player_teams: Dict[str, Optional[str]] = {}
+    original_trade_return_bans: Dict[str, Optional[Dict[str, List[str]]]] = {}
     original_pick_owners: Dict[str, str] = {}
     original_pick_protections: Dict[str, Any] = {}
     original_swap_rights: Dict[str, Optional[dict]] = {}
     original_fixed_assets: Dict[str, Optional[dict]] = {}
-    swap_rights = GAME_STATE.setdefault("swap_rights", {})
-    fixed_assets = GAME_STATE.setdefault("fixed_assets", {})
+    swap_rights = game_state.setdefault("swap_rights", {})
+    fixed_assets = game_state.setdefault("fixed_assets", {})
+    player_moves = _collect_player_moves(deal)
+    normalized_player_ids = [move.player_id for move in player_moves]
 
     try:
         acquired_date = (trade_date or get_current_date_as_date()).isoformat()
-        season_year = int(GAME_STATE.get("league", {}).get("season_year") or 0)
-        if season_year <= 0:
-            try:
-                season_year = int(get_current_date_as_date().year)
-            except Exception:
-                season_year = 0
-        season_key = str(season_year) if season_year > 0 else None
-        for player_id in player_ids:
-            try:
-                original_teams[player_id] = str(ROSTER_DF.at[player_id, "Team"]).upper()
-            except Exception:
-                original_teams[player_id] = ""
+        season_year_raw = game_state.get("league", {}).get("season_year")
+        season_key = str(season_year_raw).strip() if season_year_raw is not None else ""
+        if not season_key.isdigit():
+            season_key = str(get_current_date_as_date().year)
+        if not season_key.isdigit():
+            season_key = None
+        db_path = _get_db_path(game_state)
+
+        with LeagueRepo(db_path) as repo:
+            repo.init_db()
+            _validate_player_moves(repo, player_moves)
+            if dry_run:
+                return {
+                    "dry_run": True,
+                    "player_moves": [move.__dict__ for move in player_moves],
+                }
+            with repo.transaction():
+                for move in player_moves:
+                    repo.trade_player(move.player_id, move.to_team)
+            repo.validate_integrity()
 
         for from_team, assets in deal.legs.items():
+            normalized_from_team = _normalize_team_id_str(from_team)
             for asset in assets:
-                to_team = _resolve_receiver(deal, from_team, asset)
+                to_team = _resolve_receiver(deal, normalized_from_team, asset)
+                normalized_to_team = _normalize_team_id_str(to_team)
                 if isinstance(asset, PlayerAsset):
-                    if asset.player_id not in ROSTER_DF.index:
-                        raise KeyError(f"Player {asset.player_id} not found")
-                    ROSTER_DF.at[asset.player_id, "Team"] = to_team
-                    player_state = GAME_STATE.get("players", {}).get(asset.player_id)
+                    player_id = _normalize_player_id_str(asset.player_id)
+                    player_state = game_state.get("players", {}).get(player_id)
                     if player_state is not None:
-                        if asset.player_id not in original_trade_return_bans:
-                            original_trade_return_bans[asset.player_id] = deepcopy(
+                        if player_id not in original_player_teams:
+                            original_player_teams[player_id] = player_state.get("team_id")
+                        if player_id not in original_trade_return_bans:
+                            original_trade_return_bans[player_id] = deepcopy(
                                 player_state.get("trade_return_bans")
                             )
-                        player_state["team_id"] = to_team
+                        player_state["team_id"] = normalized_to_team
                         player_state.setdefault("signed_date", "1900-01-01")
                         player_state.setdefault("signed_via_free_agency", False)
                         player_state["acquired_date"] = acquired_date
@@ -99,11 +176,11 @@ def apply_deal(
                             season_bans = trade_return_bans.get(season_key)
                             if not isinstance(season_bans, list):
                                 season_bans = []
-                            if str(from_team) not in season_bans:
-                                season_bans.append(str(from_team))
+                            if normalized_from_team not in season_bans:
+                                season_bans.append(normalized_from_team)
                             trade_return_bans[season_key] = season_bans
                 if isinstance(asset, PickAsset):
-                    draft_picks = GAME_STATE.get("draft_picks", {})
+                    draft_picks = game_state.get("draft_picks", {})
                     pick = draft_picks.get(asset.pick_id)
                     if pick and asset.pick_id not in original_pick_owners:
                         original_pick_owners[asset.pick_id] = str(
@@ -115,7 +192,7 @@ def apply_deal(
                         raise TradeError(
                             PICK_NOT_OWNED,
                             "Pick not found",
-                            {"pick_id": asset.pick_id, "team_id": from_team},
+                            {"pick_id": asset.pick_id, "team_id": normalized_from_team},
                         )
                     if asset.protection is not None:
                         if pick.get("protection") is None:
@@ -130,26 +207,26 @@ def apply_deal(
                                     "attempted_protection": asset.protection,
                                 },
                             )
-                    transfer_pick(GAME_STATE, asset.pick_id, from_team, to_team)
+                    transfer_pick(game_state, asset.pick_id, normalized_from_team, normalized_to_team)
                 if isinstance(asset, FixedAsset):
                     fixed = fixed_assets.get(asset.asset_id)
                     if not fixed:
                         raise TradeError(
                             FIXED_ASSET_NOT_FOUND,
                             "Fixed asset not found",
-                            {"asset_id": asset.asset_id, "team_id": from_team},
+                            {"asset_id": asset.asset_id, "team_id": normalized_from_team},
                         )
                     if asset.asset_id not in original_fixed_assets:
                         original_fixed_assets[asset.asset_id] = deepcopy(fixed)
-                    if str(fixed.get("owner_team", "")).upper() != from_team:
+                    if str(fixed.get("owner_team", "")).upper() != normalized_from_team:
                         raise TradeError(
                             FIXED_ASSET_NOT_OWNED,
                             "Fixed asset not owned by team",
-                            {"asset_id": asset.asset_id, "team_id": from_team},
+                            {"asset_id": asset.asset_id, "team_id": normalized_from_team},
                         )
-                    fixed["owner_team"] = to_team.upper()
+                    fixed["owner_team"] = normalized_to_team
                 if isinstance(asset, SwapAsset):
-                    draft_picks = GAME_STATE.get("draft_picks", {})
+                    draft_picks = game_state.get("draft_picks", {})
                     pick_a = draft_picks.get(asset.pick_id_a)
                     pick_b = draft_picks.get(asset.pick_id_b)
                     if not pick_a or not pick_b:
@@ -178,13 +255,13 @@ def apply_deal(
                         )
                     swap = swap_rights.get(asset.swap_id)
                     if swap:
-                        if str(swap.get("owner_team", "")).upper() != from_team:
+                        if str(swap.get("owner_team", "")).upper() != normalized_from_team:
                             raise TradeError(
                                 SWAP_NOT_OWNED,
                                 "Swap right not owned by team",
-                                {"swap_id": asset.swap_id, "team_id": from_team},
+                                {"swap_id": asset.swap_id, "team_id": normalized_from_team},
                             )
-                        swap["owner_team"] = to_team.upper()
+                        swap["owner_team"] = normalized_to_team
                     else:
                         swap_rights[asset.swap_id] = {
                             "swap_id": asset.swap_id,
@@ -192,41 +269,27 @@ def apply_deal(
                             "pick_id_b": asset.pick_id_b,
                             "year": pick_a.get("year"),
                             "round": pick_a.get("round"),
-                            "owner_team": to_team.upper(),
+                            "owner_team": normalized_to_team,
                             "active": True,
                             "created_by_deal_id": deal_id,
                             "created_at": acquired_date,
                         }
 
         transaction = append_trade_transaction(deal, source=source, deal_id=deal_id)
-        from contracts.store import get_league_season_year
-        from contracts.sync import (
-            sync_contract_team_ids_from_players,
-            sync_players_salary_from_active_contract,
-            sync_roster_salaries_for_season,
-            sync_roster_teams_from_state,
-        )
-
-        season_year = get_league_season_year(GAME_STATE)
-        sync_contract_team_ids_from_players(GAME_STATE)
-        sync_players_salary_from_active_contract(GAME_STATE, season_year)
-        sync_roster_teams_from_state(GAME_STATE)
-        sync_roster_salaries_for_season(GAME_STATE, season_year)
         return transaction
     except TradeError:
-        for player_id, team_id in original_teams.items():
-            if player_id in ROSTER_DF.index:
-                ROSTER_DF.at[player_id, "Team"] = team_id
-            player_state = GAME_STATE.get("players", {}).get(player_id)
+        for player_id in normalized_player_ids:
+            player_state = game_state.get("players", {}).get(player_id)
             if player_state is not None:
-                player_state["team_id"] = team_id
+                if player_id in original_player_teams:
+                    player_state["team_id"] = original_player_teams[player_id]
                 if player_id in original_trade_return_bans:
                     original_bans = original_trade_return_bans[player_id]
                     if original_bans is None:
                         player_state.pop("trade_return_bans", None)
                     else:
                         player_state["trade_return_bans"] = original_bans
-        draft_picks = GAME_STATE.get("draft_picks", {})
+        draft_picks = game_state.get("draft_picks", {})
         for pick_id, owner_team in original_pick_owners.items():
             pick = draft_picks.get(pick_id)
             if pick is not None:
@@ -247,19 +310,18 @@ def apply_deal(
                 fixed_assets[asset_id] = snapshot
         raise
     except Exception as exc:
-        for player_id, team_id in original_teams.items():
-            if player_id in ROSTER_DF.index:
-                ROSTER_DF.at[player_id, "Team"] = team_id
-            player_state = GAME_STATE.get("players", {}).get(player_id)
+        for player_id in normalized_player_ids:
+            player_state = game_state.get("players", {}).get(player_id)
             if player_state is not None:
-                player_state["team_id"] = team_id
+                if player_id in original_player_teams:
+                    player_state["team_id"] = original_player_teams[player_id]
                 if player_id in original_trade_return_bans:
                     original_bans = original_trade_return_bans[player_id]
                     if original_bans is None:
                         player_state.pop("trade_return_bans", None)
                     else:
                         player_state["trade_return_bans"] = original_bans
-        draft_picks = GAME_STATE.get("draft_picks", {})
+        draft_picks = game_state.get("draft_picks", {})
         for pick_id, owner_team in original_pick_owners.items():
             pick = draft_picks.get(pick_id)
             if pick is not None:

@@ -1,6 +1,9 @@
 """Contracts package."""
 
-from contracts.bootstrap import bootstrap_contracts_from_roster_excel
+from contracts.bootstrap import (
+    bootstrap_contracts_from_repo,
+    bootstrap_contracts_from_roster_excel,
+)
 from contracts.free_agents import (
     FREE_AGENT_TEAM_ID,
     add_free_agent,
@@ -33,6 +36,7 @@ from contracts.sync import (
 __all__ = [
     "ensure_contract_state",
     "bootstrap_contracts_from_roster_excel",
+    "bootstrap_contracts_from_repo",
     "new_contract_id",
     "make_contract_record",
     "get_active_salary_for_season",
