@@ -1,4 +1,9 @@
 # league_repo.py
+# Developer note:
+# - SQLite DB is the single source of truth (SSOT).
+# - Excel files are import/export only (no runtime reads/writes).
+# - player_id and team_id are canonical strings.
+# - Never use DataFrame indices as IDs; always use schema.py normalization helpers.
 """
 LeagueRepository: single source of truth (SQLite)
 
@@ -194,7 +199,8 @@ class LeagueRepo:
                     value TEXT NOT NULL
                 );
 
-                INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');
+                INSERT INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value;
                 INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', '{now}');
 
                 CREATE TABLE IF NOT EXISTS players (
@@ -465,6 +471,7 @@ class LeagueRepo:
         if not row:
             raise KeyError(f"player not found: {player_id}")
         d = dict(row)
+        d["player_id"] = str(d.get("player_id"))
         d["attrs"] = json.loads(d["attrs_json"]) if d.get("attrs_json") else {}
         return d
 
@@ -483,9 +490,32 @@ class LeagueRepo:
         out: List[Dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            d["player_id"] = str(d.get("player_id"))
             d["attrs"] = json.loads(d["attrs_json"]) if d.get("attrs_json") else {}
             out.append(d)
         return out
+
+    def get_team_id_by_player(self, player_id: str) -> str:
+        pid = normalize_player_id(player_id, strict=False)
+        row = self._conn.execute(
+            "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
+            (str(pid),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"active roster entry not found for player_id={player_id}")
+        return str(row["team_id"])
+
+    def get_roster_player_ids(self, team_id: str) -> set[str]:
+        tid = normalize_team_id(team_id, strict=True)
+        rows = self._conn.execute(
+            "SELECT player_id FROM roster WHERE team_id=? AND status='active';",
+            (str(tid),),
+        ).fetchall()
+        return {str(r["player_id"]) for r in rows}
+
+    def get_all_player_ids(self) -> set[str]:
+        rows = self._conn.execute("SELECT player_id FROM players;").fetchall()
+        return {str(r["player_id"]) for r in rows}
 
     def list_teams(self) -> List[str]:
         rows = self._conn.execute("SELECT DISTINCT team_id FROM roster WHERE status='active' ORDER BY team_id;").fetchall()
@@ -573,6 +603,16 @@ class LeagueRepo:
         rows = self._conn.execute("SELECT COUNT(*) AS c FROM roster WHERE status='active';").fetchone()
         if rows and rows["c"] <= 0:
             raise ValueError("no active roster entries found")
+
+    def _smoke_check(self) -> None:
+        """
+        Lightweight self-check for repo wiring.
+        Runs init_db(), and only validates if there is roster data present.
+        """
+        self.init_db()
+        has_roster = self._conn.execute("SELECT 1 FROM roster LIMIT 1;").fetchone()
+        if has_roster:
+            self.validate_integrity()
 
     # ------------------------
     # Convenience
