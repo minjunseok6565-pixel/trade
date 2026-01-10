@@ -7,7 +7,10 @@ NOTE: Split from sim.py on 2025-12-27.
 
 import random
 import math
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
+
+# SSOT schema (IDs must be canonical across roster -> engine -> adapter -> state)
+from schema import normalize_team_id, normalize_player_id
 
 from .core import ENGINE_VERSION, make_replay_token, clamp
 from .models import GameState, TeamState
@@ -24,6 +27,49 @@ from .sim_fatigue import _apply_break_recovery, _apply_fatigue_loss
 from .sim_rotation import _get_on_court, _init_targets, _perform_rotation, _set_on_court, _update_minutes
 from .team_keys import AWAY, HOME, team_key
 from .sim_possession import simulate_possession
+
+# -------------------------
+# ID normalization / validation (interface contract)
+# -------------------------
+def _canonical_team_id(team: TeamState) -> str:
+    """Return canonical team_id for output keys."""
+    raw = getattr(team, "team_id", None) or getattr(team, "id", None) or getattr(team, "name", None)
+    return str(normalize_team_id(raw, strict=True))
+
+def _validate_team_and_player_ids(home: TeamState, away: TeamState, *, strict_player_ids: bool = True) -> Tuple[str, str]:
+    """Fail fast if team/player IDs are not stable (prevents duplicate players in downstream state)."""
+    home_id = _canonical_team_id(home)
+    away_id = _canonical_team_id(away)
+    if home_id == away_id:
+        raise ValueError(f"invalid matchup: home_team_id == away_team_id ({home_id})")
+
+    def norm_pid(pid: Any) -> str:
+        return str(normalize_player_id(pid, strict=strict_player_ids, allow_legacy_numeric=not strict_player_ids))
+
+    home_pids = [norm_pid(p.pid) for p in home.lineup]
+    away_pids = [norm_pid(p.pid) for p in away.lineup]
+
+    # Ensure p.pid is already canonical (we do NOT rewrite ids in-engine; we only validate).
+    for original, normalized in zip([p.pid for p in home.lineup], home_pids):
+        if str(original) != normalized:
+            raise ValueError(f"home player pid must equal canonical player_id: {original!r} -> {normalized!r}")
+    for original, normalized in zip([p.pid for p in away.lineup], away_pids):
+        if str(original) != normalized:
+            raise ValueError(f"away player pid must equal canonical player_id: {original!r} -> {normalized!r}")
+
+    if len(set(home_pids)) != len(home_pids):
+        raise ValueError(f"duplicate player_id within home team {home_id}")
+    if len(set(away_pids)) != len(away_pids):
+        raise ValueError(f"duplicate player_id within away team {away_id}")
+    overlap = set(home_pids) & set(away_pids)
+    if overlap:
+        raise ValueError(f"player_id appears on both teams in a single game: {sorted(overlap)!r}")
+
+    return home_id, away_id
+
+def _side_to_team_keyed(side_dict: Dict[str, Any], home_team_id: str, away_team_id: str) -> Dict[str, Any]:
+    """Convert internal {'home':..., 'away':...} maps into {team_id: ...} for raw_result output."""
+    return {home_team_id: side_dict.get(HOME, {}), away_team_id: side_dict.get(AWAY, {})}
 
 # -------------------------
 # Rotation plan helpers
@@ -157,6 +203,8 @@ def build_player_box(
     team: TeamState,
     game_state: Optional[GameState] = None,
     home: Optional[TeamState] = None,
+    *,
+    team_id: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Return per-player box score with derived percentages + minutes + fouls.
 
@@ -167,6 +215,10 @@ def build_player_box(
     fouls = dict(getattr(game_state, "player_fouls", {}).get(key, {}) or {}) if key else {}
     mins = dict(getattr(game_state, "minutes_played_sec", {}).get(key, {}) or {}) if key else {}
 
+    if team_id is None:
+        # Best-effort: use team.name as team_id (caller should pass team_id explicitly).
+        team_id = str(getattr(team, "team_id", None) or getattr(team, "id", None) or team.name)
+        
     out: Dict[str, Dict[str, Any]] = {}
     for p in team.lineup:
         pid = p.pid
@@ -176,6 +228,8 @@ def build_player_box(
         ftm, fta = int(s.get("FTM", 0)), int(s.get("FTA", 0))
         orb, drb = int(s.get("ORB", 0)), int(s.get("DRB", 0))
         out[pid] = {
+            "PlayerID": str(pid),
+            "TeamID": str(team_id) if team_id is not None else "",
             "Name": p.name,
             "MIN": round(float(mins.get(pid, 0)) / 60.0, 2),
             "PTS": int(s.get("PTS", 0)),
@@ -193,10 +247,13 @@ def summarize_team(
     team: TeamState,
     game_state: Optional[GameState] = None,
     home: Optional[TeamState] = None,
+    *,
+    team_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     key = team_key(team, home) if game_state is not None and home is not None else None
     fat_map = game_state.fatigue.get(key, {}) if key else {}
     return {
+        "TeamID": str(team_id) if team_id is not None else str(team.name),
         "PTS": team.pts,
         "FGM": team.fgm, "FGA": team.fga,
         "3PM": team.tpm, "3PA": team.tpa,
@@ -215,7 +272,7 @@ def summarize_team(
         "DefActionCounts": dict(sorted(team.def_action_counts.items(), key=lambda x: -x[1])),
         "OutcomeCounts": dict(sorted(team.outcome_counts.items(), key=lambda x: -x[1])),
         "Players": team.player_stats,
-        "PlayerBox": build_player_box(team, game_state, home=home),
+        "PlayerBox": build_player_box(team, game_state, home=home, team_id=(team_id or team.name)),
         "AvgFatigue": (sum((fat_map.get(p.pid, 1.0) if game_state else 1.0) for p in team.lineup) / max(len(team.lineup), 1)),
         "ShotZones": dict(team.shot_zones),
     }
@@ -263,6 +320,8 @@ def simulate_game(
         head = "\n".join(report.errors[:6])
         more = f"\n... (+{len(report.errors)-6} more)" if len(report.errors) > 6 else ""
         raise ValueError(f"MatchEngine input validation failed:\n{head}{more}")
+    # Interface contract: output keys must be canonical team_id/player_id (stable across the whole project).
+    home_team_id, away_team_id = _validate_team_and_player_ids(home, away, strict_player_ids=True)
 
     init_player_boxes(home)
     init_player_boxes(away)
@@ -527,6 +586,8 @@ def simulate_game(
     return {
         "meta": {
             "engine_version": ENGINE_VERSION,
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
             "era": era,
             "era_version": str(game_cfg.era.get("version", "1.0")),
             "replay_token": replay_token,
@@ -535,23 +596,24 @@ def simulate_game(
             "internal_debug": {
                 "errors": list(debug_errors),
                     "role_fit": {
-                    "role_counts": {home.name: home.role_fit_role_counts, away.name: away.role_fit_role_counts},
-                    "grade_counts": {home.name: home.role_fit_grade_counts, away.name: away.role_fit_grade_counts},
-                    "pos_log": {home.name: home.role_fit_pos_log, away.name: away.role_fit_pos_log},
-                    "bad_totals": {home.name: home.role_fit_bad_totals, away.name: away.role_fit_bad_totals},
-                    "bad_by_grade": {home.name: home.role_fit_bad_by_grade, away.name: away.role_fit_bad_by_grade},
+                    "role_counts": {home_team_id: home.role_fit_role_counts, away_team_id: away.role_fit_role_counts},
+                    "grade_counts": {home_team_id: home.role_fit_grade_counts, away_team_id: away.role_fit_grade_counts},
+                    "pos_log": {home_team_id: home.role_fit_pos_log, away_team_id: away.role_fit_pos_log},
+                    "bad_totals": {home_team_id: home.role_fit_bad_totals, away_team_id: away.role_fit_bad_totals},
+                    "bad_by_grade": {home_team_id: home.role_fit_bad_by_grade, away_team_id: away.role_fit_bad_by_grade},
                 }
             },
         },
         "possessions_per_team": max(home.possessions, away.possessions),
         "teams": {
-            home.name: summarize_team(home, game_state, home=home),
-            away.name: summarize_team(away, game_state, home=home),
+            home_team_id: summarize_team(home, game_state, home=home, team_id=home_team_id),
+            away_team_id: summarize_team(away, game_state, home=home, team_id=away_team_id),
         },
         "game_state": {
-            "team_fouls": dict(game_state.team_fouls),
-            "player_fouls": dict(game_state.player_fouls),
-            "fatigue": dict(game_state.fatigue),
-            "minutes_played_sec": dict(game_state.minutes_played_sec),
+            "team_fouls": _side_to_team_keyed(dict(game_state.team_fouls), home_team_id, away_team_id),
+            "player_fouls": _side_to_team_keyed(dict(game_state.player_fouls), home_team_id, away_team_id),
+            "fatigue": _side_to_team_keyed(dict(game_state.fatigue), home_team_id, away_team_id),
+            "minutes_played_sec": _side_to_team_keyed(dict(game_state.minutes_played_sec), home_team_id, away_team_id),
+            "side_map": {"home": home_team_id, "away": away_team_id},
         }
     }
