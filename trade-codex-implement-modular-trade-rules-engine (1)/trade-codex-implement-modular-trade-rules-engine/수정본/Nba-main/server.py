@@ -422,10 +422,11 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     return JSONResponse(status_code=400, content=payload)
 
 def _require_db_path() -> str:
-    league = GAME_STATE.get("league") or {}
-    db_path = league.get("db_path")
+    league = _ensure_league_state()
+    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
     if not db_path:
         raise HTTPException(status_code=500, detail="db_path is required for trade operations")
+    league["db_path"] = db_path
     return db_path
 
 def _validate_repo_integrity(db_path: str) -> None:
@@ -561,7 +562,7 @@ async def team_schedule(team_id: str):
     """마스터 스케줄 기준으로 특정 팀의 전체 시즌 일정을 반환."""
     team_id = team_id.upper()
     if team_id not in ALL_TEAM_IDS:
-        raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in roster excel")
+        raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in league")
 
     # 마스터 스케줄이 없다면 생성
     initialize_master_schedule_if_needed()

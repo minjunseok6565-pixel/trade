@@ -428,8 +428,13 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("draft_year", None)
     league.setdefault("season_start", None)
     league.setdefault("current_date", None)
-    league.setdefault("db_path", os.environ.get("LEAGUE_DB_PATH", "league.db"))
+    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    league["db_path"] = db_path
     league.setdefault("last_gm_tick_date", None)
+    from league_repo import LeagueRepo
+
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
     season_year = league.get("season_year")
     salary_cap = trade_rules.get("salary_cap")
     if season_year:
@@ -459,16 +464,8 @@ def _ensure_league_state() -> Dict[str, Any]:
  
 
     _bootstrap_contracts(GAME_STATE, overwrite=False)
-
-    from contracts.store import get_league_season_year
-    from contracts.sync import (
-        sync_contract_team_ids_from_players,
-        sync_players_salary_from_active_contract,
-    )
-
-    season_year = get_league_season_year(GAME_STATE)
-    sync_contract_team_ids_from_players(GAME_STATE)
-    sync_players_salary_from_active_contract(GAME_STATE, season_year)
+    with LeagueRepo(db_path) as repo:
+        repo.validate_integrity()
     _ensure_ingest_turn_backfilled()
     return league
 
