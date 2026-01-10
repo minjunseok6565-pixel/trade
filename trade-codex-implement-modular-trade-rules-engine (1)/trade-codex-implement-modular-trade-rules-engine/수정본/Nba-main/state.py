@@ -805,13 +805,14 @@ def _mark_master_schedule_game_final(
     away_score: int,
 ) -> None:
     """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
-    league = GAME_STATE.get("league")
-    if not league:
-        return
-    master_schedule = (league.get("master_schedule") or {})
+    league = _ensure_league_state()
+    master_schedule = league.setdefault("master_schedule", {})
     games = master_schedule.get("games") or []
-    by_id = master_schedule.get("by_id") or {}
-    entry = by_id.get(game_id) if isinstance(by_id, dict) else None
+    by_id = master_schedule.setdefault("by_id", {})
+    if not isinstance(by_id, dict):
+        by_id = {}
+        master_schedule["by_id"] = by_id
+    entry = by_id.get(game_id)
     if entry:
         entry["status"] = "final"
         entry["date"] = game_date_str
@@ -825,8 +826,7 @@ def _mark_master_schedule_game_final(
             g["date"] = game_date_str
             g["home_score"] = home_score
             g["away_score"] = away_score
-            if isinstance(by_id, dict):
-                by_id[game_id] = g
+            by_id[game_id] = g
             return
 
 
