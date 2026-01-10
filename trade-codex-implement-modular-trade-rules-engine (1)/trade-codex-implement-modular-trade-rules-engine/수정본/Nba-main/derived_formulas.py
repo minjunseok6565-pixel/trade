@@ -100,6 +100,7 @@ def compute_derived(row) -> Dict[str, float]:
 
     PHYSICAL = 0.45*_get(row,"Strength")+0.20*_get(row,"Durability")+0.20*_get(row,"Hustle")+0.15*_get(row,"Stamina")
     ENDURANCE = 0.55*_get(row,"Stamina")+0.25*_get(row,"Durability")+0.20*_get(row,"Hustle")
+    FAT_CAPACITY = _get(row,"Stamina")  # stamina(0-100) == FAT_CAPACITY; engine normalizes (/100) internally
 
     out = dict(
         FIN_RIM=FIN_RIM, FIN_DUNK=FIN_DUNK, FIN_CONTACT=FIN_CONTACT,
@@ -109,6 +110,6 @@ def compute_derived(row) -> Dict[str, float]:
         DRIVE_CREATE=DRIVE_CREATE, HANDLE_SAFE=HANDLE_SAFE, FIRST_STEP=FIRST_STEP,
         PASS_SAFE=PASS_SAFE, PASS_CREATE=PASS_CREATE, PNR_READ=PNR_READ, SHORTROLL_PLAY=SHORTROLL_PLAY,
         DEF_POA=DEF_POA, DEF_HELP=DEF_HELP, DEF_STEAL=DEF_STEAL, DEF_RIM=DEF_RIM, DEF_POST=DEF_POST,
-        REB_OR=REB_OR, REB_DR=REB_DR, PHYSICAL=PHYSICAL, ENDURANCE=ENDURANCE,
+        REB_OR=REB_OR, REB_DR=REB_DR, PHYSICAL=PHYSICAL, ENDURANCE=ENDURANCE, FAT_CAPACITY=FAT_CAPACITY,
 +    )
 +    return {k: _clamp100(v) for k, v in out.items()}
