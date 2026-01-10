@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Legacy DataFrame/Excel-based simulation path is disabled.
+raise RuntimeError(
+    "Legacy DataFrame/Excel-based simulation path is disabled. "
+    "Use DB-backed simulation (roster_adapter -> sim_game -> matchengine_v2_adapter -> state)."
+)
+
 import random
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
