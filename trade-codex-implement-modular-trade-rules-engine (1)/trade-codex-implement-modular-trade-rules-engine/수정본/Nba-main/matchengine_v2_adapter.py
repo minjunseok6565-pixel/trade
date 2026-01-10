@@ -225,8 +225,8 @@ def _normalize_team_totals_from_raw(team_summary: Mapping[str, Any]) -> Tuple[Di
         _put(canonical, k, team_summary.get(k, 0))
 
     # 3PT normalization
-    _put(canonical, "TPM", team_summary.get("3PM", 0))
-    _put(canonical, "TPA", team_summary.get("3PA", 0))
+    _put(canonical, "3PM", team_summary.get("3PM", 0))
+    _put(canonical, "3PA", team_summary.get("3PA", 0))
 
     # Collect other numeric top-level keys (excluding breakdowns/player blobs)
     for k, v in team_summary.items():
@@ -320,10 +320,10 @@ def _normalize_player_rows_from_player_box(
 
             # Normalize 3PT naming
             if k == "3PM" and _is_number(v):
-                row["TPM"] = float(v)
+                row["3PM"] = float(v)
                 continue
             if k == "3PA" and _is_number(v):
-                row["TPA"] = float(v)
+                row["3PA"] = float(v)
                 continue
 
             if _is_number(v):
