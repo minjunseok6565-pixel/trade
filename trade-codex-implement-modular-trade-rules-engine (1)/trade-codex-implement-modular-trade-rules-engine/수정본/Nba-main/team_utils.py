@@ -1,102 +1,162 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-
-from config import ROSTER_DF, ALL_TEAM_IDS, TEAM_TO_CONF_DIV
 from derived_formulas import compute_derived
 from state import GAME_STATE, _ensure_league_state, initialize_master_schedule_if_needed
 
+# Division/Conference mapping can stay in config (static).
+# We intentionally do NOT import ROSTER_DF anymore.
+from config import ALL_TEAM_IDS, TEAM_TO_CONF_DIV
+
+_LEAGUE_REPO_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from league_repo import LeagueRepo  # type: ignore
+except Exception as e:  # pragma: no cover
+    LeagueRepo = None  # type: ignore
+    _LEAGUE_REPO_IMPORT_ERROR = e
+
+
+_REPO: Optional["LeagueRepo"] = None
+
+
+def _get_repo() -> "LeagueRepo":
+    """Open (or reuse) the SQLite LeagueRepo.
+
+    Source of truth rule:
+    - DB is the only writable canonical store.
+    - Excel is import/export only (handled by league_repo.py).
+    """
+    global _REPO
+    if LeagueRepo is None:
+        raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
+
+    league = GAME_STATE.setdefault("league", {})
+    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH", "league.db")
+
+    if _REPO is not None and getattr(_REPO, "db_path", None) == str(db_path):
+        return _REPO
+
+    _REPO = LeagueRepo(str(db_path))
+    try:
+        _REPO.init_db()
+    except Exception:
+        # init_db is idempotent; ignore if project uses a different init flow
+        pass
+    return _REPO
+
+
+def _list_active_team_ids() -> List[str]:
+    """Return active team ids from DB if possible, else fall back to ALL_TEAM_IDS."""
+    try:
+        repo = _get_repo()
+        teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
+        if teams:
+            return teams
+    except Exception:
+        pass
+    return list(ALL_TEAM_IDS)
+
+
+def _has_free_agents_team() -> bool:
+    try:
+        repo = _get_repo()
+        return "FA" in {str(t).upper() for t in repo.list_teams()}
+    except Exception:
+        return False
+
+
+def _parse_potential(pot_raw: Any) -> float:
+    pot_map = {
+        "A+": 1.0, "A": 0.95, "A-": 0.9,
+        "B+": 0.85, "B": 0.8, "B-": 0.75,
+        "C+": 0.7, "C": 0.65, "C-": 0.6,
+        "D+": 0.55, "D": 0.5, "F": 0.4,
+    }
+    if isinstance(pot_raw, str):
+        return float(pot_map.get(pot_raw.strip(), 0.6))
+    try:
+        return float(pot_raw)
+    except (TypeError, ValueError):
+        return 0.6
+
 
 def _init_players_and_teams_if_needed() -> None:
-    """GAME_STATE["players"], GAME_STATE["teams"]를 초기화한다.
+    """Initialize GAME_STATE['players'] and GAME_STATE['teams'].
 
-    - players: ROSTER_DF row index를 player_id로 사용
-    - teams: 기본 성향/시장규모 등 메타
+    Step 6 invariant:
+    - GAME_STATE['players'] is keyed by **player_id (string)**.
+    - Never depend on a pandas DataFrame index for IDs.
     """
-    if GAME_STATE["players"]:
-        # Backfill derived abilities for existing/loaded players (e.g., from a save file)
-        # - GAME_STATE["players"]가 이미 채워져 있으면 초기화는 하지 않되,
-        #   derived가 없거나 비어있는 선수에 한해 ROSTER_DF 기반으로 채워준다.
-        for key, pdata in list(GAME_STATE["players"].items()):
-            pid = key
-            # normalize key -> int if numeric string
-            if not (isinstance(pid, int) and not isinstance(pid, bool)):
-                kstr = str(pid).strip()
-                if kstr.isdigit():
-                    pid = int(kstr)
-
+    # If players already exist, backfill missing derived using DB row (if present).
+    if isinstance(GAME_STATE.get("players"), dict) and GAME_STATE["players"]:
+        try:
+            repo = _get_repo()
+        except Exception:
+            return
+        for pid, pdata in list(GAME_STATE["players"].items()):
             if not isinstance(pdata, dict):
                 continue
 
-            existing = pdata.get("derived")
-            if isinstance(existing, dict) and existing:
+            derived = pdata.get("derived")
+            if isinstance(derived, dict) and derived:
                 continue
-
-            if pid in ROSTER_DF.index:
-                try:
-                    pdata["derived"] = compute_derived(ROSTER_DF.loc[pid])
-                except Exception:
-                    # 파생 계산 실패 시 그냥 비워둔다(호출부에서 재계산 가능)
-                    pass
+            try:
+                row = repo.get_player(str(pid))
+            except Exception:
+                continue
+            attrs = row.get("attrs") or {}
+            try:
+                pdata["derived"] = compute_derived(attrs)
+            except Exception:
+                pass
         return
 
-    players: Dict[int, Dict[str, Any]] = {}
-    for idx, row in ROSTER_DF.iterrows():
-        team_id = str(row.get("Team", "")).upper()
-        if not team_id:
-            team_id = ""
-        player_name = str(row.get("Name", ""))
-        pos = str(row.get("POS", ""))
-        age = int(row.get("Age", 0)) if not pd.isna(row.get("Age", None)) else 0
-        ovr = float(row.get("OVR", 0.0)) if "OVR" in ROSTER_DF.columns else 0.0
-        salary = float(row.get("SalaryAmount", 0.0))
-        pot_raw = row.get("Potential", None)
+    # Fresh build from DB
+    repo = _get_repo()
 
-        pot_map = {
-            "A+": 1.0, "A": 0.95, "A-": 0.9,
-            "B+": 0.85, "B": 0.8, "B-": 0.75,
-            "C+": 0.7, "C": 0.65, "C-": 0.6,
-            "D+": 0.55, "D": 0.5, "F": 0.4
-        }
-        if isinstance(pot_raw, str):
-            potential = pot_map.get(pot_raw.strip(), 0.6)
-        else:
-            try:
-                potential = float(pot_raw)
-            except (TypeError, ValueError):
-                potential = 0.6
+    players: Dict[str, Dict[str, Any]] = {}
+    team_ids = _list_active_team_ids()
+    roster_team_ids = list(team_ids)
+    if _has_free_agents_team():
+        roster_team_ids.append("FA")
 
-        derived = compute_derived(row)
+    for tid in roster_team_ids:
+        try:
+            roster_rows = repo.get_team_roster(tid)
+        except Exception:
+            continue
+        for row in roster_rows:
+            pid = str(row.get("player_id"))
+            attrs = row.get("attrs") or {}
 
-        players[idx] = {
-            "player_id": idx,
-            "name": player_name,
-            "team_id": team_id,
-            "pos": pos,
-            "age": age,
-            "overall": ovr,
-            "salary": salary,
-            "potential": potential,
-            "derived": derived,
-            "signed_date": "1900-01-01",
-            "signed_via_free_agency": False,
-            "acquired_date": "1900-01-01",
-            "acquired_via_trade": False,
-        }
+            players[pid] = {
+                "player_id": pid,
+                "name": row.get("name") or attrs.get("Name") or "",
+                "team_id": str(tid).upper(),
+                "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
+                "age": int(row.get("age") or 0),
+                "overall": float(row.get("ovr") or 0.0),
+                "salary": float(row.get("salary_amount") or 0.0),
+                "potential": _parse_potential(attrs.get("Potential")),
+                "derived": compute_derived(attrs),
+                "signed_date": "1900-01-01",
+                "signed_via_free_agency": False,
+                "acquired_date": "1900-01-01",
+                "acquired_via_trade": False,
+            }
 
     GAME_STATE["players"] = players
 
-    # 팀 메타 기본값
     teams_meta: Dict[str, Dict[str, Any]] = {}
-    for tid in ALL_TEAM_IDS:
+    for tid in team_ids:
         info = TEAM_TO_CONF_DIV.get(tid, {})
         teams_meta[tid] = {
             "team_id": tid,
             "conference": info.get("conference"),
             "division": info.get("division"),
-            "tendency": "neutral",  # contender / neutral / rebuild
+            "tendency": "neutral",
             "window": "now",
             "market": "mid",
             "patience": 0.5,
@@ -104,52 +164,48 @@ def _init_players_and_teams_if_needed() -> None:
     GAME_STATE["teams"] = teams_meta
 
 
-def _position_group(pos: str) -> str:
-    """POS 문자열을 guard/wing/big 그룹으로 단순 매핑."""
-    p = (pos or "").upper()
-    if "G" in p:
-        return "guard"
-    if "C" in p:
-        return "big"
-    return "wing"
-
-
 def _compute_team_payroll(team_id: str) -> float:
-    """ROSTER_DF 기반으로 팀 페이롤(달러)을 계산."""
-    df = ROSTER_DF[ROSTER_DF["Team"] == team_id]
-    if df.empty:
-        return 0.0
-    return float(df["SalaryAmount"].sum())
+    """Compute payroll from DB roster (NOT from Excel)."""
+    repo = _get_repo()
+    roster = repo.get_team_roster(team_id)
+    total = 0.0
+    for r in roster:
+        try:
+            total += float(r.get("salary_amount") or 0.0)
+        except Exception:
+            continue
+    return float(total)
 
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
     league = _ensure_league_state()
     trade_rules = league.get("trade_rules", {})
-    salary_cap = float(trade_rules.get("salary_cap") or 0.0)
+    try:
+        salary_cap = float(trade_rules.get("salary_cap") or 0.0)
+    except Exception:
+        salary_cap = 0.0
     return salary_cap - payroll
 
 
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
-    """master_schedule.games를 기준으로 각 팀의 승/패/득실점 계산.
-
-    반환: {team_id: {"wins":..,"losses":..,"pf":..,"pa":..}}
-    """
+    """Compute W/L and points from master_schedule."""
     initialize_master_schedule_if_needed()
     league = _ensure_league_state()
     master_schedule = league["master_schedule"]
     games = master_schedule.get("games") or []
 
+    team_ids = _list_active_team_ids()
     records: Dict[str, Dict[str, Any]] = {
         tid: {"wins": 0, "losses": 0, "pf": 0, "pa": 0}
-        for tid in ALL_TEAM_IDS
+        for tid in team_ids
     }
 
     for g in games:
         if g.get("status") != "final":
             continue
-        home_id = g.get("home_team_id")
-        away_id = g.get("away_team_id")
+        home_id = str(g.get("home_team_id") or "")
+        away_id = str(g.get("away_team_id") or "")
         home_score = g.get("home_score")
         away_score = g.get("away_score")
         if home_id not in records or away_id not in records:
@@ -157,10 +213,10 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
         if home_score is None or away_score is None:
             continue
 
-        records[home_id]["pf"] += home_score
-        records[home_id]["pa"] += away_score
-        records[away_id]["pf"] += away_score
-        records[away_id]["pa"] += home_score
+        records[home_id]["pf"] += int(home_score)
+        records[home_id]["pa"] += int(away_score)
+        records[away_id]["pf"] += int(away_score)
+        records[away_id]["pa"] += int(home_score)
 
         if home_score > away_score:
             records[home_id]["wins"] += 1
@@ -173,7 +229,8 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
 
 
 def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
-    """컨퍼런스별 스탠딩을 계산한다."""
+    """Return standings grouped by conference."""
+    _init_players_and_teams_if_needed()
     records = _compute_team_records()
 
     standings = {"east": [], "west": []}
@@ -203,7 +260,7 @@ def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
             "point_diff": point_diff,
         }
 
-        if conf.lower() == "east":
+        if str(conf).lower() == "east":
             standings["east"].append(entry)
         else:
             standings["west"].append(entry)
@@ -233,13 +290,14 @@ def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
 
 
 def get_team_cards() -> List[Dict[str, Any]]:
-    """팀 카드(요약 정보) 리스트를 반환한다."""
+    """Return team summary cards."""
     _init_players_and_teams_if_needed()
     records = _compute_team_records()
+    team_ids = _list_active_team_ids()
 
     team_cards: List[Dict[str, Any]] = []
-    for tid in ALL_TEAM_IDS:
-        meta = GAME_STATE["teams"].get(tid, {})
+    for tid in team_ids:
+        meta = GAME_STATE.get("teams", {}).get(tid, {})
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -262,18 +320,19 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
 
 def get_team_detail(team_id: str) -> Dict[str, Any]:
-    """특정 팀의 상세 정보 + 로스터를 반환한다."""
+    """Return team detail (summary + roster) using DB roster."""
     _init_players_and_teams_if_needed()
-    tid = team_id.upper()
+    tid = str(team_id).upper()
+
+    team_ids = set(_list_active_team_ids())
+    if tid not in team_ids:
+        raise ValueError(f"Team '{tid}' not found")
 
     records = _compute_team_records()
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = GAME_STATE["teams"].get(tid)
-    if not meta:
-        raise ValueError(f"Team '{tid}' not found")
-
+    meta = GAME_STATE.get("teams", {}).get(tid, {})
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -299,12 +358,14 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "cap_space": _compute_cap_space(tid),
     }
 
-    roster_rows = ROSTER_DF[ROSTER_DF["Team"] == tid]
-    season_stats = GAME_STATE.get("player_stats", {})
+    repo = _get_repo()
+    roster_rows = repo.get_team_roster(tid)
+    season_stats = GAME_STATE.get("player_stats", {}) or {}{})
     roster: List[Dict[str, Any]] = []
-    for pid, row in roster_rows.iterrows():
-        p_stats = season_stats.get(pid, {})
-        games = p_stats.get("games", 0) or 0
+    for row in roster_rows:
+        pid = str(row.get("player_id"))
+        p_stats = season_stats.get(pid, {}) or {}
+        games = int(p_stats.get("games", 0) or 0)
         totals = p_stats.get("totals", {}) or {}
         def per_game_val(key: str) -> float:
             try:
@@ -315,11 +376,11 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         roster.append(
             {
                 "player_id": pid,
-                "name": row.get("Name"),
-                "pos": row.get("POS"),
-                "ovr": float(row.get("OVR", 0.0)) if "OVR" in roster_rows.columns else 0.0,
-                "age": int(row.get("Age", 0)) if not pd.isna(row.get("Age", None)) else 0,
-                "salary": float(row.get("SalaryAmount", 0.0)),
+                "name": row.get("name"),
+                "pos": row.get("pos"),
+                "ovr": float(row.get("ovr") or 0.0),
+                "age": int(row.get("age") or 0),
+                "salary": float(row.get("salary_amount") or 0.0),
                 "pts": per_game_val("PTS"),
                 "ast": per_game_val("AST"),
                 "reb": per_game_val("REB"),
@@ -333,3 +394,4 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
