@@ -4,12 +4,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from .errors import TradeError, DEAL_INVALIDATED, MISSING_TO_TEAM, PROTECTION_INVALID
+from schema import normalize_player_id, normalize_team_id
 
 
 @dataclass(frozen=True)
 class PlayerAsset:
     kind: str
-    player_id: int
+    player_id: str
     to_team: Optional[str] = None
 
 
@@ -95,20 +96,42 @@ def _normalize_protection(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _normalize_team_id(value: Any, *, context: str) -> str:
+    try:
+        return str(normalize_team_id(value, strict=True))
+    except ValueError as exc:
+        raise ValueError(f"{context}: invalid team_id {value!r}") from exc
+
+
+def _normalize_player_id(value: Any, *, context: str) -> str:
+    try:
+        return str(normalize_player_id(value, strict=True))
+    except ValueError as exc:
+        is_numeric = isinstance(value, str) and value.strip().isdigit()
+        is_legacy_int = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        if is_numeric or is_legacy_int:
+            try:
+                return str(
+                    normalize_player_id(
+                        str(value),
+                        strict=False,
+                        allow_legacy_numeric=True,
+                    )
+                )
+            except ValueError as legacy_exc:
+                raise ValueError(f"{context}: invalid player_id {value!r}") from legacy_exc
+        raise ValueError(f"{context}: invalid player_id {value!r}") from exc
+
+
 def _parse_asset(raw: Dict[str, Any]) -> Asset:
     kind = str(raw.get("kind", "")).lower()
     to_team = raw.get("to_team")
-    to_team = str(to_team).upper() if to_team else None
+    to_team = _normalize_team_id(to_team, context="asset.to_team") if to_team else None
     if kind == "player":
         player_id = raw.get("player_id")
         if player_id is None:
             raise TradeError(DEAL_INVALIDATED, "Missing player_id in asset", raw)
-        try:
-            pid = int(player_id)
-        except (TypeError, ValueError):
-            raise TradeError(DEAL_INVALIDATED, "Invalid player_id in asset", raw)
-        if pid < 0:
-            raise TradeError(DEAL_INVALIDATED, "Invalid player_id in asset", raw)
+        pid = _normalize_player_id(player_id, context="asset.player_id")
         return PlayerAsset(kind="player", player_id=pid, to_team=to_team)
     if kind == "pick":
         pick_id = raw.get("pick_id")
@@ -157,11 +180,13 @@ def parse_deal(payload: Dict[str, Any]) -> Deal:
     if not isinstance(teams_raw, list) or not isinstance(legs_raw, dict):
         raise TradeError(DEAL_INVALIDATED, "Invalid deal payload", payload)
 
-    teams = [str(t).upper() for t in teams_raw]
+    teams = [_normalize_team_id(t, context="deal.teams") for t in teams_raw]
     if not teams:
         raise TradeError(DEAL_INVALIDATED, "Deal must include teams", payload)
 
-    normalized_legs_raw = {str(k).upper(): v for k, v in legs_raw.items()}
+    normalized_legs_raw = {
+        _normalize_team_id(k, context="deal.legs key"): v for k, v in legs_raw.items()
+    }
     legs: Dict[str, List[Asset]] = {}
     for team_id in teams:
         if team_id not in normalized_legs_raw:
@@ -189,19 +214,28 @@ def parse_deal(payload: Dict[str, Any]) -> Deal:
 
 
 def canonicalize_deal(deal: Deal) -> Deal:
-    teams = sorted(deal.teams)
+    teams = sorted(_normalize_team_id(team_id, context="deal.teams") for team_id in deal.teams)
     legs: Dict[str, List[Asset]] = {}
     for team_id in sorted(deal.legs.keys()):
+        normalized_team_id = _normalize_team_id(team_id, context="deal.legs key")
         assets = list(deal.legs.get(team_id, []))
         normalized_assets: List[Asset] = []
         for asset in assets:
             if isinstance(asset, PlayerAsset):
-                to_team = asset.to_team.upper() if asset.to_team else None
+                to_team = (
+                    _normalize_team_id(asset.to_team, context="deal.asset.to_team")
+                    if asset.to_team
+                    else None
+                )
                 normalized_assets.append(
                     PlayerAsset(kind=asset.kind, player_id=asset.player_id, to_team=to_team)
                 )
             elif isinstance(asset, PickAsset):
-                to_team = asset.to_team.upper() if asset.to_team else None
+                to_team = (
+                    _normalize_team_id(asset.to_team, context="deal.asset.to_team")
+                    if asset.to_team
+                    else None
+                )
                 protection = None
                 if asset.protection is not None:
                     protection = _normalize_protection(asset.protection)
@@ -214,7 +248,11 @@ def canonicalize_deal(deal: Deal) -> Deal:
                     )
                 )
             elif isinstance(asset, SwapAsset):
-                to_team = asset.to_team.upper() if asset.to_team else None
+                to_team = (
+                    _normalize_team_id(asset.to_team, context="deal.asset.to_team")
+                    if asset.to_team
+                    else None
+                )
                 normalized_assets.append(
                     SwapAsset(
                         kind=asset.kind,
@@ -225,12 +263,16 @@ def canonicalize_deal(deal: Deal) -> Deal:
                     )
                 )
             elif isinstance(asset, FixedAsset):
-                to_team = asset.to_team.upper() if asset.to_team else None
+                to_team = (
+                    _normalize_team_id(asset.to_team, context="deal.asset.to_team")
+                    if asset.to_team
+                    else None
+                )
                 normalized_assets.append(
                     FixedAsset(kind=asset.kind, asset_id=asset.asset_id, to_team=to_team)
                 )
         normalized_assets.sort(key=_asset_sort_key)
-        legs[team_id] = normalized_assets
+        legs[normalized_team_id] = normalized_assets
     meta = dict(deal.meta) if deal.meta else {}
     return Deal(teams=teams, legs=legs, meta=meta)
 
