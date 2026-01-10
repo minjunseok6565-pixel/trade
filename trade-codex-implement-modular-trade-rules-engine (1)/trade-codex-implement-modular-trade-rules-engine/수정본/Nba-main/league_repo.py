@@ -496,7 +496,7 @@ class LeagueRepo:
         return out
 
     def get_team_id_by_player(self, player_id: str) -> str:
-        pid = normalize_player_id(player_id, strict=False)
+        pid = normalize_player_id(player_id, strict=False, allow_legacy_numeric=True)
         row = self._conn.execute(
             "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
             (str(pid),),
@@ -504,6 +504,17 @@ class LeagueRepo:
         if not row:
             raise KeyError(f"active roster entry not found for player_id={player_id}")
         return str(row["team_id"])
+
+    def get_salary_amount(self, player_id: str) -> Optional[int]:
+        pid = normalize_player_id(player_id, strict=False, allow_legacy_numeric=True)
+        row = self._conn.execute(
+            "SELECT salary_amount FROM roster WHERE player_id=? AND status='active';",
+            (str(pid),),
+        ).fetchone()
+        if not row:
+            return None
+        salary = row["salary_amount"]
+        return int(salary) if salary is not None else None
 
     def get_roster_player_ids(self, team_id: str) -> set[str]:
         tid = normalize_team_id(team_id, strict=True)

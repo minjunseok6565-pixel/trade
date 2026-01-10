@@ -14,13 +14,8 @@ def validate_deal(
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
     _ensure_league_state()
-    from league_repo import LeagueRepo
 
     db_path = (GAME_STATE.get("league") or {}).get("db_path")
-    if db_path:
-        with LeagueRepo(db_path) as repo:
-            repo.validate_integrity()
-
-    # RULES ENGINE CHECKS (migrated): deadline
-    ctx = build_trade_context(current_date=current_date)
+    ctx = build_trade_context(current_date=current_date, db_path=db_path)
+    ctx.repo.validate_integrity()
     validate_all(deal, ctx)
