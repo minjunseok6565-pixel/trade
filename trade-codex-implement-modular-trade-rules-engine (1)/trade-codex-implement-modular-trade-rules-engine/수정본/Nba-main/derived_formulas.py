@@ -111,5 +111,5 @@ def compute_derived(row) -> Dict[str, float]:
         PASS_SAFE=PASS_SAFE, PASS_CREATE=PASS_CREATE, PNR_READ=PNR_READ, SHORTROLL_PLAY=SHORTROLL_PLAY,
         DEF_POA=DEF_POA, DEF_HELP=DEF_HELP, DEF_STEAL=DEF_STEAL, DEF_RIM=DEF_RIM, DEF_POST=DEF_POST,
         REB_OR=REB_OR, REB_DR=REB_DR, PHYSICAL=PHYSICAL, ENDURANCE=ENDURANCE, FAT_CAPACITY=FAT_CAPACITY,
-+    )
-+    return {k: _clamp100(v) for k, v in out.items()}
+    )
+    return {k: _clamp100(v) for k, v in out.items()}
