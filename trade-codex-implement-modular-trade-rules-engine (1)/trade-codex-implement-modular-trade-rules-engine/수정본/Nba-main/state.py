@@ -45,6 +45,8 @@ DEFAULT_TRADE_RULES: Dict[str, Any] = {
     "stepien_lookahead": 7,
 }
 
+_INGEST_TURN_BACKFILL_DONE = False
+
 # -------------------------------------------------------------------------
 # 1. 전역 GAME_STATE 및 스케줄/리그 상태 유틸
 # -------------------------------------------------------------------------
@@ -322,6 +324,78 @@ def normalize_player_keys(game_state: dict) -> dict:
     return report
 
 
+def _backfill_ingest_turns_once() -> None:
+    """Backfill missing ingest_turn values across stored games."""
+    all_games: List[Dict[str, Any]] = []
+
+    regular_games = GAME_STATE.get("games", [])
+    if isinstance(regular_games, list):
+        all_games.extend([g for g in regular_games if isinstance(g, dict)])
+
+    postseason = GAME_STATE.get("postseason", {})
+    if isinstance(postseason, dict):
+        for container in postseason.values():
+            if not isinstance(container, dict):
+                continue
+            games = container.get("games", [])
+            if isinstance(games, list):
+                all_games.extend([g for g in games if isinstance(g, dict)])
+
+    season_history = GAME_STATE.get("season_history", {})
+    if isinstance(season_history, dict):
+        for record in season_history.values():
+            if not isinstance(record, dict):
+                continue
+            games = record.get("games", [])
+            if isinstance(games, list):
+                all_games.extend([g for g in games if isinstance(g, dict)])
+
+    used_turns = {
+        int(game["ingest_turn"])
+        for game in all_games
+        if isinstance(game.get("ingest_turn"), int)
+        and not isinstance(game.get("ingest_turn"), bool)
+        and int(game.get("ingest_turn")) > 0
+    }
+
+    missing_games = [
+        game
+        for game in all_games
+        if not (
+            isinstance(game.get("ingest_turn"), int)
+            and not isinstance(game.get("ingest_turn"), bool)
+            and int(game.get("ingest_turn")) > 0
+        )
+    ]
+
+    def _missing_sort_key(game: Dict[str, Any]) -> tuple[date, str, str, str]:
+        raw_date = game.get("date")
+        try:
+            parsed_date = date.fromisoformat(str(raw_date))
+        except (TypeError, ValueError):
+            parsed_date = date.min
+        return (
+            parsed_date,
+            str(game.get("season_id") or ""),
+            str(game.get("phase") or ""),
+            str(game.get("game_id") or ""),
+        )
+
+    missing_games.sort(key=_missing_sort_key)
+
+    next_turn = 1
+    for game in missing_games:
+        while next_turn in used_turns:
+            next_turn += 1
+        game["ingest_turn"] = next_turn
+        used_turns.add(next_turn)
+        next_turn += 1
+
+    max_turn = max(used_turns) if used_turns else 0
+    if int(GAME_STATE.get("turn", 0) or 0) < max_turn:
+        GAME_STATE["turn"] = max_turn
+
+
 def _ensure_league_state() -> Dict[str, Any]:
     """GAME_STATE 안에 league 상태 블록을 보장한다."""
     league = GAME_STATE.setdefault("league", {})
@@ -375,6 +449,10 @@ def _ensure_league_state() -> Dict[str, Any]:
     sync_players_salary_from_active_contract(GAME_STATE, season_year)
     sync_roster_teams_from_state(GAME_STATE)
     sync_roster_salaries_for_season(GAME_STATE, season_year)
+    global _INGEST_TURN_BACKFILL_DONE
+    if not _INGEST_TURN_BACKFILL_DONE:
+        _backfill_ingest_turns_once()
+        _INGEST_TURN_BACKFILL_DONE = True
     return league
 
 
