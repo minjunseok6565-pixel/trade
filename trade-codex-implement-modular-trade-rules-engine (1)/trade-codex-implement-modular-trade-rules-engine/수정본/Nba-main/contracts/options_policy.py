@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from schema import normalize_player_id
+
 Decision = Literal["EXERCISE", "DECLINE"]
 
 
@@ -16,7 +18,7 @@ def normalize_option_type(value: str) -> str:
 
 def default_option_decision_policy(
     option: dict,
-    player_id: int,
+    player_id: str,
     contract: dict,
     game_state: dict,
 ) -> Decision:
@@ -26,4 +28,5 @@ def default_option_decision_policy(
     - PLAYER option: EXERCISE
     - ETO: EXERCISE
     """
+    normalize_player_id(player_id, strict=False, allow_legacy_numeric=True)
     return "EXERCISE"
