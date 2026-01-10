@@ -459,7 +459,7 @@ def _ensure_league_state() -> Dict[str, Any]:
     # fall back to legacy Excel bootstrap for older saves.
     try:
         from contracts.bootstrap import bootstrap_contracts_from_repo as _bootstrap_contracts
-    except Exception:
+    except ImportError:
         from contracts.bootstrap import bootstrap_contracts_from_roster_excel as _bootstrap_contracts
  
 
