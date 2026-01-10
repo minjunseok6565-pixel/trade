@@ -5,7 +5,8 @@ from typing import Optional
 
 import random
 
-from config import ROSTER_DF
+from league_repo import LeagueRepo
+from schema import normalize_player_id, normalize_team_id
 from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
 from trades.apply import apply_deal
@@ -53,6 +54,11 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
 
     initialize_master_schedule_if_needed()
     league = _ensure_league_state()
+    db_path = league.get("db_path")
+    if not db_path:
+        raise ValueError("db_path is required for AI trade evaluation")
+    repo = LeagueRepo(db_path)
+    repo.init_db()
     draft_picks = GAME_STATE.get("draft_picks", {})
     asset_locks = GAME_STATE.get("asset_locks", {})
 
@@ -71,53 +77,68 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
         base_year = target_date.year if target_date else get_current_date_as_date().year
         current_year = base_year + 1
 
-    for contender in contenders:
-        for rebuild in rebuilders:
-            if contender == rebuild:
-                continue
+    try:
+        for contender in contenders:
+            for rebuild in rebuilders:
+                if contender == rebuild:
+                    continue
 
-            roster_reb = ROSTER_DF[ROSTER_DF["Team"] == rebuild]
-            roster_cont = ROSTER_DF[ROSTER_DF["Team"] == contender]
-            if roster_reb.empty or roster_cont.empty:
-                continue
+                contender_id = str(normalize_team_id(contender, strict=True))
+                rebuild_id = str(normalize_team_id(rebuild, strict=True))
+                roster_reb = repo.get_team_roster(rebuild_id)
+                roster_cont = repo.get_team_roster(contender_id)
+                if not roster_reb or not roster_cont:
+                    continue
 
-            vet_candidates = roster_reb[roster_reb["Age"] >= 28]
-            if vet_candidates.empty:
-                continue
+                vet_candidates = [
+                    row for row in roster_reb if (row.get("age") or 0) >= 28
+                ]
+                if not vet_candidates:
+                    continue
 
-            vet_candidates = vet_candidates.sort_values(by="OVR", ascending=False)
-            veteran_id = int(vet_candidates.index[0])
-            if asset_key(PlayerAsset(kind="player", player_id=int(veteran_id))) in asset_locks:
-                continue
+                vet_candidates.sort(
+                    key=lambda row: (-(row.get("ovr") or 0), row.get("player_id", ""))
+                )
+                veteran_id = str(
+                    normalize_player_id(
+                        vet_candidates[0].get("player_id"),
+                        strict=False,
+                        allow_legacy_numeric=True,
+                    )
+                )
+                if asset_key(PlayerAsset(kind="player", player_id=veteran_id)) in asset_locks:
+                    continue
 
-            pick_candidates = [
-                pick
-                for pick in draft_picks.values()
-                if pick.get("owner_team") == contender
-                and pick.get("round") == 2
-                and int(pick.get("year", current_year)) >= current_year
-                and pick.get("protection") is None
-                and asset_key(PickAsset(kind="pick", pick_id=str(pick.get("pick_id"))))
-                not in asset_locks
-            ]
-            if not pick_candidates:
-                continue
+                pick_candidates = [
+                    pick
+                    for pick in draft_picks.values()
+                    if pick.get("owner_team") == contender_id
+                    and pick.get("round") == 2
+                    and int(pick.get("year", current_year)) >= current_year
+                    and pick.get("protection") is None
+                    and asset_key(PickAsset(kind="pick", pick_id=str(pick.get("pick_id"))))
+                    not in asset_locks
+                ]
+                if not pick_candidates:
+                    continue
 
-            pick = sorted(pick_candidates, key=lambda p: (p.get("year", 0), p.get("pick_id")))[0]
-            pick_id = pick.get("pick_id")
+                pick = sorted(pick_candidates, key=lambda p: (p.get("year", 0), p.get("pick_id")))[0]
+                pick_id = pick.get("pick_id")
 
-            payload = {
-                "teams": [contender, rebuild],
-                "legs": {
-                    contender: [{"kind": "pick", "pick_id": pick_id}],
-                    rebuild: [{"kind": "player", "player_id": veteran_id}],
-                },
-            }
+                payload = {
+                    "teams": [contender_id, rebuild_id],
+                    "legs": {
+                        contender_id: [{"kind": "pick", "pick_id": pick_id}],
+                        rebuild_id: [{"kind": "player", "player_id": veteran_id}],
+                    },
+                }
 
-            deal = canonicalize_deal(parse_deal(payload))
-            trade_date = target_date or get_current_date_as_date()
-            validate_deal(deal, current_date=trade_date)
-            apply_deal(deal, source="ai_gm", trade_date=trade_date)
-            return True
+                deal = canonicalize_deal(parse_deal(payload))
+                trade_date = target_date or get_current_date_as_date()
+                validate_deal(deal, current_date=trade_date)
+                apply_deal(deal, source="ai_gm", trade_date=trade_date)
+                return True
+    finally:
+        repo.close()
 
     return False

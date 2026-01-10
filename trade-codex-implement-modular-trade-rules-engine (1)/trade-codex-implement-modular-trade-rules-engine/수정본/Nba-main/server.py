@@ -11,7 +11,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config import BASE_DIR, ROSTER_DF, ALL_TEAM_IDS
+from config import BASE_DIR, ALL_TEAM_IDS
+from league_repo import LeagueRepo
+from schema import normalize_team_id
 from state import (
     GAME_STATE,
     _ensure_league_state,
@@ -419,15 +421,29 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     }
     return JSONResponse(status_code=400, content=payload)
 
+def _require_db_path() -> str:
+    league = GAME_STATE.get("league") or {}
+    db_path = league.get("db_path")
+    if not db_path:
+        raise HTTPException(status_code=500, detail="db_path is required for trade operations")
+    return db_path
+
+def _validate_repo_integrity(db_path: str) -> None:
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        repo.validate_integrity()
+
 
 @app.post("/api/trade/submit")
 async def api_trade_submit(req: TradeSubmitRequest):
     try:
         in_game_date = get_current_date_as_date()
+        db_path = _require_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = canonicalize_deal(parse_deal(req.deal))
         validate_deal(deal, current_date=in_game_date)
         transaction = apply_deal(deal, source="menu", trade_date=in_game_date)
+        _validate_repo_integrity(db_path)
         return {
             "ok": True,
             "deal": serialize_deal(deal),
@@ -441,6 +457,7 @@ async def api_trade_submit(req: TradeSubmitRequest):
 async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
     try:
         in_game_date = get_current_date_as_date()
+        db_path = _require_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = agreements.verify_committed_deal(req.deal_id, current_date=in_game_date)
         validate_deal(
@@ -454,6 +471,7 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
             deal_id=req.deal_id,
             trade_date=in_game_date,
         )
+        _validate_repo_integrity(db_path)
         agreements.mark_executed(req.deal_id)
         return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
     except TradeError as exc:
@@ -475,6 +493,7 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
 async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
     try:
         in_game_date = get_current_date_as_date()
+        _require_db_path()
         session = negotiation_store.get_session(req.session_id)
         deal = canonicalize_deal(parse_deal(req.deal))
         team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
@@ -508,19 +527,22 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
 @app.get("/api/roster-summary/{team_id}")
 async def roster_summary(team_id: str):
     """특정 팀의 로스터를 LLM이 보기 좋은 형태로 요약해서 돌려준다."""
-    team_id = team_id.upper()
-    team_df = ROSTER_DF[ROSTER_DF["Team"] == team_id]
+    db_path = _require_db_path()
+    team_id = str(normalize_team_id(team_id, strict=True))
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        roster = repo.get_team_roster(team_id)
 
-    if team_df.empty:
-        raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in roster excel")
+    if not roster:
+        raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in roster")
 
     players: List[Dict[str, Any]] = []
-    for idx, row in team_df.iterrows():
+    for row in roster:
         players.append({
-            "player_id": int(idx),
-            "name": row["Name"],
-            "pos": str(row.get("POS", "")),
-            "overall": float(row.get("OVR", 0.0)) if "OVR" in team_df.columns else 0.0,
+            "player_id": row.get("player_id"),
+            "name": row.get("name"),
+            "pos": str(row.get("pos") or ""),
+            "overall": float(row.get("ovr") or 0.0),
         })
 
     players = sorted(players, key=lambda x: x["overall"], reverse=True)

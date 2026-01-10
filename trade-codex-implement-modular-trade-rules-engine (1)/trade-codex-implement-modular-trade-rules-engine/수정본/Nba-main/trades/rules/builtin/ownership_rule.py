@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from schema import normalize_player_id, normalize_team_id
+
 from ...errors import (
     FIXED_ASSET_NOT_FOUND,
     FIXED_ASSET_NOT_OWNED,
@@ -27,10 +29,14 @@ class OwnershipRule:
             for asset in assets:
                 if isinstance(asset, PlayerAsset):
                     try:
-                        current_team = str(ctx.roster_df.at[asset.player_id, "Team"]).upper()
-                    except Exception:
-                        current_team = ""
-                    if current_team != team_id:
+                        pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
+                        current_team = ctx.repo.get_team_id_by_player(pid)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Player not found in roster: {asset.player_id}"
+                        ) from exc
+                    team_id_normalized = str(normalize_team_id(team_id, strict=True))
+                    if current_team != team_id_normalized:
                         raise TradeError(
                             PLAYER_NOT_OWNED,
                             "Player not owned by team",
