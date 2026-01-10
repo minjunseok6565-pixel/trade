@@ -464,15 +464,11 @@ def _ensure_league_state() -> Dict[str, Any]:
     from contracts.sync import (
         sync_contract_team_ids_from_players,
         sync_players_salary_from_active_contract,
-        sync_roster_salaries_for_season,
-        sync_roster_teams_from_state,
     )
 
     season_year = get_league_season_year(GAME_STATE)
     sync_contract_team_ids_from_players(GAME_STATE)
     sync_players_salary_from_active_contract(GAME_STATE, season_year)
-    sync_roster_teams_from_state(GAME_STATE)
-    sync_roster_salaries_for_season(GAME_STATE, season_year)
     _ensure_ingest_turn_backfilled()
     return league
 
