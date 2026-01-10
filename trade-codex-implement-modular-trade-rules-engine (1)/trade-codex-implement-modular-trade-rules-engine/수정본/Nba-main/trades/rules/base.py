@@ -26,19 +26,20 @@ class Rule(Protocol):
         ...
 
 
-def build_player_moves(deal: Any) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+def build_player_moves(deal: Any) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     from ..models import PlayerAsset
 
-    players_out: dict[str, list[int]] = {team_id: [] for team_id in deal.teams}
-    players_in: dict[str, list[int]] = {team_id: [] for team_id in deal.teams}
+    players_out: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
+    players_in: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
 
     for team_id, assets in deal.legs.items():
         for asset in assets:
             if not isinstance(asset, PlayerAsset):
                 continue
-            players_out[team_id].append(asset.player_id)
+            player_id = _normalize_player_id(asset.player_id)
+            players_out[team_id].append(player_id)
             receiver = _resolve_receiver(deal, team_id, asset)
-            players_in[receiver].append(asset.player_id)
+            players_in[receiver].append(player_id)
 
     return players_out, players_in
 
@@ -51,7 +52,7 @@ def _normalize_team_id(value: Any) -> str:
     return str(normalize_team_id(value, strict=True))
 
 
-def _sum_player_salaries(repo: LeagueRepo, player_ids: list[int]) -> float:
+def _sum_player_salaries(repo: LeagueRepo, player_ids: list[str]) -> float:
     if not player_ids:
         return 0.0
     total = 0.0

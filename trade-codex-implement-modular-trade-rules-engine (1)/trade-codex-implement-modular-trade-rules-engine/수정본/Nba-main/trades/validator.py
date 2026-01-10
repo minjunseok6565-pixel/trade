@@ -17,5 +17,11 @@ def validate_deal(
 
     db_path = (GAME_STATE.get("league") or {}).get("db_path")
     ctx = build_trade_context(current_date=current_date, db_path=db_path)
-    ctx.repo.validate_integrity()
-    validate_all(deal, ctx)
+    try:
+        ctx.repo.validate_integrity()
+        validate_all(deal, ctx)
+    finally:
+        # Validator closes ctx.repo to avoid SQLite connection leaks.
+        repo = getattr(ctx, "repo", None)
+        if repo is not None:
+            repo.close()
