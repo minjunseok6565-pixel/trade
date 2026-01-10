@@ -45,8 +45,6 @@ DEFAULT_TRADE_RULES: Dict[str, Any] = {
     "stepien_lookahead": 7,
 }
 
-_INGEST_TURN_BACKFILL_DONE = False
-
 # -------------------------------------------------------------------------
 # 1. 전역 GAME_STATE 및 스케줄/리그 상태 유틸
 # -------------------------------------------------------------------------
@@ -59,6 +57,7 @@ GAME_STATE: Dict[str, Any] = {
     "game_results": {},  # game_id -> 매치엔진 원본 결과(신규 엔진 기준)
     "active_season_id": None,  # 현재 누적이 쌓이는 season_id (예: "2025-26")
     "season_history": {},  # season_id -> {games, player_stats, team_stats, game_results}
+    "_migrations": {},
     "cached_views": {
         "scores": {
             "latest_date": None,
@@ -396,6 +395,15 @@ def _backfill_ingest_turns_once() -> None:
         GAME_STATE["turn"] = max_turn
 
 
+def _ensure_ingest_turn_backfilled() -> None:
+    """Ensure ingest_turn backfill runs once per GAME_STATE instance."""
+    migrations = GAME_STATE.setdefault("_migrations", {})
+    if migrations.get("ingest_turn_backfilled") is True:
+        return
+    _backfill_ingest_turns_once()
+    migrations["ingest_turn_backfilled"] = True
+
+
 def _ensure_league_state() -> Dict[str, Any]:
     """GAME_STATE 안에 league 상태 블록을 보장한다."""
     league = GAME_STATE.setdefault("league", {})
@@ -449,10 +457,7 @@ def _ensure_league_state() -> Dict[str, Any]:
     sync_players_salary_from_active_contract(GAME_STATE, season_year)
     sync_roster_teams_from_state(GAME_STATE)
     sync_roster_salaries_for_season(GAME_STATE, season_year)
-    global _INGEST_TURN_BACKFILL_DONE
-    if not _INGEST_TURN_BACKFILL_DONE:
-        _backfill_ingest_turns_once()
-        _INGEST_TURN_BACKFILL_DONE = True
+    _ensure_ingest_turn_backfilled()
     return league
 
 
@@ -1147,6 +1152,7 @@ def ingest_game_result(
 
 def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
     """Return cached or rebuilt scores view for the given season."""
+    _ensure_ingest_turn_backfilled()
     cached = GAME_STATE.setdefault("cached_views", {})
     scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
     meta = _ensure_cached_views_meta()
