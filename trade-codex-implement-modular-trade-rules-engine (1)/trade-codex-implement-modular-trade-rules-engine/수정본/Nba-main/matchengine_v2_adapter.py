@@ -26,8 +26,9 @@ Important philosophy:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple, TypedDict, Literal
+
+from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id
 
 
 Phase = Literal["regular", "play_in", "playoffs", "preseason"]
@@ -60,6 +61,20 @@ _ALLOWED_PHASES: Tuple[str, ...] = ("regular", "play_in", "playoffs", "preseason
 
 
 # --- utilities -----------------------------------------------------------
+
+def _normalize_team_id_strict(value: Any, *, path: str) -> str:
+    try:
+        return str(normalize_team_id(value, allow_fa=False, strict=True))
+    except Exception as e:
+        raise ValueError(f"context invalid: '{path}' invalid team_id={value!r} ({e})")
+
+
+def _normalize_player_id_strict(value: Any, *, path: str) -> str:
+    try:
+        return str(normalize_player_id(value, strict=True))
+    except Exception as e:
+        raise ValueError(f"raw matchengine result invalid: '{path}' invalid player_id={value!r} ({e})")
+
 
 def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -110,9 +125,9 @@ def build_context_from_master_schedule_entry(
     """
     game_id = _require_str(entry.get("game_id"), "entry.game_id")
     date_str = _require_str(date_override or entry.get("date"), "entry.date")
-    home_team_id = _require_str(entry.get("home_team_id"), "entry.home_team_id").upper()
-    away_team_id = _require_str(entry.get("away_team_id"), "entry.away_team_id").upper()
-
+    home_team_id = _normalize_team_id_strict(entry.get("home_team_id"), path="entry.home_team_id")
+    away_team_id = _normalize_team_id_strict(entry.get("away_team_id"), path="entry.away_team_id")
+ 
     if phase not in _ALLOWED_PHASES:
         raise ValueError(f"context invalid: phase must be one of {_ALLOWED_PHASES}, got '{phase}'")
 
@@ -275,6 +290,72 @@ def _normalize_breakdowns_from_raw(team_summary: Mapping[str, Any]) -> Tuple[Dic
     return breakdowns, extra
 
 
+def _int_like(value: Any, *, path: str) -> int:
+    if value is None:
+        raise ValueError(f"raw matchengine result invalid: '{path}' is None (expected int-like)")
+    if isinstance(value, bool):
+        raise ValueError(f"raw matchengine result invalid: '{path}' is bool (expected int-like)")
+    try:
+        return int(value)
+    except Exception:
+        raise ValueError(f"raw matchengine result invalid: '{path}' value={value!r} not int-like")
+
+
+def _float_like(value: Any, *, path: str) -> float:
+    if value is None:
+        raise ValueError(f"raw matchengine result invalid: '{path}' is None (expected float-like)")
+    if isinstance(value, bool):
+        raise ValueError(f"raw matchengine result invalid: '{path}' is bool (expected float-like)")
+    try:
+        return float(value)
+    except Exception:
+        raise ValueError(f"raw matchengine result invalid: '{path}' value={value!r} not float-like")
+
+
+def _normalize_player_keyed_map(
+    obj: Any,
+    *,
+    allowed_player_ids: "set[str]",
+    path: str,
+    value_kind: Literal["int", "float", "any"] = "any",
+) -> Dict[str, Any]:
+    """
+    Normalize a dict keyed by player_id and validate:
+      - keys are canonical player_id
+      - key exists in allowed_player_ids (== PlayerBox players for that team)
+      - no duplicates after normalization
+    """
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"raw matchengine result invalid: '{path}' must be a dict")
+
+    out: Dict[str, Any] = {}
+    for k, v in obj.items():
+        pid_raw = str(k)
+        pid = _normalize_player_id_strict(pid_raw, path=f"{path}.<player_id>")
+        # "no silent guessing": if engine gave non-canonical string, fail instead of rewriting
+        if pid != pid_raw.strip():
+            raise ValueError(
+                f"raw matchengine result invalid: '{path}' player key must already be canonical; got {pid_raw!r}, expected {pid!r}"
+            )
+        if pid not in allowed_player_ids:
+            raise ValueError(
+                f"raw matchengine result invalid: '{path}' references unknown/wrong-team player_id='{pid}'"
+            )
+        if pid in out:
+            raise ValueError(f"raw matchengine result invalid: '{path}' duplicate player_id='{pid}'")
+
+        if value_kind == "int":
+            out[pid] = _int_like(v, path=f"{path}[{pid}]")
+        elif value_kind == "float":
+            out[pid] = _float_like(v, path=f"{path}[{pid}]")
+        else:
+            out[pid] = v
+
+    return out
+
+
 def _normalize_player_rows_from_player_box(
     *,
     player_box: Mapping[str, Any],
@@ -288,9 +369,29 @@ def _normalize_player_rows_from_player_box(
     for pid, raw_row in player_box.items():
         if not isinstance(raw_row, dict):
             continue
+        pid_raw = str(pid)
+        pid_norm = _normalize_player_id_strict(pid_raw, path="raw.teams[].PlayerBox.<player_id>")
+        # "no silent guessing": require the dict key itself is canonical (don't auto-fix)
+        if pid_norm != pid_raw.strip():
+            raise ValueError(
+                f"raw matchengine result invalid: PlayerBox key must already be canonical; got {pid_raw!r}, expected {pid_norm!r}"
+            )
+
+        # If engine also embeds PlayerID/TeamID inside row, they MUST match.
+        if "PlayerID" in raw_row and str(raw_row.get("PlayerID")).strip() != pid_raw.strip():
+            raise ValueError(
+                f"raw matchengine result invalid: PlayerBox row PlayerID mismatch for key={pid_raw!r} row.PlayerID={raw_row.get('PlayerID')!r}"
+            )
+        if "TeamID" in raw_row:
+            row_tid = str(raw_row.get("TeamID")).strip()
+            row_tid_norm = _normalize_team_id_strict(row_tid, path="raw.teams[].PlayerBox[].TeamID")
+            if row_tid_norm != team_id:
+                raise ValueError(
+                    f"raw matchengine result invalid: PlayerBox row TeamID mismatch for player_id={pid_raw!r} row.TeamID={row_tid!r} expected team_id={team_id!r}"
+                )
 
         row: Dict[str, Any] = {
-            "PlayerID": str(pid),
+            "PlayerID": pid_raw.strip(),
             "TeamID": str(team_id),
         }
 
@@ -313,7 +414,7 @@ def _normalize_player_rows_from_player_box(
                     if k == "FG%":
                         derived["FG_PCT"] = float(v)
                     elif k == "3P%":
-                        derived["TP_PCT"] = float(v)
+                        derived["3P_PCT"] = float(v)
                     elif k == "FT%":
                         derived["FT_PCT"] = float(v)
                 continue
@@ -357,6 +458,10 @@ def _map_side_keyed_dict_to_team_ids(
 
     keys = set(obj.keys())
     if keys.issubset({"home", "away"}):
+        if keys != {"home", "away"}:
+            raise ValueError(
+                f"raw matchengine result invalid: '{path}' must include both 'home' and 'away' keys; got keys={list(obj.keys())!r}"
+            )
         return {
             home_team_id: obj.get("home", {}),
             away_team_id: obj.get("away", {}),
@@ -364,6 +469,11 @@ def _map_side_keyed_dict_to_team_ids(
 
     # Already keyed by team ids?
     if home_team_id in obj and away_team_id in obj:
+        if set(obj.keys()) != {home_team_id, away_team_id}:
+            raise ValueError(
+                f"raw matchengine result invalid: '{path}' must have exactly two team_id keys "
+                f"['{home_team_id}','{away_team_id}']; got keys={list(obj.keys())!r}"
+            )
         return {
             home_team_id: obj.get(home_team_id, {}),
             away_team_id: obj.get(away_team_id, {}),
@@ -447,9 +557,9 @@ def adapt_matchengine_result_to_v2(
     if phase not in _ALLOWED_PHASES:
         raise ValueError(f"context invalid: phase must be one of {_ALLOWED_PHASES}, got '{phase}'")
 
-    home_team_id = _require_str(context.get("home_team_id"), "context.home_team_id").upper()
-    away_team_id = _require_str(context.get("away_team_id"), "context.away_team_id").upper()
-
+    home_team_id = _normalize_team_id_strict(context.get("home_team_id"), path="context.home_team_id")
+    away_team_id = _normalize_team_id_strict(context.get("away_team_id"), path="context.away_team_id")
+ 
     home_raw_team_key = context.get("home_raw_team_key")
     away_raw_team_key = context.get("away_raw_team_key")
 
@@ -495,6 +605,32 @@ def adapt_matchengine_result_to_v2(
 
         v2_teams[tid] = team_game
 
+    # --- FINAL GATEKEEPER: validate player identity integrity ----------------
+    # 1) Each team.players[] PlayerID must be unique
+    # 2) Same player_id must NOT appear in both teams
+    team_player_ids: Dict[str, set[str]] = {}
+    all_pids: set[str] = set()
+    for tid in (home_team_id, away_team_id):
+        players_list = v2_teams[tid].get("players") or []
+        if not isinstance(players_list, list):
+            raise ValueError(f"raw matchengine result invalid: teams['{tid}'].players must be a list")
+        seen: set[str] = set()
+        for p in players_list:
+            if not isinstance(p, dict):
+                raise ValueError(f"raw matchengine result invalid: teams['{tid}'].players contains non-dict")
+            pid = _normalize_player_id_strict(p.get("PlayerID"), path=f"teams['{tid}'].players[].PlayerID")
+            if pid in seen:
+                raise ValueError(f"raw matchengine result invalid: duplicate player_id='{pid}' inside team '{tid}'")
+            if pid in all_pids:
+                raise ValueError(f"raw matchengine result invalid: duplicate player_id='{pid}' across teams")
+            if str(p.get("TeamID")) != tid:
+                raise ValueError(
+                    f"raw matchengine result invalid: player_id='{pid}' has TeamID={p.get('TeamID')!r} but is listed under team '{tid}'"
+                )
+            seen.add(pid)
+            all_pids.add(pid)
+        team_player_ids[tid] = seen
+
     # Final score from team totals (PTS)
     final = {
         home_team_id: int(float(v2_teams[home_team_id]["totals"].get("PTS", 0))),
@@ -526,6 +662,57 @@ def adapt_matchengine_result_to_v2(
         away_team_id=away_team_id,
         path="raw.game_state.minutes_played_sec",
     )
+
+    # --- Normalize & validate game_state player-keyed dicts ------------------
+    # Ensure player keys are canonical player_id AND belong to the correct team
+    # ("존재하지 않는 선수", "다른 팀 선수", "중복 선수" => 즉시 에러)
+    team_fouls_norm = {
+        home_team_id: _int_like(team_fouls.get(home_team_id, 0), path=f"raw.game_state.team_fouls[{home_team_id}]"),
+        away_team_id: _int_like(team_fouls.get(away_team_id, 0), path=f"raw.game_state.team_fouls[{away_team_id}]"),
+    }
+
+    player_fouls_norm = {
+        home_team_id: _normalize_player_keyed_map(
+            player_fouls.get(home_team_id, {}),
+            allowed_player_ids=team_player_ids[home_team_id],
+            path=f"raw.game_state.player_fouls[{home_team_id}]",
+            value_kind="int",
+        ),
+        away_team_id: _normalize_player_keyed_map(
+            player_fouls.get(away_team_id, {}),
+            allowed_player_ids=team_player_ids[away_team_id],
+            path=f"raw.game_state.player_fouls[{away_team_id}]",
+            value_kind="int",
+        ),
+    }
+    fatigue_norm = {
+        home_team_id: _normalize_player_keyed_map(
+            fatigue.get(home_team_id, {}),
+            allowed_player_ids=team_player_ids[home_team_id],
+            path=f"raw.game_state.fatigue[{home_team_id}]",
+            value_kind="float",
+        ),
+        away_team_id: _normalize_player_keyed_map(
+            fatigue.get(away_team_id, {}),
+            allowed_player_ids=team_player_ids[away_team_id],
+            path=f"raw.game_state.fatigue[{away_team_id}]",
+            value_kind="float",
+        ),
+    }
+    minutes_played_sec_norm = {
+        home_team_id: _normalize_player_keyed_map(
+            minutes_played_sec.get(home_team_id, {}),
+            allowed_player_ids=team_player_ids[home_team_id],
+            path=f"raw.game_state.minutes_played_sec[{home_team_id}]",
+            value_kind="int",
+        ),
+        away_team_id: _normalize_player_keyed_map(
+            minutes_played_sec.get(away_team_id, {}),
+            allowed_player_ids=team_player_ids[away_team_id],
+            path=f"raw.game_state.minutes_played_sec[{away_team_id}]",
+            value_kind="int",
+        ),
+    }
 
     # Required integer fields
     try:
@@ -565,15 +752,15 @@ def adapt_matchengine_result_to_v2(
         debug["internal_debug"] = meta.get("internal_debug")
 
     out: Dict[str, Any] = {
-        "schema_version": "2.0",
+        "schema_version": SCHEMA_VERSION,
         "game": game,
         "final": final,
         "teams": v2_teams,
         "game_state": {
-            "team_fouls": team_fouls,
-            "player_fouls": player_fouls,
-            "fatigue": fatigue,
-            "minutes_played_sec": minutes_played_sec,
+            "team_fouls": team_fouls_norm,
+            "player_fouls": player_fouls_norm,
+            "fatigue": fatigue_norm,
+            "minutes_played_sec": minutes_played_sec_norm,
         },
         "meta": v2_meta,
     }
