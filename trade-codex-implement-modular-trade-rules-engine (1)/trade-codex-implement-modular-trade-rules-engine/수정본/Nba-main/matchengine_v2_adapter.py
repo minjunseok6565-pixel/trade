@@ -1,10 +1,10 @@
-"""MatchEngine (raw) -> GameResultV2 adapter.
+"""matchengine_v3 (raw) -> GameResultV2 adapter.
 
 This adapter is designed to work with:
-- league_simdiff수정.py: uses master_schedule entries with fields {game_id, date, home_team_id, away_team_id}
-- statediff수정.py: ingest_game_result() only accepts GameResultV2 schema_version == "2.0"
+- sim/league_sim.py: uses master_schedule entries with fields {game_id, date, home_team_id, away_team_id}
+- state.py: ingest_game_result() only accepts GameResultV2 schema_version == "2.0"
 
-Raw engine output expected (from matchengine.zip sim/sim_game.py):
+Raw engine output expected (from matchengine_v3/sim_game.py):
 - result: {
     "meta": {"engine_version", "era", "era_version", "replay_token", "overtime_periods", "validation", "internal_debug"},
     "possessions_per_team": int,
@@ -37,7 +37,7 @@ Phase = Literal["regular", "play_in", "playoffs", "preseason"]
 class AdapterContext(TypedDict, total=False):
     """Context required to build GameResultV2.
 
-    league_simdiff수정.py can build most of these from master_schedule + league state.
+    sim/league_sim.py can build most of these from master_schedule + league state.
 
     Required:
       - game_id, date, season_id, phase, home_team_id, away_team_id
@@ -73,7 +73,7 @@ def _normalize_player_id_strict(value: Any, *, path: str) -> str:
     try:
         return str(normalize_player_id(value, strict=True))
     except Exception as e:
-        raise ValueError(f"raw matchengine result invalid: '{path}' invalid player_id={value!r} ({e})")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' invalid player_id={value!r} ({e})")
 
 
 def _is_number(v: Any) -> bool:
@@ -82,7 +82,7 @@ def _is_number(v: Any) -> bool:
 
 def _require_dict(v: Any, path: str) -> Dict[str, Any]:
     if not isinstance(v, dict):
-        raise ValueError(f"raw matchengine result invalid: '{path}' must be a dict")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' must be a dict")
     return v
 
 
@@ -96,7 +96,7 @@ def _require_str(v: Any, path: str) -> str:
 
 
 def season_id_from_year(season_year: int) -> str:
-    """Convert season start year to season_id format used by statediff수정.py.
+    """Convert season start year to season_id format used by state.py.
 
     Example: 2025 -> "2025-26"
     """
@@ -113,13 +113,13 @@ def build_context_from_master_schedule_entry(
 ) -> AdapterContext:
     """Build AdapterContext from a master_schedule game entry.
 
-    master_schedule entries are created in statediff수정.py with:
+    master_schedule entries are created in state.py with:
       - game_id, date, home_team_id, away_team_id
 
-    league_state is GAME_STATE['league'] (statediff수정.py), which includes:
+    league_state is GAME_STATE['league'] (state.py), which includes:
       - season_year
 
-    The raw team keys default to team_id values; if your MatchEngine uses a different
+    The raw team keys default to team_id values; if your matchengine_v3 setup uses a different
     naming scheme for raw_result['teams'] keys, provide home_raw_team_key/away_raw_team_key
     explicitly later.
     """
@@ -168,7 +168,7 @@ def build_context_from_team_ids(
 ) -> AdapterContext:
     """Build AdapterContext when you don't have a master_schedule entry.
 
-    This is useful for simulate_single_game() in league_simdiff수정.py.
+    This is useful for simulate_single_game() in sim/league_sim.py.
     """
     base = build_context_from_master_schedule_entry(
         entry={
@@ -292,24 +292,24 @@ def _normalize_breakdowns_from_raw(team_summary: Mapping[str, Any]) -> Tuple[Dic
 
 def _int_like(value: Any, *, path: str) -> int:
     if value is None:
-        raise ValueError(f"raw matchengine result invalid: '{path}' is None (expected int-like)")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' is None (expected int-like)")
     if isinstance(value, bool):
-        raise ValueError(f"raw matchengine result invalid: '{path}' is bool (expected int-like)")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' is bool (expected int-like)")
     try:
         return int(value)
     except Exception:
-        raise ValueError(f"raw matchengine result invalid: '{path}' value={value!r} not int-like")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' value={value!r} not int-like")
 
 
 def _float_like(value: Any, *, path: str) -> float:
     if value is None:
-        raise ValueError(f"raw matchengine result invalid: '{path}' is None (expected float-like)")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' is None (expected float-like)")
     if isinstance(value, bool):
-        raise ValueError(f"raw matchengine result invalid: '{path}' is bool (expected float-like)")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' is bool (expected float-like)")
     try:
         return float(value)
     except Exception:
-        raise ValueError(f"raw matchengine result invalid: '{path}' value={value!r} not float-like")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' value={value!r} not float-like")
 
 
 def _normalize_player_keyed_map(
@@ -328,7 +328,7 @@ def _normalize_player_keyed_map(
     if obj is None:
         return {}
     if not isinstance(obj, dict):
-        raise ValueError(f"raw matchengine result invalid: '{path}' must be a dict")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' must be a dict")
 
     out: Dict[str, Any] = {}
     for k, v in obj.items():
@@ -337,14 +337,14 @@ def _normalize_player_keyed_map(
         # "no silent guessing": if engine gave non-canonical string, fail instead of rewriting
         if pid != pid_raw.strip():
             raise ValueError(
-                f"raw matchengine result invalid: '{path}' player key must already be canonical; got {pid_raw!r}, expected {pid!r}"
+                f"raw matchengine_v3 result invalid: '{path}' player key must already be canonical; got {pid_raw!r}, expected {pid!r}"
             )
         if pid not in allowed_player_ids:
             raise ValueError(
-                f"raw matchengine result invalid: '{path}' references unknown/wrong-team player_id='{pid}'"
+                f"raw matchengine_v3 result invalid: '{path}' references unknown/wrong-team player_id='{pid}'"
             )
         if pid in out:
-            raise ValueError(f"raw matchengine result invalid: '{path}' duplicate player_id='{pid}'")
+            raise ValueError(f"raw matchengine_v3 result invalid: '{path}' duplicate player_id='{pid}'")
 
         if value_kind == "int":
             out[pid] = _int_like(v, path=f"{path}[{pid}]")
@@ -363,7 +363,7 @@ def _normalize_player_rows_from_player_box(
 ) -> List[Dict[str, Any]]:
     """Convert raw PlayerBox ({pid: row}) to v2 players list."""
     if not isinstance(player_box, dict):
-        raise ValueError("raw matchengine result invalid: team_summary.PlayerBox must be a dict")
+        raise ValueError("raw matchengine_v3 result invalid: team_summary.PlayerBox must be a dict")
 
     out: List[Dict[str, Any]] = []
     for pid, raw_row in player_box.items():
@@ -374,20 +374,20 @@ def _normalize_player_rows_from_player_box(
         # "no silent guessing": require the dict key itself is canonical (don't auto-fix)
         if pid_norm != pid_raw.strip():
             raise ValueError(
-                f"raw matchengine result invalid: PlayerBox key must already be canonical; got {pid_raw!r}, expected {pid_norm!r}"
+                f"raw matchengine_v3 result invalid: PlayerBox key must already be canonical; got {pid_raw!r}, expected {pid_norm!r}"
             )
 
         # If engine also embeds PlayerID/TeamID inside row, they MUST match.
         if "PlayerID" in raw_row and str(raw_row.get("PlayerID")).strip() != pid_raw.strip():
             raise ValueError(
-                f"raw matchengine result invalid: PlayerBox row PlayerID mismatch for key={pid_raw!r} row.PlayerID={raw_row.get('PlayerID')!r}"
+                f"raw matchengine_v3 result invalid: PlayerBox row PlayerID mismatch for key={pid_raw!r} row.PlayerID={raw_row.get('PlayerID')!r}"
             )
         if "TeamID" in raw_row:
             row_tid = str(raw_row.get("TeamID")).strip()
             row_tid_norm = _normalize_team_id_strict(row_tid, path="raw.teams[].PlayerBox[].TeamID")
             if row_tid_norm != team_id:
                 raise ValueError(
-                    f"raw matchengine result invalid: PlayerBox row TeamID mismatch for player_id={pid_raw!r} row.TeamID={row_tid!r} expected team_id={team_id!r}"
+                    f"raw matchengine_v3 result invalid: PlayerBox row TeamID mismatch for player_id={pid_raw!r} row.TeamID={row_tid!r} expected team_id={team_id!r}"
                 )
 
         row: Dict[str, Any] = {
@@ -454,13 +454,13 @@ def _map_side_keyed_dict_to_team_ids(
     if obj is None:
         return {home_team_id: {}, away_team_id: {}}
     if not isinstance(obj, dict):
-        raise ValueError(f"raw matchengine result invalid: '{path}' must be a dict")
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' must be a dict")
 
     keys = set(obj.keys())
     if keys.issubset({"home", "away"}):
         if keys != {"home", "away"}:
             raise ValueError(
-                f"raw matchengine result invalid: '{path}' must include both 'home' and 'away' keys; got keys={list(obj.keys())!r}"
+                f"raw matchengine_v3 result invalid: '{path}' must include both 'home' and 'away' keys; got keys={list(obj.keys())!r}"
             )
         return {
             home_team_id: obj.get("home", {}),
@@ -471,7 +471,7 @@ def _map_side_keyed_dict_to_team_ids(
     if home_team_id in obj and away_team_id in obj:
         if set(obj.keys()) != {home_team_id, away_team_id}:
             raise ValueError(
-                f"raw matchengine result invalid: '{path}' must have exactly two team_id keys "
+                f"raw matchengine_v3 result invalid: '{path}' must have exactly two team_id keys "
                 f"['{home_team_id}','{away_team_id}']; got keys={list(obj.keys())!r}"
             )
         return {
@@ -480,7 +480,7 @@ def _map_side_keyed_dict_to_team_ids(
         }
 
     raise ValueError(
-        f"raw matchengine result invalid: cannot map '{path}' keys to team ids; "
+        f"raw matchengine_v3 result invalid: cannot map '{path}' keys to team ids; "
         f"got keys={list(obj.keys())!r}, expected either ['home','away'] or team ids ['{home_team_id}','{away_team_id}']"
     )
 
@@ -505,12 +505,12 @@ def _resolve_raw_team_keys(
     if home_raw_team_key and away_raw_team_key:
         if home_raw_team_key not in raw_teams:
             raise ValueError(
-                f"raw matchengine result invalid: teams missing home_raw_team_key='{home_raw_team_key}'. "
+                f"raw matchengine_v3 result invalid: teams missing home_raw_team_key='{home_raw_team_key}'. "
                 f"available_keys={list(raw_teams.keys())!r}"
             )
         if away_raw_team_key not in raw_teams:
             raise ValueError(
-                f"raw matchengine result invalid: teams missing away_raw_team_key='{away_raw_team_key}'. "
+                f"raw matchengine_v3 result invalid: teams missing away_raw_team_key='{away_raw_team_key}'. "
                 f"available_keys={list(raw_teams.keys())!r}"
             )
         return home_raw_team_key, away_raw_team_key
@@ -520,7 +520,7 @@ def _resolve_raw_team_keys(
         return home_team_id, away_team_id
 
     raise ValueError(
-        "raw matchengine result invalid: cannot resolve raw team keys. "
+        "raw matchengine_v3 result invalid: cannot resolve raw team keys. "
         f"Provide context.home_raw_team_key/away_raw_team_key. "
         f"available_keys={list(raw_teams.keys())!r}, home_team_id='{home_team_id}', away_team_id='{away_team_id}'."
     )
@@ -530,15 +530,15 @@ def adapt_matchengine_result_to_v2(
     *,
     raw_result: Mapping[str, Any],
     context: Mapping[str, Any],
-    engine_name: str = "matchengine",
+    engine_name: str = "matchengine_v3",
     include_raw: bool = False,
 ) -> Dict[str, Any]:
-    """Convert MatchEngine raw result to GameResultV2 dict.
+    """Convert matchengine_v3 raw result to GameResultV2 dict.
 
-    This returns a dict compatible with statediff수정.py::ingest_game_result().
+    This returns a dict compatible with state.py::ingest_game_result().
 
     Parameters
-    - raw_result: output from engine.simulate_game()
+    - raw_result: output from matchengine_v3.sim_game.simulate_game()
     - context: required game metadata (usually from master_schedule + league state)
 
     Raises
@@ -595,13 +595,13 @@ def adapt_matchengine_result_to_v2(
         if extra_breakdowns:
             team_game["extra_breakdowns"] = extra_breakdowns
 
-        # Sanity: ensure PTS exists (required by statediff수정.py validator)
+        # Sanity: ensure PTS exists (required by state.py validator)
         if "PTS" not in team_game["totals"]:
             # Try raw PTS if missing
             if _is_number(summary.get("PTS")):
                 team_game["totals"]["PTS"] = float(summary["PTS"])
             else:
-                raise ValueError(f"raw matchengine result invalid: team '{tid}' missing PTS")
+                raise ValueError(f"raw matchengine_v3 result invalid: team '{tid}' missing PTS")
 
         v2_teams[tid] = team_game
 
@@ -613,19 +613,19 @@ def adapt_matchengine_result_to_v2(
     for tid in (home_team_id, away_team_id):
         players_list = v2_teams[tid].get("players") or []
         if not isinstance(players_list, list):
-            raise ValueError(f"raw matchengine result invalid: teams['{tid}'].players must be a list")
+            raise ValueError(f"raw matchengine_v3 result invalid: teams['{tid}'].players must be a list")
         seen: set[str] = set()
         for p in players_list:
             if not isinstance(p, dict):
-                raise ValueError(f"raw matchengine result invalid: teams['{tid}'].players contains non-dict")
+                raise ValueError(f"raw matchengine_v3 result invalid: teams['{tid}'].players contains non-dict")
             pid = _normalize_player_id_strict(p.get("PlayerID"), path=f"teams['{tid}'].players[].PlayerID")
             if pid in seen:
-                raise ValueError(f"raw matchengine result invalid: duplicate player_id='{pid}' inside team '{tid}'")
+                raise ValueError(f"raw matchengine_v3 result invalid: duplicate player_id='{pid}' inside team '{tid}'")
             if pid in all_pids:
-                raise ValueError(f"raw matchengine result invalid: duplicate player_id='{pid}' across teams")
+                raise ValueError(f"raw matchengine_v3 result invalid: duplicate player_id='{pid}' across teams")
             if str(p.get("TeamID")) != tid:
                 raise ValueError(
-                    f"raw matchengine result invalid: player_id='{pid}' has TeamID={p.get('TeamID')!r} but is listed under team '{tid}'"
+                    f"raw matchengine_v3 result invalid: player_id='{pid}' has TeamID={p.get('TeamID')!r} but is listed under team '{tid}'"
                 )
             seen.add(pid)
             all_pids.add(pid)
@@ -769,7 +769,7 @@ def adapt_matchengine_result_to_v2(
         out["debug"] = debug
 
     # Include raw only if caller asks for it.
-    # Note: statediff수정.py stores the entire game_result dict into GAME_STATE['game_results'].
+    # Note: state.py stores the entire game_result dict into GAME_STATE['game_results'].
     # If you always include raw here, you'll duplicate the raw payload inside the stored v2.
     if include_raw:
         out["raw"] = raw
