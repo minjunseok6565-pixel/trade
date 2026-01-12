@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from league_repo import LeagueRepo
+from state import get_league_db_path
 
 from .errors import TradeError, NEGOTIATION_NOT_FOUND
 from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
@@ -16,12 +16,8 @@ def _now_iso() -> str:
     return datetime.utcnow().isoformat()
 
 
-def _get_db_path() -> str:
-    return os.environ.get("LEAGUE_DB_PATH") or "league.db"
-
-
 def _load_session_row(session_id: str) -> dict:
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         row = repo.get_negotiation(session_id)
@@ -42,7 +38,7 @@ def _load_session_row(session_id: str) -> dict:
 
 
 def _persist_session(session: Dict[str, Any]) -> None:
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
@@ -126,7 +122,7 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
         "relationship": {"trust": 0, "fatigue": 0, "promises_broken": 0},
         "market_context": {},  # trade market context snapshot
     }
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import get_current_date_as_date
+from state import get_current_date_as_date, get_league_db_path
 
 from .errors import (
     TradeError,
@@ -42,14 +41,10 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
     raise ValueError("Missing to_team for multi-team deal asset")
 
 
-def _get_db_path() -> str:
-    return os.environ.get("LEAGUE_DB_PATH") or "league.db"
-
-
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    repo = LeagueRepo(_get_db_path())
+    repo = LeagueRepo(get_league_db_path())
     repo.init_db()
     for team_id, assets in deal.legs.items():
         for asset in assets:
@@ -119,7 +114,7 @@ def create_committed_deal(
         "status": "ACTIVE",
     }
 
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
@@ -132,7 +127,14 @@ def create_committed_deal(
                 status=entry["status"],
                 cursor=cur,
             )
-            _lock_assets_for_deal(repo, canonical, deal_id, entry["expires_at"], cursor=cur)
+            try:
+                _lock_assets_for_deal(repo, canonical, deal_id, entry["expires_at"], cursor=cur)
+            except ValueError as exc:
+                raise TradeError(
+                    DEAL_INVALIDATED,
+                    "Asset already locked",
+                    {"deal_id": deal_id},
+                ) from exc
         repo.validate_integrity()
     return entry
 
@@ -144,7 +146,7 @@ def _lock_assets_for_deal(repo: LeagueRepo, deal: Deal, deal_id: str, expires_at
 
 
 def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> Deal:
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     today = current_date or get_current_date_as_date()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
@@ -189,7 +191,7 @@ def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> 
 
 
 def mark_executed(deal_id: str) -> None:
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
@@ -200,7 +202,7 @@ def mark_executed(deal_id: str) -> None:
 
 def release_locks_for_deal(deal_id: str, *, cursor=None) -> None:
     if cursor is None:
-        db_path = _get_db_path()
+        db_path = get_league_db_path()
         with LeagueRepo(db_path) as repo:
             repo.init_db()
             with repo.transaction() as cur:
@@ -212,7 +214,7 @@ def release_locks_for_deal(deal_id: str, *, cursor=None) -> None:
 
 def gc_expired_agreements(current_date: Optional[date] = None) -> None:
     today = current_date or get_current_date_as_date()
-    db_path = _get_db_path()
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         for row in repo.list_active_trade_agreements():
