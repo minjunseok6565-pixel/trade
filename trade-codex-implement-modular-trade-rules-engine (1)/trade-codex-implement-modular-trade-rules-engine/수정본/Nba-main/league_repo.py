@@ -243,6 +243,38 @@ class LeagueRepo:
 
                 CREATE INDEX IF NOT EXISTS idx_contracts_player_id ON contracts(player_id);
                 CREATE INDEX IF NOT EXISTS idx_contracts_team_id ON contracts(team_id);
+
+                CREATE TABLE IF NOT EXISTS trade_agreements (
+                    deal_id TEXT PRIMARY KEY,
+                    deal_json TEXT NOT NULL,
+                    assets_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS asset_locks (
+                    asset_key TEXT PRIMARY KEY,
+                    deal_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    FOREIGN KEY(deal_id) REFERENCES trade_agreements(deal_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_asset_locks_deal_id ON asset_locks(deal_id);
+
+                CREATE TABLE IF NOT EXISTS trade_transactions (
+                    transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    entry_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_negotiations (
+                    session_id TEXT PRIMARY KEY,
+                    session_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 

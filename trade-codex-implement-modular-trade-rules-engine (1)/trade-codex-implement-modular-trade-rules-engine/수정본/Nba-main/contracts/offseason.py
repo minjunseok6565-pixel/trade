@@ -2,9 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from league_repo import LeagueRepo
+from schema import season_id_from_year
+
+
+def _parse_season_year(season_id: str | None) -> int | None:
+    if not season_id:
+        return None
+    try:
+        return int(str(season_id).split("-")[0])
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _parse_contract_payload(raw_json: str | None) -> tuple[dict, list, bool]:
+    if not raw_json:
+        return {}, [], False
+    try:
+        payload = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return {}, [], False
+    if isinstance(payload, dict) and (
+        "salary_by_year" in payload or "options" in payload
+    ):
+        salary_by_year = payload.get("salary_by_year") or {}
+        options = payload.get("options") or []
+        return salary_by_year, options, True
+    if isinstance(payload, dict):
+        return payload, [], False
+    return {}, [], False
 
 
 def process_offseason(
@@ -21,13 +50,8 @@ def process_offseason(
         recompute_contract_years_from_salary,
     )
     from contracts.options_policy import default_option_decision_policy
-    from contracts.store import ensure_contract_state, get_current_date_iso
+    from contracts.store import get_current_date_iso
     from contracts.ops import release_to_free_agents
-
-    ensure_contract_state(game_state)
-
-    contracts = game_state.get("contracts", {})
-    active_map = game_state.get("active_contract_id_by_player", {})
     expired = 0
     released = 0
     decision_date_iso = get_current_date_iso(game_state)
@@ -40,21 +64,45 @@ def process_offseason(
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
-            for player_id_str, contract_id in list(active_map.items()):
-                contract = contracts.get(contract_id)
-                if not contract:
-                    continue
-                contract_options = contract.get("options") or []
+            rows = cur.execute(
+                """
+                SELECT contract_id, player_id, team_id, start_season_id, end_season_id,
+                       salary_by_season_json, is_active
+                FROM contracts
+                WHERE is_active=1;
+                """
+            ).fetchall()
+            for row in rows:
+                contract_id = row["contract_id"]
+                player_id_str = str(row["player_id"])
+                start_year = _parse_season_year(row["start_season_id"])
+                end_year = _parse_season_year(row["end_season_id"])
+
+                salary_by_year, options, has_payload_meta = _parse_contract_payload(
+                    row["salary_by_season_json"]
+                )
+                contract = {
+                    "contract_id": contract_id,
+                    "player_id": player_id_str,
+                    "team_id": row["team_id"],
+                    "start_season_year": start_year or 0,
+                    "salary_by_year": salary_by_year,
+                    "options": options,
+                    "status": "ACTIVE",
+                }
+
                 try:
                     contract["options"] = [
-                        normalize_option_record(option) for option in contract_options
+                        normalize_option_record(option) for option in (options or [])
                     ]
                 except ValueError:
                     contract["options"] = []
+
                 try:
                     player_id = int(player_id_str)
                 except (TypeError, ValueError):
                     player_id = None
+
                 pending = get_pending_options_for_season(contract, to_season_year)
                 if pending:
                     for option_index, option in enumerate(contract["options"]):
@@ -70,18 +118,36 @@ def process_offseason(
                             decision_date_iso,
                         )
                     recompute_contract_years_from_salary(contract)
-                try:
-                    start = int(contract.get("start_season_year") or 0)
-                except (TypeError, ValueError):
-                    start = 0
-                try:
-                    years = int(contract.get("years") or 0)
-                except (TypeError, ValueError):
-                    years = 0
-                end_exclusive = start + years
-                if to_season_year >= end_exclusive:
-                    contract["status"] = "EXPIRED"
-                    active_map.pop(player_id_str, None)
+
+                    if start_year:
+                        end_year = start_year + int(contract.get("years") or 0) - 1
+                    payload = contract.get("salary_by_year", {})
+                    if has_payload_meta or contract.get("options"):
+                        payload = {
+                            "salary_by_year": contract.get("salary_by_year", {}),
+                            "options": contract.get("options", []),
+                        }
+                    cur.execute(
+                        """
+                        UPDATE contracts
+                        SET salary_by_season_json=?, end_season_id=?, updated_at=?
+                        WHERE contract_id=?;
+                        """,
+                        (
+                            json.dumps(payload),
+                            season_id_from_year(end_year) if end_year else None,
+                            decision_date_iso,
+                            contract_id,
+                        ),
+                    )
+
+                if end_year is None and start_year and salary_by_year:
+                    try:
+                        end_year = max(int(year) for year in salary_by_year.keys())
+                    except (TypeError, ValueError):
+                        end_year = start_year
+
+                if end_year is not None and to_season_year >= end_year + 1:
                     release_to_free_agents(
                         game_state,
                         player_id_str,

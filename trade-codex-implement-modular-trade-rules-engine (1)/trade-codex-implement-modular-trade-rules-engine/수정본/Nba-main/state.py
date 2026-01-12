@@ -98,15 +98,6 @@ GAME_STATE: Dict[str, Any] = {
         "trade_rules": {**DEFAULT_TRADE_RULES},
         "last_gm_tick_date": None,  # 마지막 AI GM 트레이드 시도 날짜
     },
-    "teams": {},      # 팀 성향 / 메타 정보
-    "players": {},    # 선수 메타 정보
-    "transactions": [],  # 트레이드 등 기록
-    "trade_agreements": {},  # deal_id -> committed deal data
-    "negotiations": {},  # session_id -> negotiation sessions
-    "draft_picks": {},  # Phase 3 later
-    "asset_locks": {},  # asset_key -> {deal_id, expires_at}
-    "swap_rights": {},
-    "fixed_assets": {},
     "trade_market": {
         "last_tick_date": None,
         "listings": {},
@@ -447,14 +438,6 @@ def _ensure_league_state() -> Dict[str, Any]:
             # Fix legacy saves so SalaryMatchingRule doesn't treat cap/aprons as zero.
             _apply_cap_model_for_season(league, int(season_year))
     _ensure_trade_state()
-    from contracts.store import ensure_contract_state
-
-    ensure_contract_state(GAME_STATE)
-    from team_utils import _init_players_and_teams_if_needed
-
-    _init_players_and_teams_if_needed()
-    # Normalize player IDs to canonical strings (prevents "12" vs 12 splits).
-    normalize_player_ids(GAME_STATE)
 
     # Contracts bootstrap: prefer DB-based bootstrap if available (Step 2),
     # fall back to legacy Excel bootstrap for older saves.
@@ -633,13 +616,6 @@ def _ensure_trade_state() -> None:
     GAME_STATE.setdefault("trade_market", dict(_DEFAULT_TRADE_MARKET))
     GAME_STATE.setdefault("trade_memory", dict(_DEFAULT_TRADE_MEMORY))
     GAME_STATE.setdefault("gm_profiles", {})
-
-    GAME_STATE.setdefault("trade_agreements", {})
-    GAME_STATE.setdefault("negotiations", {})
-    GAME_STATE.setdefault("draft_picks", {})
-    GAME_STATE.setdefault("asset_locks", {})
-    GAME_STATE.setdefault("swap_rights", {})
-    GAME_STATE.setdefault("fixed_assets", {})
 
 
 def _is_number(value: Any) -> bool:

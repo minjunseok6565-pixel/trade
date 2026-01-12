@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, get_current_date_as_date
+from state import get_current_date_as_date
 
 from .errors import (
     TradeError,
@@ -41,18 +42,15 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
     raise ValueError("Missing to_team for multi-team deal asset")
 
 
+def _get_db_path() -> str:
+    return os.environ.get("LEAGUE_DB_PATH") or "league.db"
+
+
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    league = GAME_STATE.get("league", {})
-    db_path = league.get("db_path") if isinstance(league, dict) else None
-    if not db_path:
-        raise ValueError("db_path is required to compute trade agreement hash")
-    repo = LeagueRepo(db_path)
+    repo = LeagueRepo(_get_db_path())
     repo.init_db()
-    draft_picks = GAME_STATE.get("draft_picks", {})
-    swap_rights = GAME_STATE.get("swap_rights", {})
-    fixed_assets = GAME_STATE.get("fixed_assets", {})
     for team_id, assets in deal.legs.items():
         for asset in assets:
             asset_key_value = asset_key(asset)
@@ -78,21 +76,18 @@ def _compute_assets_hash(deal: Deal) -> str:
                     }
                 )
             elif isinstance(asset, PickAsset):
-                pick = draft_picks.get(asset.pick_id, {})
                 ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(pick.get("owner_team", "")).upper(),
-                    "protection": pick.get("protection"),
+                    "pick_id": asset.pick_id,
+                    "protection": asset.protection,
                 }
             elif isinstance(asset, SwapAsset):
-                swap = swap_rights.get(asset.swap_id, {})
                 ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(swap.get("owner_team", "")).upper()
+                    "swap_id": asset.swap_id,
+                    "pick_id_a": asset.pick_id_a,
+                    "pick_id_b": asset.pick_id_b,
                 }
             elif isinstance(asset, FixedAsset):
-                fixed = fixed_assets.get(asset.asset_id, {})
-                ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(fixed.get("owner_team", "")).upper()
-                }
+                ownership_snapshot[asset_key_value] = {"asset_id": asset.asset_id}
 
     player_snapshots.sort(
         key=lambda row: (row["player_id"], row["from_team_id"], row["to_team_id"])
@@ -124,82 +119,149 @@ def create_committed_deal(
         "status": "ACTIVE",
     }
 
-    GAME_STATE.setdefault("trade_agreements", {})[deal_id] = entry
-    _lock_assets_for_deal(canonical, deal_id, entry["expires_at"])
+    db_path = _get_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO trade_agreements(
+                    deal_id,
+                    deal_json,
+                    assets_hash,
+                    created_at,
+                    expires_at,
+                    status
+                ) VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    deal_id,
+                    json.dumps(entry["deal"]),
+                    assets_hash,
+                    entry["created_at"],
+                    entry["expires_at"],
+                    entry["status"],
+                ),
+            )
+            _lock_assets_for_deal(cur, canonical, deal_id, entry["expires_at"])
+        repo.validate_integrity()
     return entry
 
 
-def _lock_assets_for_deal(deal: Deal, deal_id: str, expires_at: str) -> None:
-    locks = GAME_STATE.setdefault("asset_locks", {})
+def _lock_assets_for_deal(cursor, deal: Deal, deal_id: str, expires_at: str) -> None:
     for assets in deal.legs.values():
         for asset in assets:
-            locks[asset_key(asset)] = {"deal_id": deal_id, "expires_at": expires_at}
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO asset_locks(asset_key, deal_id, expires_at)
+                VALUES (?, ?, ?);
+                """,
+                (asset_key(asset), deal_id, expires_at),
+            )
 
 
 def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> Deal:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
-    entry = agreements.get(deal_id)
-    if not entry:
-        raise TradeError(DEAL_INVALIDATED, "Committed deal not found")
-
-    status = entry.get("status")
-    if status and status != "ACTIVE":
-        if status == "EXECUTED":
-            raise TradeError(DEAL_ALREADY_EXECUTED, "Deal already executed")
-        if status == "EXPIRED":
-            raise TradeError(DEAL_EXPIRED, "Deal expired")
-        raise TradeError(DEAL_INVALIDATED, "Deal invalidated")
-
-    expires_at = entry.get("expires_at")
+    db_path = _get_db_path()
     today = current_date or get_current_date_as_date()
-    if expires_at and today > date.fromisoformat(str(expires_at)):
-        entry["status"] = "EXPIRED"
-        release_locks_for_deal(deal_id)
-        raise TradeError(DEAL_EXPIRED, "Deal expired")
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        entry_row = repo._conn.execute(
+            "SELECT * FROM trade_agreements WHERE deal_id=?;",
+            (deal_id,),
+        ).fetchone()
+        if not entry_row:
+            raise TradeError(DEAL_INVALIDATED, "Committed deal not found")
 
-    deal_payload = entry.get("deal") or {}
-    deal = canonicalize_deal(parse_deal(deal_payload))
+        entry = dict(entry_row)
+        status = entry.get("status")
+        if status and status != "ACTIVE":
+            if status == "EXECUTED":
+                raise TradeError(DEAL_ALREADY_EXECUTED, "Deal already executed")
+            if status == "EXPIRED":
+                raise TradeError(DEAL_EXPIRED, "Deal expired")
+            raise TradeError(DEAL_INVALIDATED, "Deal invalidated")
 
-    if entry.get("assets_hash") != _compute_assets_hash(deal):
-        entry["status"] = "INVALIDATED"
-        release_locks_for_deal(deal_id)
-        raise TradeError(DEAL_INVALIDATED, "Deal assets have changed")
+        expires_at = entry.get("expires_at")
+        if expires_at and today > date.fromisoformat(str(expires_at)):
+            with repo.transaction() as cur:
+                cur.execute(
+                    "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+                    ("EXPIRED", deal_id),
+                )
+                release_locks_for_deal(deal_id, cursor=cur)
+            raise TradeError(DEAL_EXPIRED, "Deal expired")
 
-    locks = GAME_STATE.get("asset_locks", {})
-    for assets in deal.legs.values():
-        for asset in assets:
-            lock = locks.get(asset_key(asset))
-            if not lock or lock.get("deal_id") != deal_id:
-                entry["status"] = "INVALIDATED"
-                release_locks_for_deal(deal_id)
-                raise TradeError(DEAL_INVALIDATED, "Asset lock missing")
+        deal_payload = json.loads(entry.get("deal_json") or "{}")
+        deal = canonicalize_deal(parse_deal(deal_payload))
 
-    return deal
+        if entry.get("assets_hash") != _compute_assets_hash(deal):
+            with repo.transaction() as cur:
+                cur.execute(
+                    "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+                    ("INVALIDATED", deal_id),
+                )
+                release_locks_for_deal(deal_id, cursor=cur)
+            raise TradeError(DEAL_INVALIDATED, "Deal assets have changed")
+
+        for assets in deal.legs.values():
+            for asset in assets:
+                lock = repo._conn.execute(
+                    "SELECT deal_id FROM asset_locks WHERE asset_key=?;",
+                    (asset_key(asset),),
+                ).fetchone()
+                if not lock or lock["deal_id"] != deal_id:
+                    with repo.transaction() as cur:
+                        cur.execute(
+                            "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+                            ("INVALIDATED", deal_id),
+                        )
+                        release_locks_for_deal(deal_id, cursor=cur)
+                    raise TradeError(DEAL_INVALIDATED, "Asset lock missing")
+
+        return deal
 
 
 def mark_executed(deal_id: str) -> None:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
-    entry = agreements.get(deal_id)
-    if not entry:
+    db_path = _get_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            cur.execute(
+                "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+                ("EXECUTED", deal_id),
+            )
+            release_locks_for_deal(deal_id, cursor=cur)
+        repo.validate_integrity()
+
+
+def release_locks_for_deal(deal_id: str, *, cursor=None) -> None:
+    if cursor is None:
+        db_path = _get_db_path()
+        with LeagueRepo(db_path) as repo:
+            repo.init_db()
+            with repo.transaction() as cur:
+                cur.execute("DELETE FROM asset_locks WHERE deal_id=?;", (deal_id,))
+            repo.validate_integrity()
         return
-    entry["status"] = "EXECUTED"
-    release_locks_for_deal(deal_id)
-
-
-def release_locks_for_deal(deal_id: str) -> None:
-    locks = GAME_STATE.setdefault("asset_locks", {})
-    to_remove = [key for key, lock in locks.items() if lock.get("deal_id") == deal_id]
-    for key in to_remove:
-        locks.pop(key, None)
+    cursor.execute("DELETE FROM asset_locks WHERE deal_id=?;", (deal_id,))
 
 
 def gc_expired_agreements(current_date: Optional[date] = None) -> None:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
     today = current_date or get_current_date_as_date()
-    for deal_id, entry in list(agreements.items()):
-        if entry.get("status") != "ACTIVE":
-            continue
-        expires_at = entry.get("expires_at")
-        if expires_at and today > date.fromisoformat(str(expires_at)):
-            entry["status"] = "EXPIRED"
-            release_locks_for_deal(deal_id)
+    db_path = _get_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        rows = repo._conn.execute(
+            "SELECT deal_id, expires_at FROM trade_agreements WHERE status='ACTIVE';"
+        ).fetchall()
+        for row in rows:
+            expires_at = row["expires_at"]
+            if expires_at and today > date.fromisoformat(str(expires_at)):
+                deal_id = row["deal_id"]
+                with repo.transaction() as cur:
+                    cur.execute(
+                        "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+                        ("EXPIRED", deal_id),
+                    )
+                    release_locks_for_deal(deal_id, cursor=cur)
+        repo.validate_integrity()

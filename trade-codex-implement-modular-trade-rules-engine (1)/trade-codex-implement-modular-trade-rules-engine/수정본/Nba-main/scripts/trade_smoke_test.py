@@ -11,7 +11,6 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from config import ROSTER_DF
 from state import GAME_STATE, initialize_master_schedule_if_needed, get_current_date_as_date
-from team_utils import _init_players_and_teams_if_needed
 from trades.apply import apply_deal
 from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
 from trades.models import canonicalize_deal, parse_deal
@@ -46,7 +45,6 @@ def _pick_three_teams() -> Tuple[str, str, str]:
 
 
 def main() -> None:
-    _init_players_and_teams_if_needed()
     initialize_master_schedule_if_needed()
     current_date = get_current_date_as_date()
 

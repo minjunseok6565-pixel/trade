@@ -8,7 +8,7 @@ import random
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
 from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
-from team_utils import _init_players_and_teams_if_needed, get_team_status_map
+from team_utils import get_team_status_map
 from trades.apply import apply_deal
 from trades.errors import TradeError
 from trades.models import PickAsset, PlayerAsset, asset_key, canonicalize_deal, parse_deal
@@ -49,7 +49,6 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
 
 
 def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
-    _init_players_and_teams_if_needed()
     from state import initialize_master_schedule_if_needed
 
     initialize_master_schedule_if_needed()

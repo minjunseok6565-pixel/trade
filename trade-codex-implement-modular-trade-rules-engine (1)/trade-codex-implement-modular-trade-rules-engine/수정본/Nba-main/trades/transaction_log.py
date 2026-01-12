@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, Optional
 
-from state import GAME_STATE, get_current_date, get_current_date_as_date
+from league_repo import LeagueRepo
+from state import get_current_date, get_current_date_as_date
 
 from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
 
@@ -62,5 +65,14 @@ def append_trade_transaction(
     if extra_meta:
         entry["meta"] = dict(extra_meta)
 
-    GAME_STATE.setdefault("transactions", []).append(entry)
+    db_path = os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            cur.execute(
+                "INSERT INTO trade_transactions(created_at, entry_json) VALUES (?, ?);",
+                (current_date, json.dumps(entry)),
+            )
+            entry["transaction_id"] = cur.lastrowid
+        repo.validate_integrity()
     return entry

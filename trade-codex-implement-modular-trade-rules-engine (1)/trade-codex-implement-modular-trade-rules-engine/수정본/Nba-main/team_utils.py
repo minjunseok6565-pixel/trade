@@ -4,7 +4,6 @@ import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
-from derived_formulas import compute_derived
 from state import GAME_STATE, _ensure_league_state, initialize_master_schedule_if_needed
 
 # Division/Conference mapping can stay in config (static).
@@ -47,110 +46,6 @@ def _list_active_team_ids() -> List[str]:
     except Exception:
         pass
     return list(ALL_TEAM_IDS)
-
-
-def _has_free_agents_team() -> bool:
-    try:
-        with _repo_ctx() as repo:
-            return "FA" in {str(t).upper() for t in repo.list_teams()}
-    except Exception:
-        return False
-
-
-def _parse_potential(pot_raw: Any) -> float:
-    pot_map = {
-        "A+": 1.0, "A": 0.95, "A-": 0.9,
-        "B+": 0.85, "B": 0.8, "B-": 0.75,
-        "C+": 0.7, "C": 0.65, "C-": 0.6,
-        "D+": 0.55, "D": 0.5, "F": 0.4,
-    }
-    if isinstance(pot_raw, str):
-        return float(pot_map.get(pot_raw.strip(), 0.6))
-    try:
-        return float(pot_raw)
-    except (TypeError, ValueError):
-        return 0.6
-
-
-def _init_players_and_teams_if_needed() -> None:
-    """Initialize GAME_STATE['players'] and GAME_STATE['teams'].
-
-    Step 6 invariant:
-    - GAME_STATE['players'] is keyed by **player_id (string)**.
-    - Never depend on a pandas DataFrame index for IDs.
-    """
-    # If players already exist, backfill missing derived using DB row (if present).
-    if isinstance(GAME_STATE.get("players"), dict) and GAME_STATE["players"]:
-        try:
-            with _repo_ctx() as repo:
-                for pid, pdata in list(GAME_STATE["players"].items()):
-                    if not isinstance(pdata, dict):
-                        continue
-
-                    derived = pdata.get("derived")
-                    if isinstance(derived, dict) and derived:
-                        continue
-                    try:
-                        row = repo.get_player(str(pid))
-                    except Exception:
-                        continue
-                    attrs = row.get("attrs") or {}
-                    try:
-                        pdata["derived"] = compute_derived(attrs)
-                    except Exception:
-                        pass
-                return
-        except Exception:
-            return
-
-    # Fresh build from DB
-    players: Dict[str, Dict[str, Any]] = {}
-    team_ids = _list_active_team_ids()
-    roster_team_ids = list(team_ids)
-    if _has_free_agents_team():
-        roster_team_ids.append("FA")
-
-    with _repo_ctx() as repo:
-        for tid in roster_team_ids:
-            try:
-                roster_rows = repo.get_team_roster(tid)
-            except Exception:
-                continue
-            for row in roster_rows:
-                pid = str(row.get("player_id"))
-                attrs = row.get("attrs") or {}
-
-                players[pid] = {
-                    "player_id": pid,
-                    "name": row.get("name") or attrs.get("Name") or "",
-                    "team_id": str(tid).upper(),
-                    "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
-                    "age": int(row.get("age") or 0),
-                    "overall": float(row.get("ovr") or 0.0),
-                    "salary": float(row.get("salary_amount") or 0.0),
-                    "potential": _parse_potential(attrs.get("Potential")),
-                    "derived": compute_derived(attrs),
-                    "signed_date": "1900-01-01",
-                    "signed_via_free_agency": False,
-                    "acquired_date": "1900-01-01",
-                    "acquired_via_trade": False,
-                }
-
-    GAME_STATE["players"] = players
-
-    teams_meta: Dict[str, Dict[str, Any]] = {}
-    for tid in team_ids:
-        info = TEAM_TO_CONF_DIV.get(tid, {})
-        teams_meta[tid] = {
-            "team_id": tid,
-            "conference": info.get("conference"),
-            "division": info.get("division"),
-            "tendency": "neutral",
-            "window": "now",
-            "market": "mid",
-            "patience": 0.5,
-        }
-    GAME_STATE["teams"] = teams_meta
 
 
 def _compute_team_payroll(team_id: str) -> float:
@@ -219,7 +114,6 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
 
 def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
     """Return standings grouped by conference."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
 
     standings = {"east": [], "west": []}
@@ -280,7 +174,6 @@ def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
 
 def get_team_cards() -> List[Dict[str, Any]]:
     """Return team summary cards."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
     team_ids = _list_active_team_ids()
 
@@ -310,7 +203,6 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
 def get_team_detail(team_id: str) -> Dict[str, Any]:
     """Return team detail (summary + roster) using DB roster."""
-    _init_players_and_teams_if_needed()
     tid = str(team_id).upper()
 
     team_ids = set(_list_active_team_ids())

@@ -117,17 +117,8 @@ def _get_db_path(game_state: dict) -> str | None:
 
 def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) -> dict:
     from contracts import models
-    from contracts.store import (
-        ensure_contract_state,
-        get_current_date_iso,
-        get_league_season_year,
-    )
+    from contracts.store import get_current_date_iso, get_league_season_year
     from contracts.free_agents import FREE_AGENT_TEAM_ID
-    import team_utils
-
-    ensure_contract_state(game_state)
-    team_utils._init_players_and_teams_if_needed()
-
     db_path = _get_db_path(game_state)
     if not db_path:
         raise ValueError("game_state['league']['db_path'] is required for repo bootstrap")
@@ -147,7 +138,6 @@ def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) 
             }
 
         league_season_year = get_league_season_year(game_state)
-        players = game_state.get("players", {})
         missing_players: list[str] = []
         created = 0
         skipped_contracts_for_fa = 0
@@ -170,8 +160,6 @@ def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) 
                         initial_free_agents.append(player_id)
                         initial_free_agents_seen.add(player_id)
                     skipped_contracts_for_fa += 1
-                    if player_id in players:
-                        players[player_id]["team_id"] = ""
                     continue
 
                 salary_amount = row["salary_amount"]
@@ -180,30 +168,8 @@ def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) 
                 signed_date_iso = get_current_date_iso(game_state)
 
                 contract_id = models.new_contract_id()
-                contract = models.make_contract_record(
-                    contract_id=contract_id,
-                    player_id=player_id,
-                    team_id=team_id,
-                    signed_date_iso=signed_date_iso,
-                    start_season_year=league_season_year,
-                    years=1,
-                    salary_by_year=salary_by_year,
-                    options=[],
-                    status="ACTIVE",
-                )
 
-                game_state["contracts"][contract_id] = contract
-                game_state.setdefault("player_contracts", {}).setdefault(
-                    str(player_id), []
-                ).append(contract_id)
-                game_state.setdefault("active_contract_id_by_player", {})[
-                    str(player_id)
-                ] = contract_id
-
-                if player_id in players:
-                    players[player_id]["team_id"] = team_id
-                    players[player_id]["signed_date"] = signed_date_iso
-                else:
+                if player_id not in game_state.get("players", {}):
                     missing_players.append(player_id)
 
                 cur.execute(
@@ -236,7 +202,6 @@ def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) 
                 )
                 created += 1
 
-        game_state["free_agents"] = list(initial_free_agents)
         repo.validate_integrity()
 
         return {
@@ -259,15 +224,12 @@ def bootstrap_contracts_from_roster_excel(
         return bootstrap_contracts_from_repo(game_state, overwrite=overwrite)
     from contracts import models
     from contracts.options_policy import normalize_option_type
-    from contracts.store import (
-        ensure_contract_state,
-        get_current_date_iso,
-        get_league_season_year,
-    )
-    import team_utils
+    from contracts.store import get_current_date_iso, get_league_season_year
 
-    ensure_contract_state(game_state)
-    team_utils._init_players_and_teams_if_needed()
+    game_state.setdefault("contracts", {})
+    game_state.setdefault("player_contracts", {})
+    game_state.setdefault("active_contract_id_by_player", {})
+    game_state.setdefault("free_agents", [])
 
     if roster_df is None:
         from config import ROSTER_DF
