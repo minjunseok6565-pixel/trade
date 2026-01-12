@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, get_league_db_path
+from state import GAME_STATE, get_current_date_as_date, get_league_db_path
 
 from .errors import APPLY_FAILED, TradeError
 from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
@@ -178,6 +178,13 @@ def apply_deal(
     pick_moves = _collect_pick_moves(deal)
     swap_moves = _collect_swap_moves(deal)
     fixed_asset_moves = _collect_fixed_asset_moves(deal)
+    trade_date_iso = (
+        trade_date.isoformat()
+        if trade_date is not None
+        else get_current_date_as_date().isoformat()
+    )
+    season_year = int(game_state.get("league", {}).get("season_year") or trade_date_iso[:4])
+    season_key = str(season_year)
 
     try:
         db_path = get_league_db_path(game_state)
@@ -196,6 +203,30 @@ def apply_deal(
             with repo.transaction() as cur:
                 for move in player_moves:
                     repo.trade_player(move.player_id, move.to_team, cursor=cur)
+                    existing = repo.get_player_state(move.player_id) or {}
+                    trade_return_bans = existing.get("trade_return_bans", {})
+                    season_bans = set(trade_return_bans.get(season_key, []))
+                    season_bans.add(move.from_team)
+                    trade_return_bans[season_key] = sorted(season_bans)
+                    repo.upsert_player_state(
+                        move.player_id,
+                        {
+                            "last_contract_action_type": existing.get(
+                                "last_contract_action_type"
+                            ),
+                            "last_contract_action_date": existing.get(
+                                "last_contract_action_date"
+                            ),
+                            "signed_via_free_agency": existing.get(
+                                "signed_via_free_agency", False
+                            ),
+                            "signed_date": existing.get("signed_date"),
+                            "acquired_via_trade": True,
+                            "acquired_date": trade_date_iso,
+                            "trade_return_bans": trade_return_bans,
+                        },
+                        cursor=cur,
+                    )
                 for move in pick_moves:
                     repo.update_pick_owner(move.pick_id, move.to_team, cursor=cur)
                     if move.protection is not None:

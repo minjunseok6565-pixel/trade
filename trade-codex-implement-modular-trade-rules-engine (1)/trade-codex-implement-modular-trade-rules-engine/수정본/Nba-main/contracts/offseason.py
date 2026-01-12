@@ -98,11 +98,6 @@ def process_offseason(
                 except ValueError:
                     contract["options"] = []
 
-                try:
-                    player_id = int(player_id_str)
-                except (TypeError, ValueError):
-                    player_id = None
-
                 pending = get_pending_options_for_season(contract, to_season_year)
                 if pending:
                     for option_index, option in enumerate(contract["options"]):
@@ -110,7 +105,9 @@ def process_offseason(
                             continue
                         if option.get("status") != "PENDING":
                             continue
-                        decision = decision_policy(option, player_id, contract, game_state)
+                        decision = decision_policy(
+                            option, player_id_str, contract, game_state
+                        )
                         apply_option_decision(
                             contract,
                             option_index,

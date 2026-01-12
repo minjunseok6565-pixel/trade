@@ -268,6 +268,7 @@ def _sign_free_agent_with_repo(
         )
 
         active_salary = get_active_salary_for_season(contract, start_season_year)
+        existing = repo.get_player_state(normalized_player_id) or {}
         if cursor is None:
             with repo.transaction() as cur:
                 now_iso = _utc_now_iso()
@@ -307,6 +308,19 @@ def _sign_free_agent_with_repo(
                     repo, normalized_player_id, normalized_team_id, cursor=cur
                 )
                 _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cur)
+                repo.upsert_player_state(
+                    normalized_player_id,
+                    {
+                        "last_contract_action_type": "SIGN_FREE_AGENT",
+                        "last_contract_action_date": signed_date_iso,
+                        "signed_via_free_agency": True,
+                        "signed_date": signed_date_iso,
+                        "acquired_via_trade": existing.get("acquired_via_trade", False),
+                        "acquired_date": existing.get("acquired_date"),
+                        "trade_return_bans": existing.get("trade_return_bans", {}),
+                    },
+                    cursor=cur,
+                )
         else:
             now_iso = _utc_now_iso()
             cursor.execute(
@@ -345,6 +359,19 @@ def _sign_free_agent_with_repo(
                 repo, normalized_player_id, normalized_team_id, cursor=cursor
             )
             _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cursor)
+            repo.upsert_player_state(
+                normalized_player_id,
+                {
+                    "last_contract_action_type": "SIGN_FREE_AGENT",
+                    "last_contract_action_date": signed_date_iso,
+                    "signed_via_free_agency": True,
+                    "signed_date": signed_date_iso,
+                    "acquired_via_trade": existing.get("acquired_via_trade", False),
+                    "acquired_date": existing.get("acquired_date"),
+                    "trade_return_bans": existing.get("trade_return_bans", {}),
+                },
+                cursor=cursor,
+            )
         if validate:
             repo.validate_integrity()
     finally:
@@ -443,6 +470,7 @@ def _re_sign_or_extend_with_repo(
         )
 
         active_salary = get_active_salary_for_season(contract, start_season_year)
+        existing = repo.get_player_state(normalized_player_id) or {}
         if cursor is None:
             with repo.transaction() as cur:
                 now_iso = _utc_now_iso()
@@ -482,6 +510,21 @@ def _re_sign_or_extend_with_repo(
                     repo, normalized_player_id, normalized_team_id, cursor=cur
                 )
                 _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cur)
+                repo.upsert_player_state(
+                    normalized_player_id,
+                    {
+                        "last_contract_action_type": "RE_SIGN_OR_EXTEND",
+                        "last_contract_action_date": signed_date_iso,
+                        "signed_via_free_agency": existing.get(
+                            "signed_via_free_agency", False
+                        ),
+                        "signed_date": existing.get("signed_date") or signed_date_iso,
+                        "acquired_via_trade": existing.get("acquired_via_trade", False),
+                        "acquired_date": existing.get("acquired_date"),
+                        "trade_return_bans": existing.get("trade_return_bans", {}),
+                    },
+                    cursor=cur,
+                )
         else:
             now_iso = _utc_now_iso()
             cursor.execute(
@@ -520,6 +563,21 @@ def _re_sign_or_extend_with_repo(
                 repo, normalized_player_id, normalized_team_id, cursor=cursor
             )
             _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cursor)
+            repo.upsert_player_state(
+                normalized_player_id,
+                {
+                    "last_contract_action_type": "RE_SIGN_OR_EXTEND",
+                    "last_contract_action_date": signed_date_iso,
+                    "signed_via_free_agency": existing.get(
+                        "signed_via_free_agency", False
+                    ),
+                    "signed_date": existing.get("signed_date") or signed_date_iso,
+                    "acquired_via_trade": existing.get("acquired_via_trade", False),
+                    "acquired_date": existing.get("acquired_date"),
+                    "trade_return_bans": existing.get("trade_return_bans", {}),
+                },
+                cursor=cursor,
+            )
         if validate:
             repo.validate_integrity()
     finally:
