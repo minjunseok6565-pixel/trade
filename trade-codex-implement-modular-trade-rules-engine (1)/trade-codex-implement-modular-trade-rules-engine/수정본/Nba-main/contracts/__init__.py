@@ -1,6 +1,9 @@
 """Contracts package."""
 
-from contracts.bootstrap import bootstrap_contracts_from_roster_excel
+from contracts.bootstrap import (
+    bootstrap_contracts_from_repo,
+    bootstrap_contracts_from_roster_excel,
+)
 from contracts.free_agents import (
     FREE_AGENT_TEAM_ID,
     add_free_agent,
@@ -22,16 +25,10 @@ from contracts.options import (
 from contracts.options_policy import default_option_decision_policy
 from contracts.ops import re_sign_or_extend, release_to_free_agents, sign_free_agent
 from contracts.store import ensure_contract_state
-from contracts.sync import (
-    assert_state_vs_roster_consistency,
-    sync_contract_team_ids_from_players,
-    sync_players_salary_from_active_contract,
-    sync_roster_salaries_for_season,
-    sync_roster_teams_from_state,
-)
 
 __all__ = [
     "ensure_contract_state",
+    "bootstrap_contracts_from_repo",
     "bootstrap_contracts_from_roster_excel",
     "new_contract_id",
     "make_contract_record",
@@ -49,9 +46,4 @@ __all__ = [
     "sign_free_agent",
     "re_sign_or_extend",
     "release_to_free_agents",
-    "sync_roster_salaries_for_season",
-    "sync_roster_teams_from_state",
-    "sync_contract_team_ids_from_players",
-    "sync_players_salary_from_active_contract",
-    "assert_state_vs_roster_consistency",
 ]

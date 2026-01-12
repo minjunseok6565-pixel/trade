@@ -14,17 +14,14 @@ def validate_deal(
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
     _ensure_league_state()
-    from contracts.store import get_league_season_year
-    from contracts.sync import (
-        sync_roster_salaries_for_season,
-        sync_roster_teams_from_state,
-    )
 
-    season_year = get_league_season_year(GAME_STATE)
-    sync_roster_teams_from_state(GAME_STATE)
-    sync_roster_salaries_for_season(GAME_STATE, season_year)
-
-    # RULES ENGINE CHECKS (migrated): deadline
-    ctx = build_trade_context(current_date=current_date)
-    validate_all(deal, ctx)
-
+    db_path = (GAME_STATE.get("league") or {}).get("db_path")
+    ctx = build_trade_context(current_date=current_date, db_path=db_path)
+    try:
+        ctx.repo.validate_integrity()
+        validate_all(deal, ctx)
+    finally:
+        # Validator closes ctx.repo to avoid SQLite connection leaks.
+        repo = getattr(ctx, "repo", None)
+        if repo is not None:
+            repo.close()

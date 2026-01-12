@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
@@ -18,42 +19,31 @@ except Exception as e:  # pragma: no cover
     _LEAGUE_REPO_IMPORT_ERROR = e
 
 
-_REPO: Optional["LeagueRepo"] = None
-
-
-def _get_repo() -> "LeagueRepo":
-    """Open (or reuse) the SQLite LeagueRepo.
-
-    Source of truth rule:
-    - DB is the only writable canonical store.
-    - Excel is import/export only (handled by league_repo.py).
-    """
-    global _REPO
+@contextmanager
+def _repo_ctx() -> "LeagueRepo":
+    """Open a SQLite LeagueRepo for the duration of the operation."""
     if LeagueRepo is None:
         raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
 
     league = GAME_STATE.setdefault("league", {})
     db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH", "league.db")
 
-    if _REPO is not None and getattr(_REPO, "db_path", None) == str(db_path):
-        return _REPO
-
-    _REPO = LeagueRepo(str(db_path))
-    try:
-        _REPO.init_db()
-    except Exception:
-        # init_db is idempotent; ignore if project uses a different init flow
-        pass
-    return _REPO
+    with LeagueRepo(str(db_path)) as repo:
+        try:
+            repo.init_db()
+        except Exception:
+            # init_db is idempotent; ignore if project uses a different init flow
+            pass
+        yield repo
 
 
 def _list_active_team_ids() -> List[str]:
     """Return active team ids from DB if possible, else fall back to ALL_TEAM_IDS."""
     try:
-        repo = _get_repo()
-        teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
-        if teams:
-            return teams
+        with _repo_ctx() as repo:
+            teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
+            if teams:
+                return teams
     except Exception:
         pass
     return list(ALL_TEAM_IDS)
@@ -61,8 +51,8 @@ def _list_active_team_ids() -> List[str]:
 
 def _has_free_agents_team() -> bool:
     try:
-        repo = _get_repo()
-        return "FA" in {str(t).upper() for t in repo.list_teams()}
+        with _repo_ctx() as repo:
+            return "FA" in {str(t).upper() for t in repo.list_teams()}
     except Exception:
         return False
 
@@ -92,60 +82,59 @@ def _init_players_and_teams_if_needed() -> None:
     # If players already exist, backfill missing derived using DB row (if present).
     if isinstance(GAME_STATE.get("players"), dict) and GAME_STATE["players"]:
         try:
-            repo = _get_repo()
+            with _repo_ctx() as repo:
+                for pid, pdata in list(GAME_STATE["players"].items()):
+                    if not isinstance(pdata, dict):
+                        continue
+
+                    derived = pdata.get("derived")
+                    if isinstance(derived, dict) and derived:
+                        continue
+                    try:
+                        row = repo.get_player(str(pid))
+                    except Exception:
+                        continue
+                    attrs = row.get("attrs") or {}
+                    try:
+                        pdata["derived"] = compute_derived(attrs)
+                    except Exception:
+                        pass
+                return
         except Exception:
             return
-        for pid, pdata in list(GAME_STATE["players"].items()):
-            if not isinstance(pdata, dict):
-                continue
-
-            derived = pdata.get("derived")
-            if isinstance(derived, dict) and derived:
-                continue
-            try:
-                row = repo.get_player(str(pid))
-            except Exception:
-                continue
-            attrs = row.get("attrs") or {}
-            try:
-                pdata["derived"] = compute_derived(attrs)
-            except Exception:
-                pass
-        return
 
     # Fresh build from DB
-    repo = _get_repo()
-
     players: Dict[str, Dict[str, Any]] = {}
     team_ids = _list_active_team_ids()
     roster_team_ids = list(team_ids)
     if _has_free_agents_team():
         roster_team_ids.append("FA")
 
-    for tid in roster_team_ids:
-        try:
-            roster_rows = repo.get_team_roster(tid)
-        except Exception:
-            continue
-        for row in roster_rows:
-            pid = str(row.get("player_id"))
-            attrs = row.get("attrs") or {}
+    with _repo_ctx() as repo:
+        for tid in roster_team_ids:
+            try:
+                roster_rows = repo.get_team_roster(tid)
+            except Exception:
+                continue
+            for row in roster_rows:
+                pid = str(row.get("player_id"))
+                attrs = row.get("attrs") or {}
 
-            players[pid] = {
-                "player_id": pid,
-                "name": row.get("name") or attrs.get("Name") or "",
-                "team_id": str(tid).upper(),
-                "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
-                "age": int(row.get("age") or 0),
-                "overall": float(row.get("ovr") or 0.0),
-                "salary": float(row.get("salary_amount") or 0.0),
-                "potential": _parse_potential(attrs.get("Potential")),
-                "derived": compute_derived(attrs),
-                "signed_date": "1900-01-01",
-                "signed_via_free_agency": False,
-                "acquired_date": "1900-01-01",
-                "acquired_via_trade": False,
-            }
+                players[pid] = {
+                    "player_id": pid,
+                    "name": row.get("name") or attrs.get("Name") or "",
+                    "team_id": str(tid).upper(),
+                    "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
+                    "age": int(row.get("age") or 0),
+                    "overall": float(row.get("ovr") or 0.0),
+                    "salary": float(row.get("salary_amount") or 0.0),
+                    "potential": _parse_potential(attrs.get("Potential")),
+                    "derived": compute_derived(attrs),
+                    "signed_date": "1900-01-01",
+                    "signed_via_free_agency": False,
+                    "acquired_date": "1900-01-01",
+                    "acquired_via_trade": False,
+                }
 
     GAME_STATE["players"] = players
 
@@ -166,14 +155,14 @@ def _init_players_and_teams_if_needed() -> None:
 
 def _compute_team_payroll(team_id: str) -> float:
     """Compute payroll from DB roster (NOT from Excel)."""
-    repo = _get_repo()
-    roster = repo.get_team_roster(team_id)
     total = 0.0
-    for r in roster:
-        try:
-            total += float(r.get("salary_amount") or 0.0)
-        except Exception:
-            continue
+    with _repo_ctx() as repo:
+        roster = repo.get_team_roster(team_id)
+        for r in roster:
+            try:
+                total += float(r.get("salary_amount") or 0.0)
+            except Exception:
+                continue
     return float(total)
 
 
@@ -358,35 +347,35 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "cap_space": _compute_cap_space(tid),
     }
 
-    repo = _get_repo()
-    roster_rows = repo.get_team_roster(tid)
     season_stats = GAME_STATE.get("player_stats", {}) or {}
     roster: List[Dict[str, Any]] = []
-    for row in roster_rows:
-        pid = str(row.get("player_id"))
-        p_stats = season_stats.get(pid, {}) or {}
-        games = int(p_stats.get("games", 0) or 0)
-        totals = p_stats.get("totals", {}) or {}
-        def per_game_val(key: str) -> float:
-            try:
-                return float(totals.get(key, 0.0)) / games if games else 0.0
-            except (TypeError, ValueError, ZeroDivisionError):
-                return 0.0
+    with _repo_ctx() as repo:
+        roster_rows = repo.get_team_roster(tid)
+        for row in roster_rows:
+            pid = str(row.get("player_id"))
+            p_stats = season_stats.get(pid, {}) or {}
+            games = int(p_stats.get("games", 0) or 0)
+            totals = p_stats.get("totals", {}) or {}
+            def per_game_val(key: str) -> float:
+                try:
+                    return float(totals.get(key, 0.0)) / games if games else 0.0
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return 0.0
 
-        roster.append(
-            {
-                "player_id": pid,
-                "name": row.get("name"),
-                "pos": row.get("pos"),
-                "ovr": float(row.get("ovr") or 0.0),
-                "age": int(row.get("age") or 0),
-                "salary": float(row.get("salary_amount") or 0.0),
-                "pts": per_game_val("PTS"),
-                "ast": per_game_val("AST"),
-                "reb": per_game_val("REB"),
-                "three_pm": per_game_val("3PM"),
-            }
-        )
+            roster.append(
+                {
+                    "player_id": pid,
+                    "name": row.get("name"),
+                    "pos": row.get("pos"),
+                    "ovr": float(row.get("ovr") or 0.0),
+                    "age": int(row.get("age") or 0),
+                    "salary": float(row.get("salary_amount") or 0.0),
+                    "pts": per_game_val("PTS"),
+                    "ast": per_game_val("AST"),
+                    "reb": per_game_val("REB"),
+                    "three_pm": per_game_val("3PM"),
+                }
+            )
 
     roster_sorted = sorted(roster, key=lambda r: r.get("ovr", 0), reverse=True)
 

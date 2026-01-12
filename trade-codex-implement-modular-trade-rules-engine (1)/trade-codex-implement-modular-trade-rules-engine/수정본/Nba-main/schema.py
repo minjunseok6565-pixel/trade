@@ -32,6 +32,14 @@ PLAYER_ID_RE = re.compile(r"^P\d{6}$")
 #   3-letter uppercase NBA code, plus "FA".
 TEAM_ID_RE = re.compile(r"^(?:[A-Z]{3}|FA)$")
 
+
+def is_canonical_player_id(pid: str) -> bool:
+    return bool(PLAYER_ID_RE.match(pid))
+
+
+def is_canonical_team_id(tid: str) -> bool:
+    return bool(TEAM_ID_RE.match(tid))
+
 # Engine raw often uses these side keys for home/away mapping.
 SIDE_HOME: str = "home"
 SIDE_AWAY: str = "away"
@@ -383,4 +391,3 @@ def normalize_player_keyed_map(
 
 # Any module that produces game results should produce GameResultV2 as defined above.
 # matchengine_v2_adapter should be the only boundary module that knows about raw engine quirks.
-

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
+from league_repo import LeagueRepo
+
 
 def process_offseason(
     game_state: dict,
@@ -18,6 +22,7 @@ def process_offseason(
     )
     from contracts.options_policy import default_option_decision_policy
     from contracts.store import ensure_contract_state, get_current_date_iso
+    from contracts.ops import release_to_free_agents
 
     ensure_contract_state(game_state)
 
@@ -29,69 +34,65 @@ def process_offseason(
     if decision_policy is None:
         decision_policy = default_option_decision_policy
 
-    for player_id_str, contract_id in list(active_map.items()):
-        contract = contracts.get(contract_id)
-        if not contract:
-            continue
-        contract_options = contract.get("options") or []
-        try:
-            contract["options"] = [
-                normalize_option_record(option) for option in contract_options
-            ]
-        except ValueError:
-            contract["options"] = []
-        try:
-            player_id = int(player_id_str)
-        except (TypeError, ValueError):
-            player_id = None
-        pending = get_pending_options_for_season(contract, to_season_year)
-        if pending:
-            for option_index, option in enumerate(contract["options"]):
-                if option.get("season_year") != to_season_year:
+    league_state = game_state.get("league") or {}
+    db_path = league_state.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    league_state["db_path"] = db_path
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            for player_id_str, contract_id in list(active_map.items()):
+                contract = contracts.get(contract_id)
+                if not contract:
                     continue
-                if option.get("status") != "PENDING":
-                    continue
-                decision = decision_policy(option, player_id, contract, game_state)
-                apply_option_decision(
-                    contract,
-                    option_index,
-                    decision,
-                    decision_date_iso,
-                )
-            recompute_contract_years_from_salary(contract)
-        try:
-            start = int(contract.get("start_season_year") or 0)
-        except (TypeError, ValueError):
-            start = 0
-        try:
-            years = int(contract.get("years") or 0)
-        except (TypeError, ValueError):
-            years = 0
-        end_exclusive = start + years
-        if to_season_year >= end_exclusive:
-            contract["status"] = "EXPIRED"
-            active_map.pop(player_id_str, None)
-            try:
-                player_id = int(player_id_str)
-            except (TypeError, ValueError):
-                continue
-            from contracts.ops import release_to_free_agents
-
-            release_to_free_agents(game_state, player_id, released_date=None)
-            expired += 1
-            released += 1
-
-    from contracts.sync import (
-        sync_contract_team_ids_from_players,
-        sync_players_salary_from_active_contract,
-        sync_roster_salaries_for_season,
-        sync_roster_teams_from_state,
-    )
-
-    sync_roster_salaries_for_season(game_state, to_season_year)
-    sync_players_salary_from_active_contract(game_state, to_season_year)
-    sync_contract_team_ids_from_players(game_state)
-    sync_roster_teams_from_state(game_state)
+                contract_options = contract.get("options") or []
+                try:
+                    contract["options"] = [
+                        normalize_option_record(option) for option in contract_options
+                    ]
+                except ValueError:
+                    contract["options"] = []
+                try:
+                    player_id = int(player_id_str)
+                except (TypeError, ValueError):
+                    player_id = None
+                pending = get_pending_options_for_season(contract, to_season_year)
+                if pending:
+                    for option_index, option in enumerate(contract["options"]):
+                        if option.get("season_year") != to_season_year:
+                            continue
+                        if option.get("status") != "PENDING":
+                            continue
+                        decision = decision_policy(option, player_id, contract, game_state)
+                        apply_option_decision(
+                            contract,
+                            option_index,
+                            decision,
+                            decision_date_iso,
+                        )
+                    recompute_contract_years_from_salary(contract)
+                try:
+                    start = int(contract.get("start_season_year") or 0)
+                except (TypeError, ValueError):
+                    start = 0
+                try:
+                    years = int(contract.get("years") or 0)
+                except (TypeError, ValueError):
+                    years = 0
+                end_exclusive = start + years
+                if to_season_year >= end_exclusive:
+                    contract["status"] = "EXPIRED"
+                    active_map.pop(player_id_str, None)
+                    release_to_free_agents(
+                        game_state,
+                        player_id_str,
+                        released_date=None,
+                        repo=repo,
+                        cursor=cur,
+                        validate=False,
+                    )
+                    expired += 1
+                    released += 1
+        repo.validate_integrity()
 
     try:
         draft_year_to_settle = int(from_season_year) + 1

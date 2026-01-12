@@ -4,11 +4,15 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional, Protocol
 
+from league_repo import LeagueRepo
+from schema import normalize_player_id, normalize_team_id
+
 
 @dataclass
 class TradeContext:
     game_state: dict
-    roster_df: Any
+    repo: LeagueRepo
+    db_path: Optional[str]
     current_date: date
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -22,27 +26,41 @@ class Rule(Protocol):
         ...
 
 
-def build_player_moves(deal: Any) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+def build_player_moves(deal: Any) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     from ..models import PlayerAsset
 
-    players_out: dict[str, list[int]] = {team_id: [] for team_id in deal.teams}
-    players_in: dict[str, list[int]] = {team_id: [] for team_id in deal.teams}
+    players_out: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
+    players_in: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
 
     for team_id, assets in deal.legs.items():
         for asset in assets:
             if not isinstance(asset, PlayerAsset):
                 continue
-            players_out[team_id].append(asset.player_id)
+            player_id = _normalize_player_id(asset.player_id)
+            players_out[team_id].append(player_id)
             receiver = _resolve_receiver(deal, team_id, asset)
-            players_in[receiver].append(asset.player_id)
+            players_in[receiver].append(player_id)
 
     return players_out, players_in
 
 
-def _sum_player_salaries(roster_df: Any, player_ids: list[int]) -> float:
+def _normalize_player_id(value: Any) -> str:
+    return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
+
+
+def _normalize_team_id(value: Any) -> str:
+    return str(normalize_team_id(value, strict=True))
+
+
+def _sum_player_salaries(repo: LeagueRepo, player_ids: list[str]) -> float:
     if not player_ids:
         return 0.0
-    return float(roster_df.reindex(player_ids)["SalaryAmount"].fillna(0.0).sum())
+    total = 0.0
+    for player_id in player_ids:
+        pid = _normalize_player_id(player_id)
+        salary = repo.get_salary_amount(pid)
+        total += float(salary or 0)
+    return total
 
 
 def build_team_trade_totals(
@@ -56,8 +74,8 @@ def build_team_trade_totals(
         outgoing_players = players_out.get(team_id, [])
         incoming_players = players_in.get(team_id, [])
         totals[team_id] = {
-            "outgoing_salary": _sum_player_salaries(ctx.roster_df, outgoing_players),
-            "incoming_salary": _sum_player_salaries(ctx.roster_df, incoming_players),
+            "outgoing_salary": _sum_player_salaries(ctx.repo, outgoing_players),
+            "incoming_salary": _sum_player_salaries(ctx.repo, incoming_players),
             "outgoing_players_count": len(outgoing_players),
             "incoming_players_count": len(incoming_players),
         }
@@ -74,8 +92,9 @@ def build_team_payrolls(
     payrolls: dict[str, dict[str, float]] = {}
 
     for team_id in deal.teams:
+        tid = _normalize_team_id(team_id)
         payroll_before = float(
-            ctx.roster_df.loc[ctx.roster_df["Team"] == team_id, "SalaryAmount"].sum()
+            sum(float(row.get("salary_amount") or 0) for row in ctx.repo.get_team_roster(tid))
         )
         outgoing_salary = float(totals[team_id]["outgoing_salary"])
         incoming_salary = float(totals[team_id]["incoming_salary"])
@@ -106,8 +125,8 @@ def _resolve_receiver(deal: Any, sender_team: str, asset: Any) -> str:
 def build_trade_context(
     current_date: Optional[date] = None,
     extra: Optional[dict[str, Any]] = None,
+    db_path: Optional[str] = None,
 ) -> TradeContext:
-    from config import ROSTER_DF
     import state as state_module
 
     player_meta_defaults = {
@@ -149,9 +168,21 @@ def build_trade_context(
         if allow_locked_by_deal_id is not None:
             resolved_extra["allow_locked_by_deal_id"] = allow_locked_by_deal_id
 
+    resolved_db_path = db_path
+    if resolved_db_path is None:
+        league = state_module.GAME_STATE.get("league", {})
+        if isinstance(league, dict):
+            resolved_db_path = league.get("db_path")
+    if not resolved_db_path:
+        raise ValueError("db_path is required to build TradeContext")
+
+    repo = LeagueRepo(resolved_db_path)
+    repo.init_db()
+
     return TradeContext(
         game_state=state_module.GAME_STATE,
-        roster_df=ROSTER_DF,
+        repo=repo,
+        db_path=resolved_db_path,
         current_date=current_date,
         extra=resolved_extra,
     )

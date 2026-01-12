@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from schema import normalize_team_id
+
 from ...errors import MISSING_TO_TEAM, ROSTER_LIMIT, TradeError
 from ...models import PlayerAsset
 from ..base import TradeContext
@@ -14,7 +16,6 @@ class RosterLimitRule:
     enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
-        roster_counts = ctx.roster_df["Team"].value_counts().to_dict()
         players_out: dict[str, int] = {team_id: 0 for team_id in deal.teams}
         players_in: dict[str, int] = {team_id: 0 for team_id in deal.teams}
 
@@ -27,7 +28,8 @@ class RosterLimitRule:
                 players_in[receiver] += 1
 
         for team_id in deal.teams:
-            current_count = int(roster_counts.get(team_id, 0))
+            tid = str(normalize_team_id(team_id, strict=True))
+            current_count = len(ctx.repo.get_roster_player_ids(tid))
             new_count = current_count - players_out[team_id] + players_in[team_id]
             if new_count > 15:
                 raise TradeError(
