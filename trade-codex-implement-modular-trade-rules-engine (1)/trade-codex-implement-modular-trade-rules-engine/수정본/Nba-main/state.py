@@ -1166,7 +1166,7 @@ def ingest_game_result(
     store_raw_result: bool = True,
 ) -> Dict[str, Any]:
     """정식 GameResultV2 스키마 결과를 GAME_STATE에 반영한다."""
-    validate_v2_game_result(game_result))
+    validate_v2_game_result(game_result)
 
     game = _require_dict(game_result["game"], "game")
     season_id = str(game["season_id"])
@@ -1416,6 +1416,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
