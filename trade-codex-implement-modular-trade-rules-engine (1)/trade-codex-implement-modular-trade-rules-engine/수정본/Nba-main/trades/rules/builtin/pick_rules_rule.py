@@ -37,7 +37,7 @@ class PickRulesRule:
                 },
             )
 
-        draft_picks = ctx.game_state.get("draft_picks", {})
+        draft_picks = {pick["pick_id"]: pick for pick in ctx.repo.list_picks()}
         # Safety guard: Stepien rule checks (year, year+1) pairs.
         # If draft_picks data doesn't include year+1 at all (older saves / partial state),
         # a missing year would be misread as "0 picks" and can cause false violations.

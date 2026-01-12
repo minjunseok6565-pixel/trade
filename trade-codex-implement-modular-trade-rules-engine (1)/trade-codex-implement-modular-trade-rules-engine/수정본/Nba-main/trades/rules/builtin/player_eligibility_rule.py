@@ -23,7 +23,7 @@ class PlayerEligibilityRule:
             for asset in assets:
                 if not isinstance(asset, PlayerAsset):
                     continue
-                player_state = ctx.game_state.get("players", {}).get(asset.player_id, {})
+                player_state = _get_player_state(ctx, asset.player_id)
                 if not player_state:
                     continue
                 contract_action_type = player_state.get("last_contract_action_type")
@@ -71,7 +71,7 @@ class PlayerEligibilityRule:
             if len(outgoing_players) < 2:
                 continue
             for asset in outgoing_players:
-                player_state = ctx.game_state.get("players", {}).get(asset.player_id, {})
+                player_state = _get_player_state(ctx, asset.player_id)
                 if not player_state:
                     continue
                 if not player_state.get("acquired_via_trade"):
@@ -91,6 +91,11 @@ class PlayerEligibilityRule:
                             "acquired_date": acquired_date.isoformat(),
                         },
                     )
+
+
+def _get_player_state(ctx: TradeContext, player_id: str) -> dict:
+    state = ctx.repo.get_player_state(player_id)
+    return state or {}
 
 
 def _parse_player_date(value: object) -> date:

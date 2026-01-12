@@ -58,8 +58,7 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
         raise ValueError("db_path is required for AI trade evaluation")
     repo = LeagueRepo(db_path)
     repo.init_db()
-    draft_picks = GAME_STATE.get("draft_picks", {})
-    asset_locks = GAME_STATE.get("asset_locks", {})
+    draft_picks = repo.list_picks()
 
     team_status = get_team_status_map()
     contenders = [tid for tid, status in team_status.items() if status == "contender"]
@@ -105,18 +104,19 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
                         allow_legacy_numeric=True,
                     )
                 )
-                if asset_key(PlayerAsset(kind="player", player_id=veteran_id)) in asset_locks:
+                if repo.get_asset_lock(asset_key(PlayerAsset(kind="player", player_id=veteran_id))):
                     continue
 
                 pick_candidates = [
                     pick
-                    for pick in draft_picks.values()
+                    for pick in draft_picks
                     if pick.get("owner_team") == contender_id
                     and pick.get("round") == 2
                     and int(pick.get("year", current_year)) >= current_year
                     and pick.get("protection") is None
-                    and asset_key(PickAsset(kind="pick", pick_id=str(pick.get("pick_id"))))
-                    not in asset_locks
+                    and not repo.get_asset_lock(
+                        asset_key(PickAsset(kind="pick", pick_id=str(pick.get("pick_id"))))
+                    )
                 ]
                 if not pick_candidates:
                     continue

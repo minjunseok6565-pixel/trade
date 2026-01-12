@@ -262,18 +262,64 @@ class LeagueRepo:
 
                 CREATE INDEX IF NOT EXISTS idx_asset_locks_deal_id ON asset_locks(deal_id);
 
-                CREATE TABLE IF NOT EXISTS trade_transactions (
+                CREATE TABLE IF NOT EXISTS transactions (
                     transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
                     entry_json TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS trade_negotiations (
+                CREATE TABLE IF NOT EXISTS negotiations (
                     session_id TEXT PRIMARY KEY,
                     session_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS draft_picks (
+                    pick_id TEXT PRIMARY KEY,
+                    year INTEGER NOT NULL,
+                    round INTEGER NOT NULL,
+                    original_team TEXT NOT NULL,
+                    owner_team TEXT NOT NULL,
+                    protection_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_draft_picks_year ON draft_picks(year);
+                CREATE INDEX IF NOT EXISTS idx_draft_picks_owner_team ON draft_picks(owner_team);
+
+                CREATE TABLE IF NOT EXISTS swap_rights (
+                    swap_id TEXT PRIMARY KEY,
+                    year INTEGER NOT NULL,
+                    pick_id_a TEXT NOT NULL,
+                    pick_id_b TEXT NOT NULL,
+                    owner_team TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_swap_rights_year ON swap_rights(year);
+                CREATE INDEX IF NOT EXISTS idx_swap_rights_owner_team ON swap_rights(owner_team);
+
+                CREATE TABLE IF NOT EXISTS fixed_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    owner_team TEXT NOT NULL,
+                    source_pick_id TEXT,
+                    draft_year INTEGER
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_fixed_assets_owner_team ON fixed_assets(owner_team);
+
+                CREATE TABLE IF NOT EXISTS player_state (
+                    player_id TEXT PRIMARY KEY,
+                    last_contract_action_type TEXT,
+                    last_contract_action_date TEXT,
+                    signed_via_free_agency INTEGER NOT NULL DEFAULT 0,
+                    signed_date TEXT,
+                    acquired_via_trade INTEGER NOT NULL DEFAULT 0,
+                    acquired_date TEXT,
+                    trade_return_bans_json TEXT
                 );
                 """
             )
@@ -563,6 +609,516 @@ class LeagueRepo:
     def list_teams(self) -> List[str]:
         rows = self._conn.execute("SELECT DISTINCT team_id FROM roster WHERE status='active' ORDER BY team_id;").fetchall()
         return [r["team_id"] for r in rows]
+
+    # ------------------------
+    # Draft picks / swaps / fixed assets
+    # ------------------------
+
+    def get_pick(self, pick_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks
+            WHERE pick_id=?;
+            """,
+            (str(pick_id),),
+        ).fetchone()
+        return self._row_to_pick(row) if row else None
+
+    def list_picks(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks;
+            """
+        ).fetchall()
+        return [self._row_to_pick(row) for row in rows]
+
+    def list_picks_by_year(self, year: int) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks
+            WHERE year=?;
+            """,
+            (int(year),),
+        ).fetchall()
+        return [self._row_to_pick(row) for row in rows]
+
+    def list_picks_by_owner(self, owner_team: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks
+            WHERE owner_team=?;
+            """,
+            (str(owner_team).upper(),),
+        ).fetchall()
+        return [self._row_to_pick(row) for row in rows]
+
+    def get_picks_by_ids(self, pick_ids: Iterable[str]) -> List[Dict[str, Any]]:
+        ids = [str(pid) for pid in pick_ids if pid]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks
+            WHERE pick_id IN ({placeholders});
+            """,
+            ids,
+        ).fetchall()
+        return [self._row_to_pick(row) for row in rows]
+
+    def upsert_pick(self, pick: Dict[str, Any], *, cursor=None) -> None:
+        protection = pick.get("protection")
+        protection_json = json.dumps(protection) if protection is not None else None
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT INTO draft_picks(
+                pick_id,
+                year,
+                round,
+                original_team,
+                owner_team,
+                protection_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pick_id) DO UPDATE SET
+                year=excluded.year,
+                round=excluded.round,
+                original_team=excluded.original_team,
+                owner_team=excluded.owner_team,
+                protection_json=excluded.protection_json;
+            """,
+            (
+                str(pick.get("pick_id")),
+                int(pick.get("year") or 0),
+                int(pick.get("round") or 0),
+                str(pick.get("original_team") or "").upper(),
+                str(pick.get("owner_team") or "").upper(),
+                protection_json,
+            ),
+        )
+
+    def upsert_picks(self, picks: Iterable[Dict[str, Any]], *, cursor=None) -> None:
+        cur = cursor or self._conn
+        rows = []
+        for pick in picks:
+            protection = pick.get("protection")
+            protection_json = json.dumps(protection) if protection is not None else None
+            rows.append(
+                (
+                    str(pick.get("pick_id")),
+                    int(pick.get("year") or 0),
+                    int(pick.get("round") or 0),
+                    str(pick.get("original_team") or "").upper(),
+                    str(pick.get("owner_team") or "").upper(),
+                    protection_json,
+                )
+            )
+        cur.executemany(
+            """
+            INSERT INTO draft_picks(
+                pick_id,
+                year,
+                round,
+                original_team,
+                owner_team,
+                protection_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pick_id) DO NOTHING;
+            """,
+            rows,
+        )
+
+    def update_pick_owner(self, pick_id: str, owner_team: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE draft_picks SET owner_team=? WHERE pick_id=?;",
+            (str(owner_team).upper(), str(pick_id)),
+        )
+
+    def set_pick_protection(self, pick_id: str, protection: Optional[Dict[str, Any]], *, cursor=None) -> None:
+        protection_json = json.dumps(protection) if protection is not None else None
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE draft_picks SET protection_json=? WHERE pick_id=?;",
+            (protection_json, str(pick_id)),
+        )
+
+    def clear_pick_protection(self, pick_id: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute("UPDATE draft_picks SET protection_json=NULL WHERE pick_id=?;", (str(pick_id),))
+
+    def get_swap(self, swap_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT swap_id, year, pick_id_a, pick_id_b, owner_team, active
+            FROM swap_rights
+            WHERE swap_id=?;
+            """,
+            (str(swap_id),),
+        ).fetchone()
+        return self._row_to_swap(row) if row else None
+
+    def list_swaps_by_year(self, year: int) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT swap_id, year, pick_id_a, pick_id_b, owner_team, active
+            FROM swap_rights
+            WHERE year=?;
+            """,
+            (int(year),),
+        ).fetchall()
+        return [self._row_to_swap(row) for row in rows]
+
+    def list_swaps(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT swap_id, year, pick_id_a, pick_id_b, owner_team, active FROM swap_rights;"
+        ).fetchall()
+        return [self._row_to_swap(row) for row in rows]
+
+    def upsert_swap(self, swap: Dict[str, Any], *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT INTO swap_rights(
+                swap_id,
+                year,
+                pick_id_a,
+                pick_id_b,
+                owner_team,
+                active
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(swap_id) DO UPDATE SET
+                year=excluded.year,
+                pick_id_a=excluded.pick_id_a,
+                pick_id_b=excluded.pick_id_b,
+                owner_team=excluded.owner_team,
+                active=excluded.active;
+            """,
+            (
+                str(swap.get("swap_id")),
+                int(swap.get("year") or 0),
+                str(swap.get("pick_id_a")),
+                str(swap.get("pick_id_b")),
+                str(swap.get("owner_team") or "").upper(),
+                1 if swap.get("active", True) else 0,
+            ),
+        )
+
+    def deactivate_swap(self, swap_id: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute("UPDATE swap_rights SET active=0 WHERE swap_id=?;", (str(swap_id),))
+
+    def get_fixed_asset(self, asset_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT asset_id, label, value, owner_team, source_pick_id, draft_year
+            FROM fixed_assets
+            WHERE asset_id=?;
+            """,
+            (str(asset_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_fixed_asset(self, asset: Dict[str, Any], *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT INTO fixed_assets(
+                asset_id,
+                label,
+                value,
+                owner_team,
+                source_pick_id,
+                draft_year
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset_id) DO UPDATE SET
+                label=excluded.label,
+                value=excluded.value,
+                owner_team=excluded.owner_team,
+                source_pick_id=excluded.source_pick_id,
+                draft_year=excluded.draft_year;
+            """,
+            (
+                str(asset.get("asset_id")),
+                str(asset.get("label") or ""),
+                float(asset.get("value") or 0),
+                str(asset.get("owner_team") or "").upper(),
+                asset.get("source_pick_id"),
+                asset.get("draft_year"),
+            ),
+        )
+
+    def list_fixed_assets_by_owner(self, owner_team: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT asset_id, label, value, owner_team, source_pick_id, draft_year
+            FROM fixed_assets
+            WHERE owner_team=?;
+            """,
+            (str(owner_team).upper(),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------
+    # Asset locks
+    # ------------------------
+
+    def get_asset_lock(self, asset_key_value: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT asset_key, deal_id, expires_at FROM asset_locks WHERE asset_key=?;",
+            (str(asset_key_value),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def lock_asset(self, asset_key_value: str, deal_id: str, expires_at: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO asset_locks(asset_key, deal_id, expires_at)
+            VALUES (?, ?, ?);
+            """,
+            (str(asset_key_value), str(deal_id), str(expires_at)),
+        )
+
+    def update_asset_lock_expires(self, asset_key_value: str, expires_at: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE asset_locks SET expires_at=? WHERE asset_key=?;",
+            (str(expires_at), str(asset_key_value)),
+        )
+
+    def release_asset_lock(self, asset_key_value: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute("DELETE FROM asset_locks WHERE asset_key=?;", (str(asset_key_value),))
+
+    def release_asset_locks_for_deal(self, deal_id: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute("DELETE FROM asset_locks WHERE deal_id=?;", (str(deal_id),))
+
+    # ------------------------
+    # Trade agreements
+    # ------------------------
+
+    def save_trade_agreement(
+        self,
+        *,
+        deal_id: str,
+        deal_json: str,
+        assets_hash: str,
+        created_at: str,
+        expires_at: str,
+        status: str,
+        cursor=None,
+    ) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO trade_agreements(
+                deal_id,
+                deal_json,
+                assets_hash,
+                created_at,
+                expires_at,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (deal_id, deal_json, assets_hash, created_at, expires_at, status),
+        )
+
+    def get_trade_agreement(self, deal_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM trade_agreements WHERE deal_id=?;",
+            (str(deal_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_trade_agreement_status(self, deal_id: str, status: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE trade_agreements SET status=? WHERE deal_id=?;",
+            (str(status), str(deal_id)),
+        )
+
+    def list_active_trade_agreements(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT deal_id, expires_at FROM trade_agreements WHERE status='ACTIVE';"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------
+    # Transactions / negotiations
+    # ------------------------
+
+    def log_transaction(self, created_at: str, entry_json: str, *, cursor=None) -> int:
+        cur = cursor or self._conn
+        cur.execute(
+            "INSERT INTO transactions(created_at, entry_json) VALUES (?, ?);",
+            (created_at, entry_json),
+        )
+        return int(cur.lastrowid)
+
+    def list_transactions(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT transaction_id, created_at, entry_json FROM transactions ORDER BY transaction_id;"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_negotiation(
+        self,
+        *,
+        session_id: str,
+        session_json: str,
+        status: str,
+        created_at: str,
+        updated_at: str,
+        cursor=None,
+    ) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT INTO negotiations(
+                session_id,
+                session_json,
+                status,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?);
+            """,
+            (session_id, session_json, status, created_at, updated_at),
+        )
+
+    def update_negotiation(
+        self,
+        *,
+        session_id: str,
+        session_json: str,
+        status: str,
+        updated_at: str,
+        cursor=None,
+    ) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            UPDATE negotiations
+            SET session_json=?, status=?, updated_at=?
+            WHERE session_id=?;
+            """,
+            (session_json, status, updated_at, session_id),
+        )
+
+    def get_negotiation(self, session_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT session_json FROM negotiations WHERE session_id=?;",
+            (str(session_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    # ------------------------
+    # Player state
+    # ------------------------
+
+    def get_player_state(self, player_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT
+                last_contract_action_type,
+                last_contract_action_date,
+                signed_via_free_agency,
+                signed_date,
+                acquired_via_trade,
+                acquired_date,
+                trade_return_bans_json
+            FROM player_state
+            WHERE player_id=?;
+            """,
+            (str(player_id),),
+        ).fetchone()
+        if not row:
+            return None
+        trade_return_bans = {}
+        trade_return_bans_raw = row["trade_return_bans_json"]
+        if trade_return_bans_raw:
+            trade_return_bans = json.loads(trade_return_bans_raw)
+        return {
+            "last_contract_action_type": row["last_contract_action_type"],
+            "last_contract_action_date": row["last_contract_action_date"],
+            "signed_via_free_agency": bool(row["signed_via_free_agency"]),
+            "signed_date": row["signed_date"] or "1900-01-01",
+            "acquired_via_trade": bool(row["acquired_via_trade"]),
+            "acquired_date": row["acquired_date"] or "1900-01-01",
+            "trade_return_bans": trade_return_bans,
+        }
+
+    def upsert_player_state(self, player_id: str, state: Dict[str, Any], *, cursor=None) -> None:
+        trade_return_bans = state.get("trade_return_bans") or {}
+        trade_return_bans_json = json.dumps(trade_return_bans)
+        cur = cursor or self._conn
+        cur.execute(
+            """
+            INSERT INTO player_state(
+                player_id,
+                last_contract_action_type,
+                last_contract_action_date,
+                signed_via_free_agency,
+                signed_date,
+                acquired_via_trade,
+                acquired_date,
+                trade_return_bans_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(player_id) DO UPDATE SET
+                last_contract_action_type=excluded.last_contract_action_type,
+                last_contract_action_date=excluded.last_contract_action_date,
+                signed_via_free_agency=excluded.signed_via_free_agency,
+                signed_date=excluded.signed_date,
+                acquired_via_trade=excluded.acquired_via_trade,
+                acquired_date=excluded.acquired_date,
+                trade_return_bans_json=excluded.trade_return_bans_json;
+            """,
+            (
+                str(player_id),
+                state.get("last_contract_action_type"),
+                state.get("last_contract_action_date"),
+                1 if state.get("signed_via_free_agency") else 0,
+                state.get("signed_date") or "1900-01-01",
+                1 if state.get("acquired_via_trade") else 0,
+                state.get("acquired_date") or "1900-01-01",
+                trade_return_bans_json,
+            ),
+        )
+
+    def _row_to_pick(self, row) -> Dict[str, Any]:
+        protection = None
+        protection_raw = row["protection_json"]
+        if protection_raw:
+            protection = json.loads(protection_raw)
+        return {
+            "pick_id": row["pick_id"],
+            "year": row["year"],
+            "round": row["round"],
+            "original_team": row["original_team"],
+            "owner_team": row["owner_team"],
+            "protection": protection,
+        }
+
+    def _row_to_swap(self, row) -> Dict[str, Any]:
+        return {
+            "swap_id": row["swap_id"],
+            "year": row["year"],
+            "pick_id_a": row["pick_id_a"],
+            "pick_id_b": row["pick_id_b"],
+            "owner_team": row["owner_team"],
+            "active": bool(row["active"]),
+        }
 
     # ------------------------
     # Writes (Roster operations)
