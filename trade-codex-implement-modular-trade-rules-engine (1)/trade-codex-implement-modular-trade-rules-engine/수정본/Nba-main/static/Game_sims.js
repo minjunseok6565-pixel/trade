@@ -70,37 +70,38 @@ function calcFatigueFactor(restDays) {
   return 1.05;                     // 4일 이상 푹 쉼
 }
 
-// 팀 전술 객체 생성 (match_engine 기대 포맷)
+// 팀 전술 객체 생성 (matchengine_v3 기대 포맷)
 function buildTacticsForTeam(teamId, fatigueFactor) {
   const userTeam = appState.selectedTeam;
   const isUserTeam = userTeam && userTeam.id === teamId;
 
   if (isUserTeam) {
     const tactics = getOrCreateTacticsForTeam(teamId);
+    const normalizeWeight = (value, fallback = 5) => {
+      const raw = value ?? fallback;
+      const numeric = Number.isFinite(raw) ? raw : fallback;
+      return Math.max(0.2, numeric / 5);
+    };
     return {
       pace: tactics.pace ?? 0,
-      offense_scheme: tactics.offenseScheme || 'pace_space',
-      offense_secondary_scheme: tactics.offenseSecondaryScheme || 'none',
-      offense_primary_weight: tactics.offensePrimaryWeight ?? 5,
-      offense_secondary_weight: tactics.offenseSecondaryWeight ?? 5,
-      defense_scheme: tactics.defenseScheme || 'drop_coverage',
-      defense_secondary_scheme: tactics.defenseSecondaryScheme || 'none',
-      defense_primary_weight: tactics.defensePrimaryWeight ?? 5,
-      defense_secondary_weight: tactics.defenseSecondaryWeight ?? 5,
+      offense_scheme: tactics.offenseScheme || 'Spread_HeavyPnR',
+      defense_scheme: tactics.defenseScheme || 'Drop',
+      scheme_weight_sharpness: normalizeWeight(tactics.offensePrimaryWeight, 5),
+      scheme_outcome_strength: normalizeWeight(tactics.offenseSecondaryWeight, 5),
+      def_scheme_weight_sharpness: normalizeWeight(tactics.defensePrimaryWeight, 5),
+      def_scheme_outcome_strength: normalizeWeight(tactics.defenseSecondaryWeight, 5),
       rotation_size: tactics.rotationSize || 9,
       lineup: {
         starters: tactics.starters || [],
         bench: tactics.bench || []
       },
-      minutes: tactics.minutes || {},
-      fatigue_factor: fatigueFactor
+      minutes: tactics.minutes || {}
     };
   }
 
   // 상대 팀은 기본값(페이스/피로만) 전달
   return {
-    pace: 0,
-    fatigue_factor: fatigueFactor
+    pace: 0
   };
 }
 

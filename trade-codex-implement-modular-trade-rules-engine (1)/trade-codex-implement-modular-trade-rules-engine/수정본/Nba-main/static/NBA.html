@@ -296,15 +296,14 @@
             </div>
             <div class="prompt-tab-content" data-ptab-content="engine">
               <div class="prompt-mini-label">매치 엔진 (Python)</div>
-              <div class="prompt-mini-note">실제 실행은 서버의 <code>match_engine.py</code>를 사용합니다.</div>
+              <div class="prompt-mini-note">실제 실행은 서버의 <code>matchengine_v3</code>를 사용합니다.</div>
               <textarea id="matchEngineTextarea" placeholder="# 매치 엔진 관련 메모를 적어두는 용도입니다."></textarea>
             </div>
             <div class="prompt-tab-content" data-ptab-content="lore">
               <div class="prompt-mini-label">로스터 로어북</div>
-              <div class="prompt-mini-note">엑셀 로스터 파일은 서버 쪽에서 사용됩니다.</div>
-              <input type="file" id="lorebookFile" accept=".xlsx,.xls" style="font-size:0.75rem;margin-top:3px;" />
+              <div class="prompt-mini-note">로스터는 서버 DB에서 관리됩니다. (엑셀 업로드는 비활성화됨)</div>
               <div id="lorebookStatus" style="font-size:0.74rem;margin-top:4px;" class="muted">
-                아직 업로드된 파일이 없습니다.
+                현재 로스터는 DB에서 로드됩니다.
               </div>
             </div>
           </div>
