@@ -44,7 +44,8 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    with LeagueRepo(get_league_db_path()) as repo:
+    db_path = get_league_db_path()
+    with LeagueRepo(db_path) as repo:
         repo.init_db()
         for team_id, assets in deal.legs.items():
             for asset in assets:

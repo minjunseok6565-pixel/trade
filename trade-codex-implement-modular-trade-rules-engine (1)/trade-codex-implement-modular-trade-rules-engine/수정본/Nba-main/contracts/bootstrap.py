@@ -260,15 +260,13 @@ def bootstrap_contracts_from_roster_excel(
     skipped_contracts_for_fa = 0
     initial_free_agents: list[int] = []
     initial_free_agents_seen: set[int] = set()
-    has_team_column = "Team" in roster_df.columns
-
     for player_id in roster_df.index:
         pid = _resolve_player_id(player_id)
         if pid is None:
             non_int_roster_ids.append(player_id)
             continue
 
-        team_value = roster_df.at[player_id, "Team"] if has_team_column else None
+        team_value = roster_df.at[player_id, "Team"]
         if _is_blank(team_value) or (
             isinstance(team_value, str) and team_value.strip().upper() == "FA"
         ):
