@@ -179,7 +179,7 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
-        meta = GAME_STATE.get("teams", {}).get(tid, {})
+        info = TEAM_TO_CONF_DIV.get(tid, {})
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -187,12 +187,12 @@ def get_team_cards() -> List[Dict[str, Any]]:
         win_pct = wins / gp if gp else 0.0
         card = {
             "team_id": tid,
-            "conference": meta.get("conference"),
-            "division": meta.get("division"),
+            "conference": info.get("conference"),
+            "division": info.get("division"),
             "wins": wins,
             "losses": losses,
             "win_pct": win_pct,
-            "tendency": meta.get("tendency"),
+            "tendency": None,
             "payroll": _compute_team_payroll(tid),
             "cap_space": _compute_cap_space(tid),
         }
@@ -213,7 +213,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = GAME_STATE.get("teams", {}).get(tid, {})
+    info = TEAM_TO_CONF_DIV.get(tid, {})
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -226,15 +226,15 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
 
     summary = {
         "team_id": tid,
-        "conference": meta.get("conference"),
-        "division": meta.get("division"),
+        "conference": info.get("conference"),
+        "division": info.get("division"),
         "wins": wins,
         "losses": losses,
         "win_pct": win_pct,
         "point_diff": point_diff,
         "rank": rank_entry.get("rank"),
         "gb": rank_entry.get("gb"),
-        "tendency": meta.get("tendency"),
+        "tendency": None,
         "payroll": _compute_team_payroll(tid),
         "cap_space": _compute_cap_space(tid),
     }

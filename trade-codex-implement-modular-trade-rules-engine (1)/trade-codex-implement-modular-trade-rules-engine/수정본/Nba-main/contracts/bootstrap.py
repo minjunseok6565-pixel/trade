@@ -255,8 +255,6 @@ def bootstrap_contracts_from_roster_excel(
     salary_years.sort()
     used_salary_columns = [f"Salary_{year}" for year in salary_years]
 
-    players = game_state.get("players", {})
-    missing_players = []
     non_int_roster_ids = []
     created = 0
     skipped_contracts_for_fa = 0
@@ -269,24 +267,18 @@ def bootstrap_contracts_from_roster_excel(
         if pid is None:
             non_int_roster_ids.append(player_id)
             continue
-        if pid not in players:
-            missing_players.append(player_id)
-            continue
 
-        is_free_agent = False
-        if has_team_column:
-            team_value = roster_df.at[player_id, "Team"]
-            if _is_blank(team_value):
-                is_free_agent = True
-            elif isinstance(team_value, str) and team_value.strip().upper() == "FA":
-                is_free_agent = True
-        if is_free_agent:
-            players[pid]["team_id"] = ""
+        team_value = roster_df.at[player_id, "Team"] if has_team_column else None
+        if _is_blank(team_value) or (
+            isinstance(team_value, str) and team_value.strip().upper() == "FA"
+        ):
+            team_id = ""
             if pid not in initial_free_agents_seen:
                 initial_free_agents.append(pid)
                 initial_free_agents_seen.add(pid)
             skipped_contracts_for_fa += 1
             continue
+        team_id = str(normalize_team_id(team_value, strict=True))
 
         start_season_year = None
         if "ContractStartSeasonYear" in roster_df.columns:
@@ -353,12 +345,6 @@ def bootstrap_contracts_from_roster_excel(
                 }
             )
 
-        team_id = players[pid].get("team_id")
-        if isinstance(team_id, str):
-            team_id = team_id.upper()
-        else:
-            team_id = ""
-
         signed_date_iso = None
         if "SignedDate" in roster_df.columns:
             signed_date_iso = _parse_iso_date(roster_df.at[player_id, "SignedDate"])
@@ -386,15 +372,6 @@ def bootstrap_contracts_from_roster_excel(
             contract_id
         )
 
-        if "SignedViaFreeAgency" in roster_df.columns:
-            signed_via_free_agency = _parse_bool_like(
-                roster_df.at[player_id, "SignedViaFreeAgency"]
-            )
-            if signed_via_free_agency is not None:
-                players[pid]["signed_via_free_agency"] = signed_via_free_agency
-        if "SignedDate" in roster_df.columns:
-            players[pid]["signed_date"] = signed_date_iso
-
         created += 1
 
     game_state["free_agents"] = list(initial_free_agents)
@@ -402,7 +379,7 @@ def bootstrap_contracts_from_roster_excel(
     return {
         "skipped": False,
         "created": created,
-        "missing_players": missing_players,
+        "missing_players": [],
         "non_int_roster_ids": non_int_roster_ids,
         "used_salary_columns": used_salary_columns,
         "initial_free_agents": list(initial_free_agents),
