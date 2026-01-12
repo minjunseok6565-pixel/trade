@@ -6,16 +6,38 @@ from typing import Any, Dict, Optional
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE
+from state import GAME_STATE, get_league_db_path
 
 from .errors import APPLY_FAILED, TradeError
-from .models import Deal, PlayerAsset
+from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
 from .transaction_log import append_trade_transaction
 
 
 @dataclass(frozen=True)
 class _PlayerMove:
     player_id: str
+    from_team: str
+    to_team: str
+
+
+@dataclass(frozen=True)
+class _PickMove:
+    pick_id: str
+    from_team: str
+    to_team: str
+    protection: Optional[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _SwapMove:
+    swap_id: str
+    from_team: str
+    to_team: str
+
+
+@dataclass(frozen=True)
+class _FixedAssetMove:
+    asset_id: str
     from_team: str
     to_team: str
 
@@ -28,14 +50,6 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
         if other_team:
             return other_team[0]
     raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
-
-
-def _get_db_path(game_state: dict) -> str:
-    league_state = game_state.get("league") or {}
-    db_path = league_state.get("db_path")
-    if not db_path:
-        raise ValueError("game_state['league']['db_path'] is required to apply trades")
-    return db_path
 
 
 def _normalize_player_id_str(value: Any) -> str:
@@ -63,6 +77,64 @@ def _collect_player_moves(deal: Deal) -> list[_PlayerMove]:
             moves.append(
                 _PlayerMove(
                     player_id=player_id,
+                    from_team=normalized_from_team,
+                    to_team=normalized_to_team,
+                )
+            )
+    return moves
+
+
+def _collect_pick_moves(deal: Deal) -> list[_PickMove]:
+    moves: list[_PickMove] = []
+    for from_team, assets in deal.legs.items():
+        normalized_from_team = _normalize_team_id_str(from_team)
+        for asset in assets:
+            if not isinstance(asset, PickAsset):
+                continue
+            to_team = _resolve_receiver(deal, normalized_from_team, asset)
+            normalized_to_team = _normalize_team_id_str(to_team)
+            moves.append(
+                _PickMove(
+                    pick_id=str(asset.pick_id),
+                    from_team=normalized_from_team,
+                    to_team=normalized_to_team,
+                    protection=asset.protection,
+                )
+            )
+    return moves
+
+
+def _collect_swap_moves(deal: Deal) -> list[_SwapMove]:
+    moves: list[_SwapMove] = []
+    for from_team, assets in deal.legs.items():
+        normalized_from_team = _normalize_team_id_str(from_team)
+        for asset in assets:
+            if not isinstance(asset, SwapAsset):
+                continue
+            to_team = _resolve_receiver(deal, normalized_from_team, asset)
+            normalized_to_team = _normalize_team_id_str(to_team)
+            moves.append(
+                _SwapMove(
+                    swap_id=str(asset.swap_id),
+                    from_team=normalized_from_team,
+                    to_team=normalized_to_team,
+                )
+            )
+    return moves
+
+
+def _collect_fixed_asset_moves(deal: Deal) -> list[_FixedAssetMove]:
+    moves: list[_FixedAssetMove] = []
+    for from_team, assets in deal.legs.items():
+        normalized_from_team = _normalize_team_id_str(from_team)
+        for asset in assets:
+            if not isinstance(asset, FixedAsset):
+                continue
+            to_team = _resolve_receiver(deal, normalized_from_team, asset)
+            normalized_to_team = _normalize_team_id_str(to_team)
+            moves.append(
+                _FixedAssetMove(
+                    asset_id=str(asset.asset_id),
                     from_team=normalized_from_team,
                     to_team=normalized_to_team,
                 )
@@ -103,9 +175,12 @@ def apply_deal(
             raise TypeError("apply_deal requires a Deal")
 
     player_moves = _collect_player_moves(deal)
+    pick_moves = _collect_pick_moves(deal)
+    swap_moves = _collect_swap_moves(deal)
+    fixed_asset_moves = _collect_fixed_asset_moves(deal)
 
     try:
-        db_path = _get_db_path(game_state)
+        db_path = get_league_db_path(game_state)
 
         with LeagueRepo(db_path) as repo:
             repo.init_db()
@@ -114,10 +189,21 @@ def apply_deal(
                 return {
                     "dry_run": True,
                     "player_moves": [move.__dict__ for move in player_moves],
+                    "pick_moves": [move.__dict__ for move in pick_moves],
+                    "swap_moves": [move.__dict__ for move in swap_moves],
+                    "fixed_asset_moves": [move.__dict__ for move in fixed_asset_moves],
                 }
-            with repo.transaction():
+            with repo.transaction() as cur:
                 for move in player_moves:
-                    repo.trade_player(move.player_id, move.to_team)
+                    repo.trade_player(move.player_id, move.to_team, cursor=cur)
+                for move in pick_moves:
+                    repo.update_pick_owner(move.pick_id, move.to_team, cursor=cur)
+                    if move.protection is not None:
+                        repo.set_pick_protection(move.pick_id, move.protection, cursor=cur)
+                for move in swap_moves:
+                    repo.update_swap_owner(move.swap_id, move.to_team, cursor=cur)
+                for move in fixed_asset_moves:
+                    repo.update_fixed_asset_owner(move.asset_id, move.to_team, cursor=cur)
             repo.validate_integrity()
 
         transaction = append_trade_transaction(deal, source=source, deal_id=deal_id)

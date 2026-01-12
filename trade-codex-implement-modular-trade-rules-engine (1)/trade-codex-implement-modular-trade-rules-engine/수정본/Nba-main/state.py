@@ -129,6 +129,17 @@ def get_current_date() -> Optional[str]:
     return None
 
 
+def get_league_db_path(game_state: Optional[dict] = None) -> str:
+    if game_state is None or game_state is GAME_STATE:
+        league = _ensure_league_state()
+        return str(league.get("db_path"))
+    league_state = game_state.get("league") or {}
+    db_path = league_state.get("db_path")
+    if not db_path:
+        raise ValueError("game_state['league']['db_path'] is required")
+    return str(db_path)
+
+
 def get_current_date_as_date() -> date:
     """Return the league's current in-game date as a date object."""
     current = get_current_date()

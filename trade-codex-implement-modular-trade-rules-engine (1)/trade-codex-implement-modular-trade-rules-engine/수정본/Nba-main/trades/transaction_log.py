@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Dict, Optional
 
 from league_repo import LeagueRepo
-from state import get_current_date, get_current_date_as_date
+from state import get_current_date, get_current_date_as_date, get_league_db_path
 
 from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
 
@@ -65,7 +64,7 @@ def append_trade_transaction(
     if extra_meta:
         entry["meta"] = dict(extra_meta)
 
-    db_path = os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = get_league_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:

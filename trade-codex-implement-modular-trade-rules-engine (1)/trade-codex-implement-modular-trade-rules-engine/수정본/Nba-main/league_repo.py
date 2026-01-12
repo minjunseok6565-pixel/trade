@@ -742,6 +742,13 @@ class LeagueRepo:
             (str(owner_team).upper(), str(pick_id)),
         )
 
+    def update_swap_owner(self, swap_id: str, owner_team: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE swap_rights SET owner_team=? WHERE swap_id=?;",
+            (str(owner_team).upper(), str(swap_id)),
+        )
+
     def set_pick_protection(self, pick_id: str, protection: Optional[Dict[str, Any]], *, cursor=None) -> None:
         protection_json = json.dumps(protection) if protection is not None else None
         cur = cursor or self._conn
@@ -857,6 +864,13 @@ class LeagueRepo:
             ),
         )
 
+    def update_fixed_asset_owner(self, asset_id: str, owner_team: str, *, cursor=None) -> None:
+        cur = cursor or self._conn
+        cur.execute(
+            "UPDATE fixed_assets SET owner_team=? WHERE asset_id=?;",
+            (str(owner_team).upper(), str(asset_id)),
+        )
+
     def list_fixed_assets_by_owner(self, owner_team: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             """
@@ -881,13 +895,26 @@ class LeagueRepo:
 
     def lock_asset(self, asset_key_value: str, deal_id: str, expires_at: str, *, cursor=None) -> None:
         cur = cursor or self._conn
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO asset_locks(asset_key, deal_id, expires_at)
-            VALUES (?, ?, ?);
-            """,
-            (str(asset_key_value), str(deal_id), str(expires_at)),
-        )
+        existing = cur.execute(
+            "SELECT deal_id FROM asset_locks WHERE asset_key=?;",
+            (str(asset_key_value),),
+        ).fetchone()
+        if not existing:
+            cur.execute(
+                """
+                INSERT INTO asset_locks(asset_key, deal_id, expires_at)
+                VALUES (?, ?, ?);
+                """,
+                (str(asset_key_value), str(deal_id), str(expires_at)),
+            )
+            return
+        if str(existing["deal_id"]) == str(deal_id):
+            cur.execute(
+                "UPDATE asset_locks SET expires_at=? WHERE asset_key=?;",
+                (str(expires_at), str(asset_key_value)),
+            )
+            return
+        raise ValueError("Asset lock already held by another deal")
 
     def update_asset_lock_expires(self, asset_key_value: str, expires_at: str, *, cursor=None) -> None:
         cur = cursor or self._conn
@@ -1124,15 +1151,39 @@ class LeagueRepo:
     # Writes (Roster operations)
     # ------------------------
 
-    def trade_player(self, player_id: str, to_team_id: str) -> None:
+    def trade_player(self, player_id: str, to_team_id: str, *, cursor=None) -> None:
         """Move player to another team."""
         pid = normalize_player_id(player_id, strict=False)
         to_tid = normalize_team_id(to_team_id, strict=True)
         now = _utc_now_iso()
 
+        if cursor is not None:
+            cur = cursor
+            # Must exist in roster
+            exists = cur.execute(
+                "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
+                (str(pid),),
+            ).fetchone()
+            if not exists:
+                raise KeyError(f"active roster entry not found for player_id={player_id}")
+
+            cur.execute(
+                "UPDATE roster SET team_id=?, updated_at=? WHERE player_id=?;",
+                (str(to_tid), now, str(pid)),
+            )
+            # If there's an active contract, update team_id too (optional, but helps consistency)
+            cur.execute(
+                "UPDATE contracts SET team_id=?, updated_at=? WHERE player_id=? AND is_active=1;",
+                (str(to_tid), now, str(pid)),
+            )
+            return
+
         with self.transaction() as cur:
             # Must exist in roster
-            exists = cur.execute("SELECT team_id FROM roster WHERE player_id=? AND status='active';", (str(pid),)).fetchone()
+            exists = cur.execute(
+                "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
+                (str(pid),),
+            ).fetchone()
             if not exists:
                 raise KeyError(f"active roster entry not found for player_id={player_id}")
 
