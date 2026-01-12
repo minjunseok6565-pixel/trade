@@ -48,6 +48,10 @@ try:
         assert_unique_ids,
         ROSTER_COL_PLAYER_ID,
         ROSTER_COL_TEAM_ID,
+        make_player_id_seq,
+        normalize_pick_id,
+        parse_pick_id,
+        compute_swap_pair_key,
     )
 except Exception as e:  # pragma: no cover
     raise ImportError(
@@ -189,62 +193,34 @@ class LeagueRepo:
     # ------------------------
 
     def init_db(self) -> None:
-        """Create tables if they don't exist."""
-        now = _utc_now_iso()
-        with self.transaction() as cur:
-            cur.executescript(
-                f"""
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
+        """Create tables if they don't exist and run schema migrations."""
+        from db_migrations import (
+            migrate_db_schema,
+            _ensure_meta_schema_version,
+            LATEST_DB_SCHEMA_VERSION,
+            get_user_version,
+        )
 
-                INSERT INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-                INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', '{now}');
+        with self.transaction():
+            migrate_db_schema(self._conn)
+            _ensure_meta_schema_version(self._conn, get_user_version(self._conn))
 
-                CREATE TABLE IF NOT EXISTS players (
-                    player_id TEXT PRIMARY KEY,
-                    name TEXT,
-                    pos TEXT,
-                    age INTEGER,
-                    height_in INTEGER,
-                    weight_lb INTEGER,
-                    ovr INTEGER,
-                    attrs_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS roster (
-                    player_id TEXT PRIMARY KEY,
-                    team_id TEXT NOT NULL,
-                    salary_amount INTEGER,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_roster_team_id ON roster(team_id);
-
-                CREATE TABLE IF NOT EXISTS contracts (
-                    contract_id TEXT PRIMARY KEY,
-                    player_id TEXT NOT NULL,
-                    team_id TEXT NOT NULL,
-                    start_season_id TEXT,
-                    end_season_id TEXT,
-                    salary_by_season_json TEXT,
-                    contract_type TEXT,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_contracts_player_id ON contracts(player_id);
-                CREATE INDEX IF NOT EXISTS idx_contracts_team_id ON contracts(team_id);
-                """
+        current_version = get_user_version(self._conn)
+        if current_version != LATEST_DB_SCHEMA_VERSION:
+            raise ValueError(
+                f"DB user_version {current_version} != expected {LATEST_DB_SCHEMA_VERSION}"
             )
+
+    def canonicalize_player_id(self, raw_player_id: Any, *, allow_legacy_ids: bool) -> str:
+        """Normalize player_id and optionally convert legacy numeric IDs to canonical."""
+        try:
+            return str(normalize_player_id(raw_player_id, strict=True))
+        except ValueError as exc:
+            if allow_legacy_ids:
+                text = str(raw_player_id).strip()
+                if text.isdigit():
+                    return str(make_player_id_seq(int(text)))
+            raise ValueError(f"invalid player_id '{raw_player_id}'") from exc
 
     # ------------------------
     # Import / Export (Excel)
@@ -279,11 +255,17 @@ class LeagueRepo:
         df[ROSTER_COL_TEAM_ID] = df[ROSTER_COL_TEAM_ID].astype(str).str.strip()
         df[ROSTER_COL_PLAYER_ID] = df[ROSTER_COL_PLAYER_ID].astype(str).str.strip()
 
-        # Validate uniqueness of player_id inside this file
-        assert_unique_ids(df[ROSTER_COL_PLAYER_ID].tolist(), what="player_id (in Excel)")
+        allow_legacy_ids = not strict_ids
+        canonical_player_ids = [
+            self.canonicalize_player_id(pid, allow_legacy_ids=allow_legacy_ids)
+            for pid in df[ROSTER_COL_PLAYER_ID].tolist()
+        ]
+        # Validate uniqueness of player_id inside this file (canonicalized)
+        assert_unique_ids(canonical_player_ids, what="player_id (in Excel)")
 
         players: List[PlayerRow] = []
         roster: List[RosterRow] = []
+        team_ids: set[str] = set()
 
         # Columns we treat as "core" (not attributes)
         core_cols = {
@@ -301,8 +283,9 @@ class LeagueRepo:
             raw_pid = row.get(ROSTER_COL_PLAYER_ID)
             raw_tid = row.get(ROSTER_COL_TEAM_ID)
 
-            pid = normalize_player_id(raw_pid, strict=strict_ids, allow_legacy_numeric=not strict_ids)
+            pid = self.canonicalize_player_id(raw_pid, allow_legacy_ids=allow_legacy_ids)
             tid = normalize_team_id(raw_tid, strict=True)
+            team_ids.add(str(tid))
 
             # pick best name/pos column
             name = row.get("name", None)
@@ -409,6 +392,15 @@ class LeagueRepo:
                 """,
                 [(p.player_id, p.name, p.pos, p.age, p.height_in, p.weight_lb, p.ovr, p.attrs_json, now, now) for p in players],
             )
+
+            for tid in sorted(team_ids):
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO teams(team_id, name, attrs_json, created_at, updated_at)
+                    VALUES (?, NULL, '{}', ?, ?);
+                    """,
+                    (tid, now, now),
+                )
 
             # Upsert roster
             cur.executemany(
@@ -529,8 +521,442 @@ class LeagueRepo:
         return {str(r["player_id"]) for r in rows}
 
     def list_teams(self) -> List[str]:
-        rows = self._conn.execute("SELECT DISTINCT team_id FROM roster WHERE status='active' ORDER BY team_id;").fetchall()
-        return [r["team_id"] for r in rows]
+        rows = self._conn.execute(
+            "SELECT team_id FROM teams ORDER BY team_id;"
+        ).fetchall()
+        return [str(r["team_id"]) for r in rows]
+
+    def upsert_team(
+        self,
+        team_id: str,
+        *,
+        name: Optional[str] = None,
+        attrs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        tid = normalize_team_id(team_id, strict=True)
+        now = _utc_now_iso()
+        attrs_json = json.dumps(attrs or {}, ensure_ascii=False, separators=(",", ":"))
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO teams(team_id, name, attrs_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(team_id) DO UPDATE SET
+                    name=excluded.name,
+                    attrs_json=excluded.attrs_json,
+                    updated_at=excluded.updated_at;
+                """,
+                (str(tid), name, attrs_json, now, now),
+            )
+
+    def ensure_team_exists(self, team_id: str) -> None:
+        tid = normalize_team_id(team_id, strict=True)
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO teams(team_id, name, attrs_json, created_at, updated_at)
+                VALUES (?, NULL, '{}', ?, ?);
+                """,
+                (str(tid), now, now),
+            )
+
+    def backfill_teams_from_roster(self) -> None:
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO teams(team_id, name, attrs_json, created_at, updated_at)
+                SELECT DISTINCT team_id, NULL, '{}', ?, ?
+                FROM roster
+                WHERE team_id IS NOT NULL AND TRIM(team_id) != '';
+                """,
+                (now, now),
+            )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO teams(team_id, name, attrs_json, created_at, updated_at)
+                VALUES ('FA', 'Free Agent', '{}', ?, ?);
+                """,
+                (now, now),
+            )
+
+    # ------------------------
+    # Draft picks / swaps / fixed assets
+    # ------------------------
+
+    def _pick_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        data["protection"] = (
+            json.loads(data["protection_json"]) if data.get("protection_json") else None
+        )
+        return data
+
+    def _normalize_pick_protection(self, protection: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(protection, dict):
+            raise ValueError("protection must be a dict")
+        protection_type = protection.get("type", protection.get("rule"))
+        if not isinstance(protection_type, str):
+            raise ValueError("protection type is required")
+        protection_type = protection_type.strip().upper()
+        if protection_type != "TOP_N":
+            raise ValueError("unsupported protection type")
+        raw_n = protection.get("n")
+        try:
+            n_value = int(raw_n)
+        except (TypeError, ValueError):
+            raise ValueError("protection n must be an integer")
+        if n_value < 1 or n_value > 30:
+            raise ValueError("protection n out of range")
+        normalized = {"type": protection_type, "n": n_value}
+        compensation = protection.get("compensation")
+        if compensation is not None:
+            if not isinstance(compensation, dict):
+                raise ValueError("protection compensation must be an object")
+            value = compensation.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("protection compensation value must be numeric")
+            label = compensation.get("label")
+            if not isinstance(label, str) or not label.strip():
+                label = "Protected pick compensation"
+            normalized["compensation"] = {"label": str(label), "value": value}
+        return normalized
+
+    def ensure_draft_picks(
+        self,
+        draft_year: int,
+        *,
+        years_ahead: int = 7,
+        team_ids: Optional[List[str]] = None,
+    ) -> int:
+        if not isinstance(draft_year, int):
+            raise ValueError("draft_year must be an int")
+        if years_ahead < 0:
+            raise ValueError("years_ahead must be >= 0")
+
+        if team_ids is None:
+            team_ids = [tid for tid in self.list_teams() if tid != "FA"]
+        normalized_team_ids = [
+            str(normalize_team_id(tid, strict=True)) for tid in team_ids if tid != "FA"
+        ]
+
+        now = _utc_now_iso()
+        created = 0
+        with self.transaction() as cur:
+            for year in range(draft_year, draft_year + years_ahead + 1):
+                for round_value in (1, 2):
+                    for team_id in normalized_team_ids:
+                        pick_id = f"{year}_R{round_value}_{team_id}"
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO draft_picks(
+                                pick_id,
+                                year,
+                                round,
+                                original_team_id,
+                                owner_team_id,
+                                protection_json,
+                                created_at,
+                                updated_at
+                            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?);
+                            """,
+                            (pick_id, year, round_value, team_id, team_id, now, now),
+                        )
+                        if cur.rowcount > 0:
+                            created += 1
+        return created
+
+    def get_pick(self, pick_id: str) -> Dict[str, Any]:
+        pid = normalize_pick_id(pick_id, strict=True)
+        row = self._conn.execute(
+            "SELECT * FROM draft_picks WHERE pick_id=?;",
+            (str(pid),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"pick not found: {pick_id}")
+        return self._pick_row_to_dict(row)
+
+    def list_picks_by_owner(
+        self,
+        team_id: str,
+        *,
+        year: Optional[int] = None,
+        round: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        tid = normalize_team_id(team_id, strict=True)
+        clauses = ["owner_team_id=?"]
+        params: List[Any] = [str(tid)]
+        if year is not None:
+            clauses.append("year=?")
+            params.append(int(year))
+        if round is not None:
+            clauses.append("round=?")
+            params.append(int(round))
+        where = " AND ".join(clauses)
+        rows = self._conn.execute(
+            f"SELECT * FROM draft_picks WHERE {where} ORDER BY year, round, pick_id;",
+            tuple(params),
+        ).fetchall()
+        return [self._pick_row_to_dict(row) for row in rows]
+
+    def transfer_pick(self, pick_id: str, from_team_id: str, to_team_id: str) -> None:
+        pid = normalize_pick_id(pick_id, strict=True)
+        from_tid = normalize_team_id(from_team_id, strict=True)
+        to_tid = normalize_team_id(to_team_id, strict=True)
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT owner_team_id FROM draft_picks WHERE pick_id=?;",
+                (str(pid),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"pick not found: {pick_id}")
+            owner = str(row["owner_team_id"])
+            if owner != str(from_tid):
+                raise ValueError(
+                    f"pick {pick_id} not owned by {from_tid} (current: {owner})"
+                )
+            cur.execute(
+                """
+                UPDATE draft_picks
+                SET owner_team_id=?, updated_at=?
+                WHERE pick_id=?;
+                """,
+                (str(to_tid), now, str(pid)),
+            )
+
+    def set_pick_protection(self, pick_id: str, protection: Optional[Dict[str, Any]]) -> None:
+        pid = normalize_pick_id(pick_id, strict=True)
+        now = _utc_now_iso()
+        if protection is None:
+            payload = None
+        else:
+            payload = self._normalize_pick_protection(protection)
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT 1 FROM draft_picks WHERE pick_id=?;",
+                (str(pid),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"pick not found: {pick_id}")
+            cur.execute(
+                """
+                UPDATE draft_picks
+                SET protection_json=?, updated_at=?
+                WHERE pick_id=?;
+                """,
+                (payload_json, now, str(pid)),
+            )
+
+    def upsert_swap_right(
+        self,
+        swap_id: str,
+        pick_id_a: str,
+        pick_id_b: str,
+        owner_team_id: str,
+        *,
+        active: bool = True,
+        created_by_deal_id: Optional[str] = None,
+    ) -> None:
+        pid_a = normalize_pick_id(pick_id_a, strict=True)
+        pid_b = normalize_pick_id(pick_id_b, strict=True)
+        owner_tid = normalize_team_id(owner_team_id, strict=True)
+        year_a, round_a, _ = parse_pick_id(pid_a)
+        year_b, round_b, _ = parse_pick_id(pid_b)
+        if year_a != year_b or round_a != round_b:
+            raise ValueError("swap picks must share the same year and round")
+
+        pick_pair_key = compute_swap_pair_key(pid_a, pid_b)
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            for pid in (pid_a, pid_b):
+                row = cur.execute(
+                    "SELECT 1 FROM draft_picks WHERE pick_id=?;",
+                    (str(pid),),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"pick not found: {pid}")
+            cur.execute(
+                """
+                INSERT INTO swap_rights(
+                    swap_id,
+                    pick_id_a,
+                    pick_id_b,
+                    year,
+                    round,
+                    owner_team_id,
+                    active,
+                    created_by_deal_id,
+                    pick_pair_key,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(swap_id) DO UPDATE SET
+                    pick_id_a=excluded.pick_id_a,
+                    pick_id_b=excluded.pick_id_b,
+                    year=excluded.year,
+                    round=excluded.round,
+                    owner_team_id=excluded.owner_team_id,
+                    active=excluded.active,
+                    created_by_deal_id=excluded.created_by_deal_id,
+                    pick_pair_key=excluded.pick_pair_key,
+                    updated_at=excluded.updated_at;
+                """,
+                (
+                    str(swap_id),
+                    str(pid_a),
+                    str(pid_b),
+                    year_a,
+                    round_a,
+                    str(owner_tid),
+                    1 if active else 0,
+                    created_by_deal_id,
+                    pick_pair_key,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_swap_right(self, swap_id: str) -> Dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM swap_rights WHERE swap_id=?;",
+            (str(swap_id),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"swap right not found: {swap_id}")
+        return dict(row)
+
+    def transfer_swap_right(self, swap_id: str, from_team_id: str, to_team_id: str) -> None:
+        from_tid = normalize_team_id(from_team_id, strict=True)
+        to_tid = normalize_team_id(to_team_id, strict=True)
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT owner_team_id FROM swap_rights WHERE swap_id=?;",
+                (str(swap_id),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"swap right not found: {swap_id}")
+            owner = str(row["owner_team_id"])
+            if owner != str(from_tid):
+                raise ValueError(
+                    f"swap right {swap_id} not owned by {from_tid} (current: {owner})"
+                )
+            cur.execute(
+                """
+                UPDATE swap_rights
+                SET owner_team_id=?, updated_at=?
+                WHERE swap_id=?;
+                """,
+                (str(to_tid), now, str(swap_id)),
+            )
+
+    def deactivate_swap_right(self, swap_id: str) -> None:
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT 1 FROM swap_rights WHERE swap_id=?;",
+                (str(swap_id),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"swap right not found: {swap_id}")
+            cur.execute(
+                """
+                UPDATE swap_rights
+                SET active=0, updated_at=?
+                WHERE swap_id=?;
+                """,
+                (now, str(swap_id)),
+            )
+
+    def create_fixed_asset(
+        self,
+        asset_id: str,
+        *,
+        label: str,
+        value: float,
+        owner_team_id: str,
+        source_pick_id: Optional[str] = None,
+        draft_year: Optional[int] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        owner_tid = normalize_team_id(owner_team_id, strict=True)
+        source_pid = (
+            normalize_pick_id(source_pick_id, strict=True) if source_pick_id else None
+        )
+        meta_json = json.dumps(meta or {}, ensure_ascii=False, separators=(",", ":"))
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            if source_pid:
+                row = cur.execute(
+                    "SELECT 1 FROM draft_picks WHERE pick_id=?;",
+                    (str(source_pid),),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"pick not found: {source_pid}")
+            cur.execute(
+                """
+                INSERT INTO fixed_assets(
+                    asset_id,
+                    label,
+                    value,
+                    owner_team_id,
+                    source_pick_id,
+                    draft_year,
+                    meta_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    str(asset_id),
+                    str(label),
+                    float(value),
+                    str(owner_tid),
+                    str(source_pid) if source_pid else None,
+                    int(draft_year) if draft_year is not None else None,
+                    meta_json,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_fixed_asset(self, asset_id: str) -> Dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM fixed_assets WHERE asset_id=?;",
+            (str(asset_id),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"fixed asset not found: {asset_id}")
+        data = dict(row)
+        data["meta"] = json.loads(data["meta_json"]) if data.get("meta_json") else {}
+        return data
+
+    def transfer_fixed_asset(self, asset_id: str, from_team_id: str, to_team_id: str) -> None:
+        from_tid = normalize_team_id(from_team_id, strict=True)
+        to_tid = normalize_team_id(to_team_id, strict=True)
+        now = _utc_now_iso()
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT owner_team_id FROM fixed_assets WHERE asset_id=?;",
+                (str(asset_id),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"fixed asset not found: {asset_id}")
+            owner = str(row["owner_team_id"])
+            if owner != str(from_tid):
+                raise ValueError(
+                    f"fixed asset {asset_id} not owned by {from_tid} (current: {owner})"
+                )
+            cur.execute(
+                """
+                UPDATE fixed_assets
+                SET owner_team_id=?, updated_at=?
+                WHERE asset_id=?;
+                """,
+                (str(to_tid), now, str(asset_id)),
+            )
 
     # ------------------------
     # Writes (Roster operations)
@@ -580,6 +1006,14 @@ class LeagueRepo:
         Fail fast on ID split / missing rows / invalid team codes.
         Run this after imports and after any batch roster changes.
         """
+        from db_migrations import LATEST_DB_SCHEMA_VERSION, get_user_version
+
+        current_version = get_user_version(self._conn)
+        if current_version != LATEST_DB_SCHEMA_VERSION:
+            raise ValueError(
+                f"DB user_version {current_version} != expected {LATEST_DB_SCHEMA_VERSION}"
+            )
+
         # schema version check
         row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version';").fetchone()
         if not row:
@@ -592,6 +1026,11 @@ class LeagueRepo:
             rows = self._conn.execute("SELECT player_id FROM players;").fetchall()
             for r in rows:
                 normalize_player_id(r["player_id"], strict=True)
+        else:
+            rows = self._conn.execute("SELECT player_id FROM players;").fetchall()
+            for r in rows:
+                if not str(r["player_id"]).strip():
+                    raise ValueError("players table has empty player_id")
 
         # roster must reference existing players (FK enforces, but keep explicit check)
         bad = self._conn.execute(
@@ -605,15 +1044,164 @@ class LeagueRepo:
         if bad:
             raise ValueError(f"roster has player_ids missing in players: {[x['player_id'] for x in bad]}")
 
+        empty_roster = self._conn.execute(
+            "SELECT player_id FROM roster WHERE player_id IS NULL OR TRIM(player_id) = '';"
+        ).fetchall()
+        if empty_roster:
+            raise ValueError("roster has empty player_id values")
+
         # team_id normalization check
         rows = self._conn.execute("SELECT DISTINCT team_id FROM roster WHERE status='active';").fetchall()
         for r in rows:
             normalize_team_id(r["team_id"], strict=True)
 
+        fa_row = self._conn.execute(
+            "SELECT team_id FROM teams WHERE team_id='FA';"
+        ).fetchone()
+        if not fa_row:
+            raise ValueError("teams table missing 'FA' entry")
+
+        missing_team_links = self._conn.execute(
+            """
+            SELECT r.team_id
+            FROM roster r
+            LEFT JOIN teams t ON t.team_id = r.team_id
+            WHERE r.team_id IS NOT NULL AND t.team_id IS NULL;
+            """
+        ).fetchall()
+        if missing_team_links:
+            raise ValueError(
+                f"roster references missing teams: {[row['team_id'] for row in missing_team_links]}"
+            )
+
+        missing_pick_owners = self._conn.execute(
+            """
+            SELECT owner_team_id FROM draft_picks dp
+            LEFT JOIN teams t ON t.team_id = dp.owner_team_id
+            WHERE t.team_id IS NULL;
+            """
+        ).fetchall()
+        if missing_pick_owners:
+            raise ValueError(
+                f"draft_picks references missing owner teams: {[row['owner_team_id'] for row in missing_pick_owners]}"
+            )
+
+        missing_pick_originals = self._conn.execute(
+            """
+            SELECT original_team_id FROM draft_picks dp
+            LEFT JOIN teams t ON t.team_id = dp.original_team_id
+            WHERE t.team_id IS NULL;
+            """
+        ).fetchall()
+        if missing_pick_originals:
+            raise ValueError(
+                "draft_picks references missing original teams: "
+                f"{[row['original_team_id'] for row in missing_pick_originals]}"
+            )
+
+        missing_swap_picks = self._conn.execute(
+            """
+            SELECT sr.swap_id
+            FROM swap_rights sr
+            LEFT JOIN draft_picks pa ON pa.pick_id = sr.pick_id_a
+            LEFT JOIN draft_picks pb ON pb.pick_id = sr.pick_id_b
+            WHERE pa.pick_id IS NULL OR pb.pick_id IS NULL;
+            """
+        ).fetchall()
+        if missing_swap_picks:
+            raise ValueError(
+                f"swap_rights references missing picks: {[row['swap_id'] for row in missing_swap_picks]}"
+            )
+
+        missing_swap_owners = self._conn.execute(
+            """
+            SELECT sr.owner_team_id
+            FROM swap_rights sr
+            LEFT JOIN teams t ON t.team_id = sr.owner_team_id
+            WHERE t.team_id IS NULL;
+            """
+        ).fetchall()
+        if missing_swap_owners:
+            raise ValueError(
+                f"swap_rights references missing owner teams: {[row['owner_team_id'] for row in missing_swap_owners]}"
+            )
+
+        mismatched_swaps = self._conn.execute(
+            """
+            SELECT sr.swap_id
+            FROM swap_rights sr
+            JOIN draft_picks pa ON pa.pick_id = sr.pick_id_a
+            JOIN draft_picks pb ON pb.pick_id = sr.pick_id_b
+            WHERE pa.year != pb.year
+               OR pa.round != pb.round
+               OR pa.year != sr.year
+               OR pa.round != sr.round;
+            """
+        ).fetchall()
+        if mismatched_swaps:
+            raise ValueError(
+                f"swap_rights has mismatched pick year/round: {[row['swap_id'] for row in mismatched_swaps]}"
+            )
+
+        duplicate_swap_pairs = self._conn.execute(
+            """
+            SELECT pick_pair_key
+            FROM swap_rights
+            GROUP BY pick_pair_key
+            HAVING COUNT(*) > 1;
+            """
+        ).fetchall()
+        if duplicate_swap_pairs:
+            raise ValueError(
+                "swap_rights has duplicate pick_pair_key values: "
+                f"{[row['pick_pair_key'] for row in duplicate_swap_pairs]}"
+            )
+
+        missing_fixed_owner = self._conn.execute(
+            """
+            SELECT fa.asset_id
+            FROM fixed_assets fa
+            LEFT JOIN teams t ON t.team_id = fa.owner_team_id
+            WHERE t.team_id IS NULL;
+            """
+        ).fetchall()
+        if missing_fixed_owner:
+            raise ValueError(
+                f"fixed_assets references missing owner teams: {[row['asset_id'] for row in missing_fixed_owner]}"
+            )
+
+        missing_fixed_pick = self._conn.execute(
+            """
+            SELECT fa.asset_id
+            FROM fixed_assets fa
+            LEFT JOIN draft_picks dp ON dp.pick_id = fa.source_pick_id
+            WHERE fa.source_pick_id IS NOT NULL AND dp.pick_id IS NULL;
+            """
+        ).fetchall()
+        if missing_fixed_pick:
+            raise ValueError(
+                f"fixed_assets references missing source picks: {[row['asset_id'] for row in missing_fixed_pick]}"
+            )
+
         # No duplicate active roster entries (PK ensures), but check status sanity
         rows = self._conn.execute("SELECT COUNT(*) AS c FROM roster WHERE status='active';").fetchone()
         if rows and rows["c"] <= 0:
             raise ValueError("no active roster entries found")
+
+        duplicate_contracts = self._conn.execute(
+            """
+            SELECT player_id, COUNT(*) AS c
+            FROM contracts
+            WHERE is_active=1
+            GROUP BY player_id
+            HAVING COUNT(*) > 1;
+            """
+        ).fetchall()
+        if duplicate_contracts:
+            offenders = [row["player_id"] for row in duplicate_contracts]
+            raise ValueError(
+                f"players with multiple active contracts: {offenders}"
+            )
 
     def _smoke_check(self) -> None:
         """

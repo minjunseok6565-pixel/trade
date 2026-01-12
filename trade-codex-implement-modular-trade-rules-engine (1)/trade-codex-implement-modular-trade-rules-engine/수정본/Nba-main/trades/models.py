@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from .errors import TradeError, DEAL_INVALIDATED, MISSING_TO_TEAM, PROTECTION_INVALID
-from schema import normalize_player_id, normalize_team_id
+from .errors import (
+    TradeError,
+    DEAL_INVALIDATED,
+    MISSING_TO_TEAM,
+    PROTECTION_INVALID,
+    INVALID_PLAYER_ID,
+    INVALID_INPUT,
+)
+from schema import normalize_player_id, normalize_team_id, make_player_id_seq
 
 
 @dataclass(frozen=True)
@@ -100,30 +107,50 @@ def _normalize_team_id(value: Any, *, context: str) -> str:
     try:
         return str(normalize_team_id(value, strict=True))
     except ValueError as exc:
-        raise ValueError(f"{context}: invalid team_id {value!r}") from exc
+        raise TradeError(
+            INVALID_INPUT,
+            f"{context}: invalid team_id",
+            {"value": value},
+        ) from exc
 
 
-def _normalize_player_id(value: Any, *, context: str) -> str:
+def _is_legacy_numeric(value: Any) -> bool:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value >= 0
+    if isinstance(value, float) and value.is_integer():
+        return value >= 0
+    if isinstance(value, str):
+        return value.strip().isdigit()
+    return False
+
+
+def _normalize_player_id(
+    value: Any,
+    *,
+    context: str,
+    allow_legacy_numeric: bool = False,
+) -> str:
     try:
         return str(normalize_player_id(value, strict=True))
     except ValueError as exc:
-        is_numeric = isinstance(value, str) and value.strip().isdigit()
-        is_legacy_int = isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        if is_numeric or is_legacy_int:
+        if allow_legacy_numeric and _is_legacy_numeric(value):
             try:
-                return str(
-                    normalize_player_id(
-                        str(value),
-                        strict=False,
-                        allow_legacy_numeric=True,
-                    )
-                )
-            except ValueError as legacy_exc:
-                raise ValueError(f"{context}: invalid player_id {value!r}") from legacy_exc
-        raise ValueError(f"{context}: invalid player_id {value!r}") from exc
+                numeric_value = int(float(value))
+            except (TypeError, ValueError):
+                raise TradeError(
+                    INVALID_PLAYER_ID,
+                    f"{context}: invalid player_id",
+                    {"value": value},
+                ) from exc
+            return str(make_player_id_seq(numeric_value))
+        raise TradeError(
+            INVALID_PLAYER_ID,
+            f"{context}: invalid player_id",
+            {"value": value},
+        ) from exc
 
 
-def _parse_asset(raw: Dict[str, Any]) -> Asset:
+def _parse_asset(raw: Dict[str, Any], *, allow_legacy_numeric: bool) -> Asset:
     kind = str(raw.get("kind", "")).lower()
     to_team = raw.get("to_team")
     to_team = _normalize_team_id(to_team, context="asset.to_team") if to_team else None
@@ -131,7 +158,11 @@ def _parse_asset(raw: Dict[str, Any]) -> Asset:
         player_id = raw.get("player_id")
         if player_id is None:
             raise TradeError(DEAL_INVALIDATED, "Missing player_id in asset", raw)
-        pid = _normalize_player_id(player_id, context="asset.player_id")
+        pid = _normalize_player_id(
+            player_id,
+            context="asset.player_id",
+            allow_legacy_numeric=allow_legacy_numeric,
+        )
         return PlayerAsset(kind="player", player_id=pid, to_team=to_team)
     if kind == "pick":
         pick_id = raw.get("pick_id")
@@ -174,7 +205,7 @@ def _parse_asset(raw: Dict[str, Any]) -> Asset:
     raise TradeError(DEAL_INVALIDATED, "Unknown asset kind", raw)
 
 
-def parse_deal(payload: Dict[str, Any]) -> Deal:
+def parse_deal(payload: Dict[str, Any], *, allow_legacy_numeric: bool = False) -> Deal:
     teams_raw = payload.get("teams")
     legs_raw = payload.get("legs")
     if not isinstance(teams_raw, list) or not isinstance(legs_raw, dict):
@@ -194,7 +225,10 @@ def parse_deal(payload: Dict[str, Any]) -> Deal:
         raw_assets = normalized_legs_raw.get(team_id) or []
         if not isinstance(raw_assets, list):
             raise TradeError(DEAL_INVALIDATED, f"Invalid legs for team {team_id}", payload)
-        legs[team_id] = [_parse_asset(asset) for asset in raw_assets]
+        legs[team_id] = [
+            _parse_asset(asset, allow_legacy_numeric=allow_legacy_numeric)
+            for asset in raw_assets
+        ]
 
     if len(teams) >= 3:
         for team_id, assets in legs.items():
@@ -227,8 +261,13 @@ def canonicalize_deal(deal: Deal) -> Deal:
                     if asset.to_team
                     else None
                 )
+                player_id = _normalize_player_id(
+                    asset.player_id,
+                    context="deal.asset.player_id",
+                    allow_legacy_numeric=False,
+                )
                 normalized_assets.append(
-                    PlayerAsset(kind=asset.kind, player_id=asset.player_id, to_team=to_team)
+                    PlayerAsset(kind=asset.kind, player_id=player_id, to_team=to_team)
                 )
             elif isinstance(asset, PickAsset):
                 to_team = (

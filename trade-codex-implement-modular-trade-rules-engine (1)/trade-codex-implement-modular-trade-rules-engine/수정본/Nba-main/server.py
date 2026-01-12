@@ -39,7 +39,7 @@ from team_utils import (
     get_team_detail,
 )
 from season_report_ai import generate_season_report
-from trades.errors import TradeError
+from trades.errors import TradeError, INVALID_INPUT, INVALID_PLAYER_ID
 from trades.models import canonicalize_deal, parse_deal, serialize_deal
 from trades.validator import validate_deal
 from trades.apply import apply_deal
@@ -421,6 +421,33 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     }
     return JSONResponse(status_code=400, content=payload)
 
+def _bad_request_response(
+    message: str,
+    *,
+    code: str = INVALID_INPUT,
+    details: Optional[Any] = None,
+) -> JSONResponse:
+    payload = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    }
+    return JSONResponse(status_code=400, content=payload)
+
+def _allow_legacy_player_ids() -> bool:
+    league = GAME_STATE.get("league", {})
+    if isinstance(league, dict) and league.get("allow_legacy_ids") is True:
+        return True
+    return str(os.environ.get("ALLOW_LEGACY_IDS", "")).strip().lower() in {"1", "true", "yes"}
+
+def _parse_trade_payload(payload: Dict[str, Any]) -> Any:
+    allow_legacy = _allow_legacy_player_ids()
+    deal = parse_deal(payload, allow_legacy_numeric=allow_legacy)
+    return canonicalize_deal(deal)
+
 def _require_db_path() -> str:
     league = _ensure_league_state()
     db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
@@ -441,8 +468,8 @@ async def api_trade_submit(req: TradeSubmitRequest):
         in_game_date = get_current_date_as_date()
         db_path = _require_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
-        deal = canonicalize_deal(parse_deal(req.deal))
-        validate_deal(deal, current_date=in_game_date)
+        deal = _parse_trade_payload(req.deal)
+        validate_deal(deal, current_date=in_game_date, db_path=db_path)
         transaction = apply_deal(deal, source="menu", trade_date=in_game_date)
         _validate_repo_integrity(db_path)
         return {
@@ -452,6 +479,11 @@ async def api_trade_submit(req: TradeSubmitRequest):
         }
     except TradeError as exc:
         return _trade_error_response(exc)
+    except (KeyError, TypeError) as exc:
+        return _bad_request_response("Malformed trade payload", details=str(exc))
+    except ValueError as exc:
+        code = INVALID_PLAYER_ID if "player_id" in str(exc) else INVALID_INPUT
+        return _bad_request_response(str(exc), code=code)
 
 
 @app.post("/api/trade/submit-committed")
@@ -465,6 +497,7 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
             deal,
             current_date=in_game_date,
             allow_locked_by_deal_id=req.deal_id,
+            db_path=db_path,
         )
         transaction = apply_deal(
             deal,
@@ -477,6 +510,11 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
         return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
     except TradeError as exc:
         return _trade_error_response(exc)
+    except (KeyError, TypeError) as exc:
+        return _bad_request_response("Malformed trade payload", details=str(exc))
+    except ValueError as exc:
+        code = INVALID_PLAYER_ID if "player_id" in str(exc) else INVALID_INPUT
+        return _bad_request_response(str(exc), code=code)
 
 
 @app.post("/api/trade/negotiation/start")
@@ -488,6 +526,8 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
         return {"ok": True, "session": session}
     except TradeError as exc:
         return _trade_error_response(exc)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _bad_request_response("Invalid negotiation request", details=str(exc))
 
 
 @app.post("/api/trade/negotiation/commit")
@@ -496,7 +536,7 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
         in_game_date = get_current_date_as_date()
         _require_db_path()
         session = negotiation_store.get_session(req.session_id)
-        deal = canonicalize_deal(parse_deal(req.deal))
+        deal = _parse_trade_payload(req.deal)
         team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
         if set(deal.teams) != team_ids or len(deal.teams) != 2:
             raise TradeError(
@@ -520,6 +560,11 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
         }
     except TradeError as exc:
         return _trade_error_response(exc)
+    except (KeyError, TypeError) as exc:
+        return _bad_request_response("Malformed trade payload", details=str(exc))
+    except ValueError as exc:
+        code = INVALID_PLAYER_ID if "player_id" in str(exc) else INVALID_INPUT
+        return _bad_request_response(str(exc), code=code)
 
 
 # -------------------------------------------------------------------------

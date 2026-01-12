@@ -46,16 +46,34 @@ def _get_db_path(game_state: dict) -> str:
     league_state = game_state.get("league") or {}
     db_path = league_state.get("db_path")
     if not db_path:
-        raise ValueError("game_state['league']['db_path'] is required to apply trades")
+        raise TradeError(
+            APPLY_FAILED,
+            "db_path is required to apply trades",
+            {"field": "game_state.league.db_path"},
+        )
     return db_path
 
 
 def _normalize_player_id_str(value: Any) -> str:
-    return str(normalize_player_id(value, strict=True))
+    try:
+        return str(normalize_player_id(value, strict=True))
+    except ValueError as exc:
+        raise TradeError(
+            DEAL_INVALIDATED,
+            "Invalid player_id in trade asset",
+            {"player_id": value},
+        ) from exc
 
 
 def _normalize_team_id_str(value: Any) -> str:
-    return str(normalize_team_id(value, strict=True))
+    try:
+        return str(normalize_team_id(value, strict=True))
+    except ValueError as exc:
+        raise TradeError(
+            DEAL_INVALIDATED,
+            "Invalid team_id in trade asset",
+            {"team_id": value},
+        ) from exc
 
 
 def _collect_player_moves(deal: Deal) -> list[_PlayerMove]:
@@ -68,7 +86,11 @@ def _collect_player_moves(deal: Deal) -> list[_PlayerMove]:
                 continue
             player_id = _normalize_player_id_str(asset.player_id)
             if player_id in seen:
-                raise ValueError(f"duplicate player in trade assets: {player_id}")
+                raise TradeError(
+                    DEAL_INVALIDATED,
+                    "Duplicate player in trade assets",
+                    {"player_id": player_id},
+                )
             seen.add(player_id)
             to_team = _resolve_receiver(deal, normalized_from_team, asset)
             normalized_to_team = _normalize_team_id_str(to_team)
@@ -87,14 +109,20 @@ def _validate_player_moves(repo: LeagueRepo, moves: list[_PlayerMove]) -> None:
         try:
             current_team = repo.get_team_id_by_player(move.player_id)
         except KeyError as exc:
-            raise ValueError(
-                f"player_id not found in DB: {move.player_id}"
+            raise TradeError(
+                DEAL_INVALIDATED,
+                "player_id not found in DB",
+                {"player_id": move.player_id},
             ) from exc
         if current_team != move.from_team:
-            raise ValueError(
-                "player_id "
-                f"{move.player_id} expected team {move.from_team} "
-                f"but DB shows {current_team}"
+            raise TradeError(
+                DEAL_INVALIDATED,
+                "player_id not owned by expected team",
+                {
+                    "player_id": move.player_id,
+                    "expected_team": move.from_team,
+                    "current_team": current_team,
+                },
             )
 
 
@@ -123,10 +151,12 @@ def apply_deal(
     original_fixed_assets: Dict[str, Optional[dict]] = {}
     swap_rights = game_state.setdefault("swap_rights", {})
     fixed_assets = game_state.setdefault("fixed_assets", {})
-    player_moves = _collect_player_moves(deal)
-    normalized_player_ids = [move.player_id for move in player_moves]
+    player_moves: list[_PlayerMove] = []
+    normalized_player_ids: list[str] = []
 
     try:
+        player_moves = _collect_player_moves(deal)
+        normalized_player_ids = [move.player_id for move in player_moves]
         acquired_date = (trade_date or get_current_date_as_date()).isoformat()
         season_year_raw = game_state.get("league", {}).get("season_year")
         season_key = str(season_year_raw).strip() if season_year_raw is not None else ""

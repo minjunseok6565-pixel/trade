@@ -9,6 +9,22 @@ from matchengine_v3.models import Player, TeamState
 from matchengine_v3.tactics import TacticsConfig
 
 
+def _safe_float(value: Any, default: float, *, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        print(f"[WARN] Invalid tactics value for {field}: {value!r}; using {default}")
+        return default
+
+
+def _safe_int(value: Any, default: int, *, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(f"[WARN] Invalid tactics value for {field}: {value!r}; using {default}")
+        return default
+
+
 def _build_tactics_config(raw: Optional[Dict[str, Any]]) -> TacticsConfig:
     if not raw:
         return TacticsConfig()
@@ -19,13 +35,29 @@ def _build_tactics_config(raw: Optional[Dict[str, Any]]) -> TacticsConfig:
     )
 
     if "scheme_weight_sharpness" in raw:
-        cfg.scheme_weight_sharpness = float(raw["scheme_weight_sharpness"])
+        cfg.scheme_weight_sharpness = _safe_float(
+            raw["scheme_weight_sharpness"],
+            cfg.scheme_weight_sharpness,
+            field="scheme_weight_sharpness",
+        )
     if "scheme_outcome_strength" in raw:
-        cfg.scheme_outcome_strength = float(raw["scheme_outcome_strength"])
+        cfg.scheme_outcome_strength = _safe_float(
+            raw["scheme_outcome_strength"],
+            cfg.scheme_outcome_strength,
+            field="scheme_outcome_strength",
+        )
     if "def_scheme_weight_sharpness" in raw:
-        cfg.def_scheme_weight_sharpness = float(raw["def_scheme_weight_sharpness"])
+        cfg.def_scheme_weight_sharpness = _safe_float(
+            raw["def_scheme_weight_sharpness"],
+            cfg.def_scheme_weight_sharpness,
+            field="def_scheme_weight_sharpness",
+        )
     if "def_scheme_outcome_strength" in raw:
-        cfg.def_scheme_outcome_strength = float(raw["def_scheme_outcome_strength"])
+        cfg.def_scheme_outcome_strength = _safe_float(
+            raw["def_scheme_outcome_strength"],
+            cfg.def_scheme_outcome_strength,
+            field="def_scheme_outcome_strength",
+        )
 
     cfg.action_weight_mult = dict(raw.get("action_weight_mult") or {})
     cfg.outcome_global_mult = dict(raw.get("outcome_global_mult") or {})
@@ -155,7 +187,11 @@ def build_team_state_from_db(
     lineup_info = tactics.get("lineup", {}) if tactics else {}
     starters = lineup_info.get("starters") or []
     bench = lineup_info.get("bench") or []
-    max_players = int((tactics or {}).get("rotation_size") or 10)
+    max_players = _safe_int(
+        (tactics or {}).get("rotation_size") or 10,
+        10,
+        field="rotation_size",
+    )
 
     players = load_team_players_from_db(repo, team_id)
     max_players = max(5, min(max_players, len(players)))
@@ -166,13 +202,17 @@ def build_team_state_from_db(
     team_state = TeamState(name=str(team_id).upper(), lineup=lineup, tactics=tactics_cfg, roles=roles)
     minutes = (tactics or {}).get("minutes") or {}
     if isinstance(minutes, dict) and minutes:
+        rotation_targets: Dict[str, int] = {}
+        for pid, mins in minutes.items():
+            if pid is None or mins is None:
+                continue
+            try:
+                rotation_targets[str(pid)] = int(float(mins) * 60)
+            except (TypeError, ValueError):
+                print(f"[WARN] Invalid minutes value for {pid}: {mins!r}; skipping")
         team_state = replace(
             team_state,
-            rotation_target_sec_by_pid={
-                str(pid): int(float(mins) * 60)
-                for pid, mins in minutes.items()
-                if pid is not None and mins is not None
-            },
+            rotation_target_sec_by_pid=rotation_targets,
         )
 
     return team_state

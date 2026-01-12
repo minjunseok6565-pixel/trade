@@ -3,7 +3,6 @@
 from .models import Deal, PlayerAsset, PickAsset, parse_deal, canonicalize_deal, serialize_deal
 from .errors import TradeError
 from .validator import validate_deal
-from .apply import apply_deal
 from .agreements import (
     create_committed_deal,
     verify_committed_deal,
@@ -22,7 +21,6 @@ __all__ = [
     "serialize_deal",
     "TradeError",
     "validate_deal",
-    "apply_deal",
     "create_committed_deal",
     "verify_committed_deal",
     "mark_executed",
