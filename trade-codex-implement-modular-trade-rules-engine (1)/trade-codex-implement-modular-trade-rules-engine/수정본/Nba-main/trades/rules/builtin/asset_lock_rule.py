@@ -15,19 +15,18 @@ class AssetLockRule:
     enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
-        asset_locks = ctx.game_state.get("asset_locks", {})
         allow_locked_by_deal_id = ctx.extra.get("allow_locked_by_deal_id")
 
         for team_id, assets in deal.legs.items():
             for asset in assets:
                 asset_key_value = asset_key(asset)
 
-                lock = asset_locks.get(asset_key_value)
+                lock = ctx.repo.get_asset_lock(asset_key_value)
                 if not lock:
                     continue
 
-                locked_deal_id = lock.get("deal_id")
-                expires_at = lock.get("expires_at")
+                locked_deal_id = lock["deal_id"]
+                expires_at = lock["expires_at"]
                 expires_at_date = None
                 if expires_at is not None:
                     if isinstance(expires_at, date):
@@ -47,7 +46,7 @@ class AssetLockRule:
                             )
 
                 if expires_at_date is not None and ctx.current_date > expires_at_date:
-                    asset_locks.pop(asset_key_value, None)
+                    ctx.repo.release_asset_lock(asset_key_value)
                     continue
 
                 if allow_locked_by_deal_id and locked_deal_id == allow_locked_by_deal_id:

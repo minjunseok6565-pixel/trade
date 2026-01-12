@@ -43,8 +43,7 @@ class OwnershipRule:
                             {"player_id": asset.player_id, "team_id": team_id},
                         )
                 if isinstance(asset, PickAsset):
-                    draft_picks = ctx.game_state.get("draft_picks", {})
-                    pick = draft_picks.get(asset.pick_id)
+                    pick = ctx.repo.get_pick(asset.pick_id)
                     if not pick:
                         raise TradeError(
                             PICK_NOT_OWNED,
@@ -52,7 +51,7 @@ class OwnershipRule:
                             {"pick_id": asset.pick_id, "team_id": team_id},
                         )
                     # Ensure teams cannot trade picks they do not own.
-                    current_owner = str(pick.get("owner_team", "")).upper()
+                    current_owner = str(pick.get("owner_team") or "").upper()
                     if current_owner != team_id:
                         raise TradeError(
                             PICK_NOT_OWNED,
@@ -76,24 +75,24 @@ class OwnershipRule:
                                 },
                             )
                 if isinstance(asset, FixedAsset):
-                    fixed_assets = ctx.game_state.get("fixed_assets", {})
-                    fixed = fixed_assets.get(asset.asset_id)
+                    fixed = ctx.repo.get_fixed_asset(asset.asset_id)
                     if not fixed:
                         raise TradeError(
                             FIXED_ASSET_NOT_FOUND,
                             "Fixed asset not found",
                             {"asset_id": asset.asset_id, "team_id": team_id},
                         )
-                    if str(fixed.get("owner_team", "")).upper() != team_id:
+                    if str(fixed.get("owner_team") or "").upper() != team_id:
                         raise TradeError(
                             FIXED_ASSET_NOT_OWNED,
                             "Fixed asset not owned by team",
                             {"asset_id": asset.asset_id, "team_id": team_id},
                         )
                 if isinstance(asset, SwapAsset):
-                    draft_picks = ctx.game_state.get("draft_picks", {})
-                    pick_a = draft_picks.get(asset.pick_id_a)
-                    pick_b = draft_picks.get(asset.pick_id_b)
+                    pick_rows = ctx.repo.get_picks_by_ids([asset.pick_id_a, asset.pick_id_b])
+                    pick_lookup = {row["pick_id"]: row for row in pick_rows}
+                    pick_a = pick_lookup.get(asset.pick_id_a)
+                    pick_b = pick_lookup.get(asset.pick_id_b)
                     if not pick_a or not pick_b:
                         raise TradeError(
                             SWAP_INVALID,
@@ -104,28 +103,27 @@ class OwnershipRule:
                                 "pick_id_b": asset.pick_id_b,
                             },
                         )
-                    if pick_a.get("year") != pick_b.get("year") or pick_a.get("round") != pick_b.get("round"):
+                    if pick_a["year"] != pick_b["year"] or pick_a["round"] != pick_b["round"]:
                         raise TradeError(
                             SWAP_INVALID,
                             "Swap picks must match year and round",
                             {
                                 "swap_id": asset.swap_id,
-                                "pick_a": {"year": pick_a.get("year"), "round": pick_a.get("round")},
-                                "pick_b": {"year": pick_b.get("year"), "round": pick_b.get("round")},
+                                "pick_a": {"year": pick_a["year"], "round": pick_a["round"]},
+                                "pick_b": {"year": pick_b["year"], "round": pick_b["round"]},
                             },
                         )
-                    swap_rights = ctx.game_state.get("swap_rights", {})
-                    swap = swap_rights.get(asset.swap_id)
+                    swap = ctx.repo.get_swap(asset.swap_id)
                     if swap:
-                        if str(swap.get("owner_team", "")).upper() != team_id:
+                        if str(swap.get("owner_team") or "").upper() != team_id:
                             raise TradeError(
                                 SWAP_NOT_OWNED,
                                 "Swap right not owned by team",
                                 {"swap_id": asset.swap_id, "team_id": team_id},
                             )
                     else:
-                        owner_a = str(pick_a.get("owner_team", "")).upper()
-                        owner_b = str(pick_b.get("owner_team", "")).upper()
+                        owner_a = str(pick_a["owner_team"] or "").upper()
+                        owner_b = str(pick_b["owner_team"] or "").upper()
                         if owner_a != team_id and owner_b != team_id:
                             raise TradeError(
                                 SWAP_INVALID,

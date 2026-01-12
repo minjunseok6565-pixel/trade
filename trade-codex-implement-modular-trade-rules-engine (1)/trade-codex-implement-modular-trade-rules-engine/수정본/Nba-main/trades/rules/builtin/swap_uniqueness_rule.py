@@ -31,7 +31,7 @@ class SwapUniquenessRule:
                         },
                     )
                 pair_key = frozenset([asset.pick_id_a, asset.pick_id_b])
-                for record in ctx.game_state.get("swap_rights", {}).values():
+                for record in ctx.repo.list_swaps():
                     if not record.get("active", True):
                         continue
                     existing_pick_id_a = record.get("pick_id_a")

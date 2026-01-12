@@ -25,7 +25,7 @@ class ReturnToTradingTeamRule:
                 if not isinstance(asset, PlayerAsset):
                     continue
                 to_team = _resolve_receiver(deal, from_team, asset)
-                player_state = ctx.game_state.get("players", {}).get(asset.player_id)
+                player_state = _get_player_state(ctx, asset.player_id)
                 if not player_state:
                     continue
                 banned = player_state.get("trade_return_bans", {}).get(season_key, [])
@@ -42,6 +42,11 @@ class ReturnToTradingTeamRule:
                             "reason": "same_season_return_to_trading_team",
                         },
                     )
+
+
+def _get_player_state(ctx: TradeContext, player_id: str) -> dict:
+    state = ctx.repo.get_player_state(player_id)
+    return state or {}
 
 
 def _resolve_receiver(deal, team_id: str, asset: PlayerAsset) -> str:

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
-from contracts.free_agents import add_free_agent, remove_free_agent
 from contracts.models import (
     get_active_salary_for_season,
     make_contract_record,
     new_contract_id,
 )
-from contracts.store import ensure_contract_state, get_league_season_year
+from contracts.store import get_league_season_year
 from league_repo import LeagueRepo
-from schema import normalize_player_id, normalize_team_id
+from schema import normalize_player_id, normalize_team_id, season_id_from_year
 
 
 def _resolve_date_iso(game_state: dict, value: "date|str|None") -> str:
@@ -27,11 +27,6 @@ def _resolve_date_iso(game_state: dict, value: "date|str|None") -> str:
 
     return resolved.isoformat()
 
-
-def _ensure_team_state(game_state: dict) -> None:
-    from team_utils import _init_players_and_teams_if_needed
-
-    _init_players_and_teams_if_needed()
 
 def _get_db_path(game_state: dict) -> str:
     league_state = game_state.get("league") or {}
@@ -62,6 +57,19 @@ def _get_salary_amount(repo: LeagueRepo, player_id: str) -> int:
     if not isinstance(salary_amount, int):
         raise ValueError(f"salary_amount is not an int for player_id={player_id}")
     return salary_amount
+
+
+def _get_team_id(repo: LeagueRepo, player_id: str) -> str:
+    row = repo._conn.execute(
+        "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
+        (player_id,),
+    ).fetchone()
+    if not row:
+        raise KeyError(f"active roster entry not found for player_id={player_id}")
+    team_id = row["team_id"]
+    if not team_id:
+        raise ValueError(f"team_id is missing for player_id={player_id}")
+    return str(team_id)
 
 
 def _utc_now_iso() -> str:
@@ -122,34 +130,44 @@ def release_to_free_agents(
     cursor=None,
     validate: bool | None = None,
 ) -> dict:
-    ensure_contract_state(game_state)
-    _ensure_team_state(game_state)
-
     normalized_player_id = _normalize_player_id_str(player_id)
     released_date_iso = _resolve_date_iso(game_state, released_date)
-
-    player = game_state["players"][normalized_player_id]
-    player["team_id"] = ""
-    player["acquired_date"] = released_date_iso
-    player["acquired_via_trade"] = False
-
-    add_free_agent(game_state, normalized_player_id)
 
     db_path = _get_db_path(game_state)
     if repo is None:
         with LeagueRepo(db_path) as managed_repo:
             with managed_repo.transaction() as cur:
-                _execute_trade_player(
-                    managed_repo,
-                    normalized_player_id,
-                    "FA",
-                    cursor=cur,
+                now_iso = _utc_now_iso()
+                cur.execute(
+                    "UPDATE roster SET team_id=?, updated_at=? WHERE player_id=?;",
+                    ("FA", now_iso, normalized_player_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE contracts
+                    SET team_id=?, is_active=0, updated_at=?
+                    WHERE player_id=? AND is_active=1;
+                    """,
+                    ("FA", now_iso, normalized_player_id),
                 )
             managed_repo.validate_integrity()
     else:
         if validate is None:
             validate = False
-        _execute_trade_player(repo, normalized_player_id, "FA", cursor=cursor)
+        now_iso = _utc_now_iso()
+        cur = cursor or repo._conn
+        cur.execute(
+            "UPDATE roster SET team_id=?, updated_at=? WHERE player_id=?;",
+            ("FA", now_iso, normalized_player_id),
+        )
+        cur.execute(
+            """
+            UPDATE contracts
+            SET team_id=?, is_active=0, updated_at=?
+            WHERE player_id=? AND is_active=1;
+            """,
+            ("FA", now_iso, normalized_player_id),
+        )
         if validate:
             repo.validate_integrity()
 
@@ -172,19 +190,16 @@ def sign_free_agent(
     cursor=None,
     validate: bool | None = None,
 ) -> dict:
-    ensure_contract_state(game_state)
-    _ensure_team_state(game_state)
-
     normalized_team_id = _normalize_team_id_str(team_id)
     normalized_player_id = _normalize_player_id_str(player_id)
-    if normalized_player_id not in game_state["free_agents"]:
-        raise ValueError(f"Player {normalized_player_id} is not a free agent")
-
     signed_date_iso = _resolve_date_iso(game_state, signed_date)
 
     db_path = _get_db_path(game_state)
     if repo is None:
         with LeagueRepo(db_path) as managed_repo:
+            current_team_id = _get_team_id(managed_repo, normalized_player_id)
+            if current_team_id != "FA":
+                raise ValueError(f"Player {normalized_player_id} is not a free agent")
             return _sign_free_agent_with_repo(
                 game_state,
                 normalized_team_id,
@@ -200,6 +215,9 @@ def sign_free_agent(
         validate = False
 
     try:
+        current_team_id = _get_team_id(repo, normalized_player_id)
+        if current_team_id != "FA":
+            raise ValueError(f"Player {normalized_player_id} is not a free agent")
         return _sign_free_agent_with_repo(
             game_state,
             normalized_team_id,
@@ -249,37 +267,111 @@ def _sign_free_agent_with_repo(
             status="ACTIVE",
         )
 
-        game_state["contracts"][contract_id] = contract
-        game_state.setdefault("player_contracts", {}).setdefault(
-            str(normalized_player_id), []
-        ).append(contract_id)
-        game_state.setdefault("active_contract_id_by_player", {})[
-            str(normalized_player_id)
-        ] = contract_id
-
-        player = game_state["players"][normalized_player_id]
-        player["team_id"] = normalized_team_id
-        player["signed_date"] = signed_date_iso
-        player["last_contract_action_date"] = signed_date_iso
-        player["last_contract_action_type"] = "SIGN_FREE_AGENT"
-        player["signed_via_free_agency"] = True
-        player["acquired_date"] = signed_date_iso
-        player["acquired_via_trade"] = False
-
-        remove_free_agent(game_state, normalized_player_id)
-
         active_salary = get_active_salary_for_season(contract, start_season_year)
+        existing = repo.get_player_state(normalized_player_id) or {}
         if cursor is None:
             with repo.transaction() as cur:
+                now_iso = _utc_now_iso()
+                cur.execute(
+                    "UPDATE contracts SET is_active=0, updated_at=? WHERE player_id=? AND is_active=1;",
+                    (now_iso, normalized_player_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO contracts(
+                        contract_id,
+                        player_id,
+                        team_id,
+                        start_season_id,
+                        end_season_id,
+                        salary_by_season_json,
+                        contract_type,
+                        is_active,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        contract_id,
+                        normalized_player_id,
+                        normalized_team_id,
+                        season_id_from_year(start_season_year),
+                        season_id_from_year(start_season_year + years - 1),
+                        json.dumps(contract.get("salary_by_year", {})),
+                        "STANDARD",
+                        1,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
                 _execute_trade_player(
                     repo, normalized_player_id, normalized_team_id, cursor=cur
                 )
                 _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cur)
+                repo.upsert_player_state(
+                    normalized_player_id,
+                    {
+                        "last_contract_action_type": "SIGN_FREE_AGENT",
+                        "last_contract_action_date": signed_date_iso,
+                        "signed_via_free_agency": True,
+                        "signed_date": signed_date_iso,
+                        "acquired_via_trade": existing.get("acquired_via_trade", False),
+                        "acquired_date": existing.get("acquired_date"),
+                        "trade_return_bans": existing.get("trade_return_bans", {}),
+                    },
+                    cursor=cur,
+                )
         else:
+            now_iso = _utc_now_iso()
+            cursor.execute(
+                "UPDATE contracts SET is_active=0, updated_at=? WHERE player_id=? AND is_active=1;",
+                (now_iso, normalized_player_id),
+            )
+            cursor.execute(
+                """
+                INSERT INTO contracts(
+                    contract_id,
+                    player_id,
+                    team_id,
+                    start_season_id,
+                    end_season_id,
+                    salary_by_season_json,
+                    contract_type,
+                    is_active,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    contract_id,
+                    normalized_player_id,
+                    normalized_team_id,
+                    season_id_from_year(start_season_year),
+                    season_id_from_year(start_season_year + years - 1),
+                    json.dumps(contract.get("salary_by_year", {})),
+                    "STANDARD",
+                    1,
+                    now_iso,
+                    now_iso,
+                ),
+            )
             _execute_trade_player(
                 repo, normalized_player_id, normalized_team_id, cursor=cursor
             )
             _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cursor)
+            repo.upsert_player_state(
+                normalized_player_id,
+                {
+                    "last_contract_action_type": "SIGN_FREE_AGENT",
+                    "last_contract_action_date": signed_date_iso,
+                    "signed_via_free_agency": True,
+                    "signed_date": signed_date_iso,
+                    "acquired_via_trade": existing.get("acquired_via_trade", False),
+                    "acquired_date": existing.get("acquired_date"),
+                    "trade_return_bans": existing.get("trade_return_bans", {}),
+                },
+                cursor=cursor,
+            )
         if validate:
             repo.validate_integrity()
     finally:
@@ -306,9 +398,6 @@ def re_sign_or_extend(
     cursor=None,
     validate: bool | None = None,
 ) -> dict:
-    ensure_contract_state(game_state)
-    _ensure_team_state(game_state)
-
     normalized_team_id = _normalize_team_id_str(team_id)
     normalized_player_id = _normalize_player_id_str(player_id)
     signed_date_iso = _resolve_date_iso(game_state, signed_date)
@@ -380,35 +469,115 @@ def _re_sign_or_extend_with_repo(
             status="ACTIVE",
         )
 
-        game_state["contracts"][contract_id] = contract
-        game_state.setdefault("player_contracts", {}).setdefault(
-            str(normalized_player_id), []
-        ).append(contract_id)
-        game_state.setdefault("active_contract_id_by_player", {})[
-            str(normalized_player_id)
-        ] = contract_id
-
-        player = game_state["players"][normalized_player_id]
-        player["team_id"] = normalized_team_id
-        player["signed_date"] = signed_date_iso
-        player["last_contract_action_date"] = signed_date_iso
-        player["last_contract_action_type"] = "RE_SIGN_OR_EXTEND"
-        player["signed_via_free_agency"] = False
-        player["acquired_date"] = signed_date_iso
-        player["acquired_via_trade"] = False
-
         active_salary = get_active_salary_for_season(contract, start_season_year)
+        existing = repo.get_player_state(normalized_player_id) or {}
         if cursor is None:
             with repo.transaction() as cur:
+                now_iso = _utc_now_iso()
+                cur.execute(
+                    "UPDATE contracts SET is_active=0, updated_at=? WHERE player_id=? AND is_active=1;",
+                    (now_iso, normalized_player_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO contracts(
+                        contract_id,
+                        player_id,
+                        team_id,
+                        start_season_id,
+                        end_season_id,
+                        salary_by_season_json,
+                        contract_type,
+                        is_active,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        contract_id,
+                        normalized_player_id,
+                        normalized_team_id,
+                        season_id_from_year(start_season_year),
+                        season_id_from_year(start_season_year + years - 1),
+                        json.dumps(contract.get("salary_by_year", {})),
+                        "STANDARD",
+                        1,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
                 _execute_trade_player(
                     repo, normalized_player_id, normalized_team_id, cursor=cur
                 )
                 _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cur)
+                repo.upsert_player_state(
+                    normalized_player_id,
+                    {
+                        "last_contract_action_type": "RE_SIGN_OR_EXTEND",
+                        "last_contract_action_date": signed_date_iso,
+                        "signed_via_free_agency": existing.get(
+                            "signed_via_free_agency", False
+                        ),
+                        "signed_date": existing.get("signed_date") or signed_date_iso,
+                        "acquired_via_trade": existing.get("acquired_via_trade", False),
+                        "acquired_date": existing.get("acquired_date"),
+                        "trade_return_bans": existing.get("trade_return_bans", {}),
+                    },
+                    cursor=cur,
+                )
         else:
+            now_iso = _utc_now_iso()
+            cursor.execute(
+                "UPDATE contracts SET is_active=0, updated_at=? WHERE player_id=? AND is_active=1;",
+                (now_iso, normalized_player_id),
+            )
+            cursor.execute(
+                """
+                INSERT INTO contracts(
+                    contract_id,
+                    player_id,
+                    team_id,
+                    start_season_id,
+                    end_season_id,
+                    salary_by_season_json,
+                    contract_type,
+                    is_active,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    contract_id,
+                    normalized_player_id,
+                    normalized_team_id,
+                    season_id_from_year(start_season_year),
+                    season_id_from_year(start_season_year + years - 1),
+                    json.dumps(contract.get("salary_by_year", {})),
+                    "STANDARD",
+                    1,
+                    now_iso,
+                    now_iso,
+                ),
+            )
             _execute_trade_player(
                 repo, normalized_player_id, normalized_team_id, cursor=cursor
             )
             _execute_set_salary(repo, normalized_player_id, active_salary, cursor=cursor)
+            repo.upsert_player_state(
+                normalized_player_id,
+                {
+                    "last_contract_action_type": "RE_SIGN_OR_EXTEND",
+                    "last_contract_action_date": signed_date_iso,
+                    "signed_via_free_agency": existing.get(
+                        "signed_via_free_agency", False
+                    ),
+                    "signed_date": existing.get("signed_date") or signed_date_iso,
+                    "acquired_via_trade": existing.get("acquired_via_trade", False),
+                    "acquired_date": existing.get("acquired_date"),
+                    "trade_return_bans": existing.get("trade_return_bans", {}),
+                },
+                cursor=cursor,
+            )
         if validate:
             repo.validate_integrity()
     finally:

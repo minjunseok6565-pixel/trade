@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from state import GAME_STATE
+from league_repo import LeagueRepo
+from state import get_league_db_path
 
 from .errors import TradeError, NEGOTIATION_NOT_FOUND
 from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
@@ -12,6 +14,42 @@ from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def _load_session_row(session_id: str) -> dict:
+    db_path = get_league_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        row = repo.get_negotiation(session_id)
+        if not row:
+            raise TradeError(
+                NEGOTIATION_NOT_FOUND,
+                "Negotiation session not found",
+                {"session_id": session_id},
+            )
+        payload = json.loads(row["session_json"] or "{}")
+        if not isinstance(payload, dict):
+            raise TradeError(
+                NEGOTIATION_NOT_FOUND,
+                "Negotiation session not found",
+                {"session_id": session_id},
+            )
+        return payload
+
+
+def _persist_session(session: Dict[str, Any]) -> None:
+    db_path = get_league_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            repo.update_negotiation(
+                session_id=session["session_id"],
+                session_json=json.dumps(session),
+                status=session.get("status", "ACTIVE"),
+                updated_at=session.get("updated_at") or _now_iso(),
+                cursor=cur,
+            )
+        repo.validate_integrity()
 
 
 def _ensure_session_schema(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -84,18 +122,24 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
         "relationship": {"trust": 0, "fatigue": 0, "promises_broken": 0},
         "market_context": {},  # trade market context snapshot
     }
-    GAME_STATE.setdefault("negotiations", {})[session_id] = session
+    db_path = get_league_db_path()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            repo.save_negotiation(
+                session_id=session_id,
+                session_json=json.dumps(session),
+                status=session["status"],
+                created_at=session["created_at"],
+                updated_at=session["updated_at"],
+                cursor=cur,
+            )
+        repo.validate_integrity()
     return session
 
 
 def get_session(session_id: str) -> Dict[str, Any]:
-    session = (GAME_STATE.get("negotiations") or {}).get(session_id)
-    if not session:
-        raise TradeError(
-            NEGOTIATION_NOT_FOUND,
-            "Negotiation session not found",
-            {"session_id": session_id},
-        )
+    session = _load_session_row(session_id)
     return _ensure_session_schema(session)
 
 
@@ -103,6 +147,7 @@ def append_message(session_id: str, speaker: str, text: str) -> None:
     session = get_session(session_id)
     session["messages"].append({"speaker": speaker, "text": text, "at": _now_iso()})
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
@@ -110,24 +155,28 @@ def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
     deal: Deal = canonicalize_deal(parse_deal(deal_serialized))
     session["draft_deal"] = serialize_deal(deal)
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_committed(session_id: str, deal_id: str) -> None:
     session = get_session(session_id)
     session["committed_deal_id"] = deal_id
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_phase(session_id: str, phase: str) -> None:
     session = get_session(session_id)
     session["phase"] = phase if isinstance(phase, str) else "INIT"
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_constraints(session_id: str, constraints: dict) -> None:
     session = get_session(session_id)
     session["constraints"] = constraints if isinstance(constraints, dict) else {}
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_valid_until(session_id: str, valid_until_iso: Optional[str]) -> None:
@@ -136,6 +185,7 @@ def set_valid_until(session_id: str, valid_until_iso: Optional[str]) -> None:
         valid_until_iso = None
     session["valid_until"] = valid_until_iso
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_summary(session_id: str, summary: dict) -> None:
@@ -146,6 +196,7 @@ def set_summary(session_id: str, summary: dict) -> None:
     summary.setdefault("updated_at", None)
     session["summary"] = summary
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def bump_fatigue(session_id: str, delta: int = 1) -> None:
@@ -160,6 +211,7 @@ def bump_fatigue(session_id: str, delta: int = 1) -> None:
         session["relationship"] = relationship
     relationship["fatigue"] = int(relationship.get("fatigue", 0)) + increment
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_relationship(session_id: str, patch: dict) -> None:
@@ -173,15 +225,18 @@ def set_relationship(session_id: str, patch: dict) -> None:
             if key in patch:
                 relationship[key] = patch[key]
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_last_offer(session_id: str, payload: Any) -> None:
     session = get_session(session_id)
     session["last_offer"] = payload
     session["updated_at"] = _now_iso()
+    _persist_session(session)
 
 
 def set_last_counter(session_id: str, payload: Any) -> None:
     session = get_session(session_id)
     session["last_counter"] = payload
     session["updated_at"] = _now_iso()
+    _persist_session(session)

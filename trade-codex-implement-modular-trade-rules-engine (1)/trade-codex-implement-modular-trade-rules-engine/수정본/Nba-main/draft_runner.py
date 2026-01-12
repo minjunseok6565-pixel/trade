@@ -19,6 +19,8 @@ import tempfile
 import traceback
 from typing import Any, Dict, Iterable, List, Tuple
 
+from league_repo import LeagueRepo
+
 
 def load_game_state(path: str) -> dict:
     try:
@@ -60,17 +62,11 @@ def load_pick_order(path: str) -> Dict[str, int]:
     return {str(pick_id): int(slot) for pick_id, slot in data.items()}
 
 
-def _ensure_state_containers(game_state: dict) -> None:
-    game_state.setdefault("draft_picks", {})
-    game_state.setdefault("swap_rights", {})
-    game_state.setdefault("fixed_assets", {})
-
-
-def _resolve_team_ids(game_state: dict) -> List[str]:
+def _resolve_team_ids(game_state: dict, repo: LeagueRepo) -> List[str]:
     teams = game_state.get("teams")
     if isinstance(teams, dict) and teams:
         return sorted([str(team_id) for team_id in teams.keys()])
-    if game_state.get("draft_picks"):
+    if repo.list_picks():
         return []
     try:
         from config import ALL_TEAM_IDS
@@ -125,13 +121,16 @@ def main() -> int:
 
             game_state = GAME_STATE
 
-        _ensure_state_containers(game_state)
-
         pick_order = load_pick_order(args.pick_order)
         draft_year = int(args.draft_year)
+        db_path = (game_state.get("league") or {}).get("db_path")
+        if not db_path:
+            raise ValueError("league.db_path is required to run draft settlement")
+        repo = LeagueRepo(db_path)
+        repo.init_db()
 
         if args.init_picks:
-            team_ids = _resolve_team_ids(game_state)
+            team_ids = _resolve_team_ids(game_state, repo)
             if not team_ids:
                 raise ValueError(
                     "Cannot init picks: team list unavailable; provide state with teams or install roster file."

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contracts.store import ensure_contract_state
 from schema import normalize_player_id
 
 FREE_AGENT_TEAM_ID = "FA"
@@ -13,25 +12,23 @@ def _normalize_player_id(value) -> str:
 
 
 def list_free_agents(game_state: dict) -> list[str]:
-    ensure_contract_state(game_state)
-    return [str(player_id) for player_id in game_state["free_agents"]]
+    return [str(player_id) for player_id in game_state.get("free_agents", [])]
 
 
 def is_free_agent(game_state: dict, player_id: str) -> bool:
-    ensure_contract_state(game_state)
     normalized_player_id = _normalize_player_id(player_id)
-    return normalized_player_id in game_state["free_agents"]
+    return normalized_player_id in game_state.get("free_agents", [])
 
 
 def add_free_agent(game_state: dict, player_id: str) -> None:
-    ensure_contract_state(game_state)
     normalized_player_id = _normalize_player_id(player_id)
-    if normalized_player_id not in game_state["free_agents"]:
-        game_state["free_agents"].append(normalized_player_id)
+    free_agents = game_state.setdefault("free_agents", [])
+    if normalized_player_id not in free_agents:
+        free_agents.append(normalized_player_id)
 
 
 def remove_free_agent(game_state: dict, player_id: str) -> None:
-    ensure_contract_state(game_state)
     normalized_player_id = _normalize_player_id(player_id)
-    if normalized_player_id in game_state["free_agents"]:
-        game_state["free_agents"].remove(normalized_player_id)
+    free_agents = game_state.get("free_agents", [])
+    if normalized_player_id in free_agents:
+        free_agents.remove(normalized_player_id)

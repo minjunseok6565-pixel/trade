@@ -5,7 +5,7 @@ from __future__ import annotations
 from math import isnan
 
 from contracts.models import get_active_salary_for_season
-from contracts.store import ensure_contract_state, get_league_season_year
+from contracts.store import get_league_season_year
 
 
 def sync_roster_salaries_for_season(
@@ -27,10 +27,6 @@ def sync_roster_teams_from_state(game_state: dict, roster_df=None) -> None:
 
 
 def sync_contract_team_ids_from_players(game_state: dict) -> None:
-    from contracts.store import ensure_contract_state
-
-    ensure_contract_state(game_state)
-
     for player_id_str, contract_id in game_state.get(
         "active_contract_id_by_player", {}
     ).items():
@@ -56,9 +52,6 @@ def sync_players_salary_from_active_contract(
     game_state: dict, season_year: int
 ) -> None:
     from contracts import models
-    from contracts.store import ensure_contract_state
-
-    ensure_contract_state(game_state)
 
     active_contract_map = game_state.get("active_contract_id_by_player", {})
     contracts = game_state.get("contracts", {})
@@ -82,7 +75,6 @@ def assert_state_vs_roster_consistency(
     max_errors: int = 20,
 ) -> None:
     """Deprecated: roster DataFrame consistency checks removed (DB is SSOT)."""
-    ensure_contract_state(game_state)
     if season_year is None:
         season_year = get_league_season_year(game_state)
     _ = (season_year, roster_df, max_errors)
