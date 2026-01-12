@@ -45,7 +45,7 @@ def build_player_moves(deal: Any) -> tuple[dict[str, list[str]], dict[str, list[
 
 
 def _normalize_player_id(value: Any) -> str:
-    return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
+    return str(normalize_player_id(value, strict=True))
 
 
 def _normalize_team_id(value: Any) -> str:

@@ -163,7 +163,13 @@ def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) 
             ).fetchall()
             now_iso = _utc_now_iso()
             for row in roster_rows:
-                player_id = str(normalize_player_id(row["player_id"], strict=True))
+                try:
+                    player_id = str(normalize_player_id(row["player_id"], strict=True))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Roster contains non-canonical player_id; "
+                        "import roster with canonical IDs before bootstrapping contracts."
+                    ) from exc
                 team_id = str(normalize_team_id(row["team_id"], strict=True))
                 if team_id == FREE_AGENT_TEAM_ID:
                     if player_id not in initial_free_agents_seen:

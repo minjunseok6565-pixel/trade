@@ -18,6 +18,9 @@ PlayerId = NewType("PlayerId", str)
 TeamId = NewType("TeamId", str)
 SeasonId = NewType("SeasonId", str)
 GameId = NewType("GameId", str)
+PickId = NewType("PickId", str)
+SwapId = NewType("SwapId", str)
+AssetId = NewType("AssetId", str)
 
 Phase = Literal["regular", "play_in", "playoffs", "preseason"]
 
@@ -31,6 +34,7 @@ PLAYER_ID_RE = re.compile(r"^P\d{6}$")
 # TeamID canonical format recommendation:
 #   3-letter uppercase NBA code, plus "FA".
 TEAM_ID_RE = re.compile(r"^(?:[A-Z]{3}|FA)$")
+PICK_ID_RE = re.compile(r"^(\\d{4})_R([12])_([A-Z]{3}|FA)$")
 
 
 def is_canonical_player_id(pid: str) -> bool:
@@ -39,6 +43,10 @@ def is_canonical_player_id(pid: str) -> bool:
 
 def is_canonical_team_id(tid: str) -> bool:
     return bool(TEAM_ID_RE.match(tid))
+
+
+def is_canonical_pick_id(pid: str) -> bool:
+    return bool(PICK_ID_RE.match(pid))
 
 # Engine raw often uses these side keys for home/away mapping.
 SIDE_HOME: str = "home"
@@ -249,6 +257,36 @@ def normalize_player_id(
     if strict:
         raise ValueError(f"invalid player_id '{s}' (expected like P000001)")
     return PlayerId(s)
+
+
+def parse_pick_id(value: Any) -> tuple[int, int, str]:
+    """
+    Parse pick_id into (year, round, team_id).
+
+    Expected format: YYYY_R{1|2}_TEAM (e.g., 2027_R1_LAL).
+    """
+    s = str(value).strip().upper()
+    match = PICK_ID_RE.match(s)
+    if not match:
+        raise ValueError(f"invalid pick_id '{s}' (expected YYYY_R1_TEAM)")
+    year = int(match.group(1))
+    round_value = int(match.group(2))
+    team_id = str(normalize_team_id(match.group(3), strict=True))
+    return year, round_value, team_id
+
+
+def normalize_pick_id(value: Any, *, strict: bool = True) -> PickId:
+    s = str(value).strip().upper()
+    if strict:
+        parse_pick_id(s)
+    return PickId(s)
+
+
+def compute_swap_pair_key(pick_id_a: Any, pick_id_b: Any) -> str:
+    pid_a = str(normalize_pick_id(pick_id_a, strict=True))
+    pid_b = str(normalize_pick_id(pick_id_b, strict=True))
+    first, second = sorted([pid_a, pid_b])
+    return f"{first}__{second}"
 
 def season_id_from_year(season_year: int) -> SeasonId:
     """Example: 2025 -> '2025-26'"""

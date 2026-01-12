@@ -15,6 +15,7 @@ from .errors import (
     DEAL_EXPIRED,
     DEAL_INVALIDATED,
     DEAL_ALREADY_EXECUTED,
+    INVALID_PLAYER_ID,
 )
 from .models import (
     Asset,
@@ -48,51 +49,70 @@ def _compute_assets_hash(deal: Deal) -> str:
     db_path = league.get("db_path") if isinstance(league, dict) else None
     if not db_path:
         raise ValueError("db_path is required to compute trade agreement hash")
-    repo = LeagueRepo(db_path)
-    repo.init_db()
     draft_picks = GAME_STATE.get("draft_picks", {})
     swap_rights = GAME_STATE.get("swap_rights", {})
     fixed_assets = GAME_STATE.get("fixed_assets", {})
-    for team_id, assets in deal.legs.items():
-        for asset in assets:
-            asset_key_value = asset_key(asset)
-            if isinstance(asset, PlayerAsset):
-                pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
-                from_team_id = str(normalize_team_id(team_id, strict=True))
-                try:
-                    current_team_id = repo.get_team_id_by_player(pid)
-                except Exception as exc:
-                    raise ValueError(f"Player not found in roster: {asset.player_id}") from exc
-                if current_team_id != from_team_id:
-                    raise ValueError(
-                        f"Player {asset.player_id} not owned by {from_team_id} (current: {current_team_id})"
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        for team_id, assets in deal.legs.items():
+            for asset in assets:
+                asset_key_value = asset_key(asset)
+                if isinstance(asset, PlayerAsset):
+                    try:
+                        pid = str(normalize_player_id(asset.player_id, strict=True))
+                    except ValueError as exc:
+                        raise TradeError(
+                            INVALID_PLAYER_ID,
+                            "Invalid player_id in trade asset",
+                            {"player_id": asset.player_id},
+                        ) from exc
+                    from_team_id = str(normalize_team_id(team_id, strict=True))
+                    try:
+                        current_team_id = repo.get_team_id_by_player(pid)
+                    except Exception as exc:
+                        raise TradeError(
+                            DEAL_INVALIDATED,
+                            "Player not found in roster",
+                            {"player_id": asset.player_id},
+                        ) from exc
+                    if current_team_id != from_team_id:
+                        raise TradeError(
+                            DEAL_INVALIDATED,
+                            "Player not owned by expected team",
+                            {
+                                "player_id": asset.player_id,
+                                "expected_team": from_team_id,
+                                "current_team": current_team_id,
+                            },
+                        )
+                    to_team_id = str(
+                        normalize_team_id(_resolve_receiver(deal, team_id, asset), strict=True)
                     )
-                to_team_id = str(normalize_team_id(_resolve_receiver(deal, team_id, asset), strict=True))
-                salary_amount = repo.get_salary_amount(pid)
-                player_snapshots.append(
-                    {
-                        "player_id": pid,
-                        "from_team_id": from_team_id,
-                        "to_team_id": to_team_id,
-                        "salary_amount": int(salary_amount) if salary_amount is not None else None,
+                    salary_amount = repo.get_salary_amount(pid)
+                    player_snapshots.append(
+                        {
+                            "player_id": pid,
+                            "from_team_id": from_team_id,
+                            "to_team_id": to_team_id,
+                            "salary_amount": int(salary_amount) if salary_amount is not None else None,
+                        }
+                    )
+                elif isinstance(asset, PickAsset):
+                    pick = draft_picks.get(asset.pick_id, {})
+                    ownership_snapshot[asset_key_value] = {
+                        "owner_team": str(pick.get("owner_team", "")).upper(),
+                        "protection": pick.get("protection"),
                     }
-                )
-            elif isinstance(asset, PickAsset):
-                pick = draft_picks.get(asset.pick_id, {})
-                ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(pick.get("owner_team", "")).upper(),
-                    "protection": pick.get("protection"),
-                }
-            elif isinstance(asset, SwapAsset):
-                swap = swap_rights.get(asset.swap_id, {})
-                ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(swap.get("owner_team", "")).upper()
-                }
-            elif isinstance(asset, FixedAsset):
-                fixed = fixed_assets.get(asset.asset_id, {})
-                ownership_snapshot[asset_key_value] = {
-                    "owner_team": str(fixed.get("owner_team", "")).upper()
-                }
+                elif isinstance(asset, SwapAsset):
+                    swap = swap_rights.get(asset.swap_id, {})
+                    ownership_snapshot[asset_key_value] = {
+                        "owner_team": str(swap.get("owner_team", "")).upper()
+                    }
+                elif isinstance(asset, FixedAsset):
+                    fixed = fixed_assets.get(asset.asset_id, {})
+                    ownership_snapshot[asset_key_value] = {
+                        "owner_team": str(fixed.get("owner_team", "")).upper()
+                    }
 
     player_snapshots.sort(
         key=lambda row: (row["player_id"], row["from_team_id"], row["to_team_id"])
