@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-# Legacy DataFrame/Excel-based simulation path is disabled.
-raise RuntimeError(
-    "Legacy DataFrame/Excel-based simulation path is disabled. "
-    "Use DB-backed simulation (roster_adapter -> sim_game -> matchengine_v2_adapter -> state)."
-)
-
+import os
 import random
+from contextlib import contextmanager
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
-from config import ROSTER_DF, TEAM_TO_CONF_DIV
-from match_engine import MatchEngine, Team
+from config import TEAM_TO_CONF_DIV
+from league_repo import LeagueRepo
+from matchengine_v2_adapter import adapt_matchengine_result_to_v2, build_context_from_team_ids
+from matchengine_v3.sim_game import simulate_game
+from sim.roster_adapter import build_team_state_from_db
 from state import (
     GAME_STATE,
+    _accumulate_player_rows,
     _ensure_league_state,
-    _update_playoff_player_stats_from_boxscore,
+    ingest_game_result,
     set_current_date,
 )
 from team_utils import get_conference_standings
@@ -26,6 +27,18 @@ HomePattern = [True, True, False, False, True, False, True]
 # ---------------------------------------------------------------------------
 # 상태 helpers
 # ---------------------------------------------------------------------------
+
+@contextmanager
+def _repo_ctx() -> LeagueRepo:
+    league = _ensure_league_state()
+    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+
+    with LeagueRepo(str(db_path)) as repo:
+        try:
+            repo.init_db()
+        except Exception:
+            pass
+        yield repo
 
 def _ensure_postseason_state() -> Dict[str, Any]:
     postseason = GAME_STATE.setdefault("postseason", {})
@@ -210,13 +223,6 @@ def _build_random_conf_field(conf_key: str, my_team_id: Optional[str]) -> Dict[s
     }
 
 
-def _find_team_df(team_id: str):
-    df = ROSTER_DF[ROSTER_DF["Team"] == team_id]
-    if df.empty:
-        raise ValueError(f"Team '{team_id}' not found in roster data")
-    return df
-
-
 def _simulate_postseason_game(
     home_team_id: str, away_team_id: str, game_date: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -230,20 +236,41 @@ def _simulate_postseason_game(
 
     set_current_date(game_date)
 
-    home_df = _find_team_df(home_team_id)
-    away_df = _find_team_df(away_team_id)
+    league = _ensure_league_state()
+    game_id = f"playoffs_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
+    context = build_context_from_team_ids(
+        game_id=game_id,
+        date_str=game_date,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+        league_state=league,
+        phase="playoffs",
+    )
 
-    home_team = Team(home_team_id, home_df)
-    away_team = Team(away_team_id, away_df)
-    engine = MatchEngine(home_team, away_team)
-    result = engine.simulate_game()
-    score = result.get("final_score", {})
+    rng = random.Random()
+    with _repo_ctx() as repo:
+        home_team = build_team_state_from_db(repo=repo, team_id=home_team_id)
+        away_team = build_team_state_from_db(repo=repo, team_id=away_team_id)
 
-    home_score = int(score.get(home_team_id, 0))
-    away_score = int(score.get(away_team_id, 0))
+    raw_result = simulate_game(rng, home_team, away_team)
+    v2_result = adapt_matchengine_result_to_v2(
+        raw_result=raw_result,
+        context=context,
+        engine_name="matchengine_v3",
+    )
+    ingest_game_result(game_result=v2_result, game_date=game_date)
+
+    postseason = _ensure_postseason_state()
+    playoff_stats = postseason.setdefault("playoff_player_stats", {})
+    for tid in (home_team_id, away_team_id):
+        rows = (v2_result.get("teams", {}).get(tid) or {}).get("players") or []
+        if isinstance(rows, list):
+            _accumulate_player_rows(rows, playoff_stats)
+
+    final = v2_result.get("final") or {}
+    home_score = int(final.get(home_team_id, 0))
+    away_score = int(final.get(away_team_id, 0))
     winner = home_team_id if home_score > away_score else away_team_id
-
-    _update_playoff_player_stats_from_boxscore(result.get("boxscore"))
 
     return {
         "date": game_date,
@@ -253,8 +280,8 @@ def _simulate_postseason_game(
         "away_score": away_score,
         "winner": winner,
         "status": "final",
-        "final_score": score,
-        "boxscore": result.get("boxscore"),
+        "final_score": final,
+        "boxscore": v2_result.get("teams"),
     }
 
 

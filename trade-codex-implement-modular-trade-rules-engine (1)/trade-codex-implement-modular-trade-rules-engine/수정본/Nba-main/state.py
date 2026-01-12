@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import random
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
@@ -469,12 +470,82 @@ def _ensure_league_state() -> Dict[str, Any]:
     _ensure_ingest_turn_backfilled()
     return league
 
+# -------------------------------------------------------------------------
+# 1B. 인터페이스 계약(Contract) 검증 유틸
+#  - validate_v2_game_result: ingest_game_result()가 기대하는 v2 스키마
+#  - validate_master_schedule_entry: master_schedule.games[*] 최소 엔트리 스키마
+# -------------------------------------------------------------------------
+
+_ALLOWED_SCHEDULE_STATUSES = {"scheduled", "final", "in_progress", "canceled"}
+
+
+def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master_schedule.entry") -> None:
+    """
+    master_schedule.games[*]에서 실제로 "사용되는 필드만" 최소 계약으로 고정한다.
+
+    Required:
+      - game_id: str (non-empty)
+      - home_team_id: str (non-empty)
+      - away_team_id: str (non-empty)
+      - status: str (allowed set)
+
+    Optional (if present, must be correct type):
+      - date: str (ISO-like recommended)
+      - season_id: str
+      - phase: str
+      - home_score/away_score: int|None
+      - home_tactics/away_tactics/tactics: dict|None  (프로젝트별로 사용하는 키가 달라도 안전하게 수용)
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"MasterScheduleEntry invalid: '{path}' must be a dict")
+
+    for k in ("game_id", "home_team_id", "away_team_id", "status"):
+        if k not in entry:
+            raise ValueError(f"MasterScheduleEntry invalid: missing {path}.{k}")
+
+    game_id = entry.get("game_id")
+    if not isinstance(game_id, str) or not game_id.strip():
+        raise ValueError(f"MasterScheduleEntry invalid: {path}.game_id must be a non-empty string")
+
+    for k in ("home_team_id", "away_team_id"):
+        v = entry.get(k)
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"MasterScheduleEntry invalid: {path}.{k} must be a non-empty string")
+
+    status = entry.get("status")
+    if not isinstance(status, str) or status not in _ALLOWED_SCHEDULE_STATUSES:
+        raise ValueError(
+            f"MasterScheduleEntry invalid: {path}.status must be one of {sorted(_ALLOWED_SCHEDULE_STATUSES)}"
+        )
+
+    # Optional: tactics payload(s)
+    for tk in ("tactics", "home_tactics", "away_tactics"):
+        if tk in entry and entry[tk] is not None and not isinstance(entry[tk], dict):
+            raise ValueError(f"MasterScheduleEntry invalid: {path}.{tk} must be a dict if present")
+
+    # Optional: date (string)
+    if "date" in entry and entry["date"] is not None and not isinstance(entry["date"], str):
+        raise ValueError(f"MasterScheduleEntry invalid: {path}.date must be a string if present")
+
+    # Optional: scores
+    for sk in ("home_score", "away_score"):
+        if sk in entry and entry[sk] is not None and not isinstance(entry[sk], int):
+            raise ValueError(f"MasterScheduleEntry invalid: {path}.{sk} must be int or None if present")
+
+
+def validate_v2_game_result(game_result: Dict[str, Any]) -> None:
+    """Public validator: raises ValueError if the v2 contract is violated."""
+    _validate_game_result_v2(game_result)
+
 
 def _ensure_master_schedule_indices() -> None:
     """Legacy state를 위해 master_schedule의 by_id 인덱스를 보장한다."""
     league = _ensure_league_state()
     master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
+    # Contract check: master_schedule entries must satisfy the minimal schema.
+    for i, g in enumerate(games):
+        validate_master_schedule_entry(g, path=f"master_schedule.games[{i}]")
     by_id = master_schedule.get("by_id")
     if not isinstance(by_id, dict) or len(by_id) != len(games):
         master_schedule["by_id"] = {
@@ -1095,7 +1166,7 @@ def ingest_game_result(
     store_raw_result: bool = True,
 ) -> Dict[str, Any]:
     """정식 GameResultV2 스키마 결과를 GAME_STATE에 반영한다."""
-    _validate_game_result_v2(game_result)
+    validate_v2_game_result(game_result))
 
     game = _require_dict(game_result["game"], "game")
     season_id = str(game["season_id"])
@@ -1345,6 +1416,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
