@@ -1254,6 +1254,196 @@ class LeagueRepo:
         if rows and rows["c"] <= 0:
             raise ValueError("no active roster entries found")
 
+        # draft_picks
+        draft_pick_rows = self._conn.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks;
+            """
+        ).fetchall()
+        pick_ids = {row["pick_id"] for row in draft_pick_rows}
+        for row in draft_pick_rows:
+            normalize_team_id(row["original_team"], strict=True)
+            normalize_team_id(row["owner_team"], strict=True)
+            try:
+                year = int(row["year"])
+            except (TypeError, ValueError):
+                raise ValueError(f"draft_picks.year invalid for pick_id={row['pick_id']}")
+            if year <= 0:
+                raise ValueError(f"draft_picks.year invalid for pick_id={row['pick_id']}")
+            try:
+                round_num = int(row["round"])
+            except (TypeError, ValueError):
+                raise ValueError(f"draft_picks.round invalid for pick_id={row['pick_id']}")
+            if round_num not in {1, 2}:
+                raise ValueError(f"draft_picks.round invalid for pick_id={row['pick_id']}")
+            protection_json = row["protection_json"]
+            if protection_json:
+                try:
+                    json.loads(protection_json)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"draft_picks.protection_json invalid for pick_id={row['pick_id']}"
+                    ) from exc
+
+        # swap_rights
+        swap_rows = self._conn.execute(
+            """
+            SELECT swap_id, year, pick_id_a, pick_id_b, owner_team, active
+            FROM swap_rights;
+            """
+        ).fetchall()
+        for row in swap_rows:
+            normalize_team_id(row["owner_team"], strict=True)
+            try:
+                year = int(row["year"])
+            except (TypeError, ValueError):
+                raise ValueError(f"swap_rights.year invalid for swap_id={row['swap_id']}")
+            if year <= 0:
+                raise ValueError(f"swap_rights.year invalid for swap_id={row['swap_id']}")
+            if row["active"] not in {0, 1}:
+                raise ValueError(f"swap_rights.active invalid for swap_id={row['swap_id']}")
+            if row["pick_id_a"] not in pick_ids:
+                raise ValueError(
+                    f"swap_rights.pick_id_a missing in draft_picks for swap_id={row['swap_id']}"
+                )
+            if row["pick_id_b"] not in pick_ids:
+                raise ValueError(
+                    f"swap_rights.pick_id_b missing in draft_picks for swap_id={row['swap_id']}"
+                )
+
+        # fixed_assets
+        fixed_asset_rows = self._conn.execute(
+            "SELECT asset_id, owner_team, source_pick_id FROM fixed_assets;"
+        ).fetchall()
+        for row in fixed_asset_rows:
+            normalize_team_id(row["owner_team"], strict=True)
+            source_pick_id = row["source_pick_id"]
+            if source_pick_id and source_pick_id not in pick_ids:
+                raise ValueError(
+                    "fixed_assets.source_pick_id missing in draft_picks "
+                    f"for asset_id={row['asset_id']}"
+                )
+
+        # asset_locks
+        asset_lock_rows = self._conn.execute(
+            "SELECT asset_key, deal_id, expires_at FROM asset_locks;"
+        ).fetchall()
+        trade_agreement_ids = {
+            row["deal_id"]
+            for row in self._conn.execute(
+                "SELECT deal_id FROM trade_agreements;"
+            ).fetchall()
+        }
+        for row in asset_lock_rows:
+            if row["deal_id"] not in trade_agreement_ids:
+                raise ValueError(
+                    f"asset_locks.deal_id missing in trade_agreements for asset_key={row['asset_key']}"
+                )
+            try:
+                _dt.datetime.fromisoformat(row["expires_at"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"asset_locks.expires_at invalid for asset_key={row['asset_key']}"
+                ) from exc
+
+        # trade_agreements
+        trade_agreement_rows = self._conn.execute(
+            """
+            SELECT deal_id, deal_json, assets_hash, created_at, expires_at, status
+            FROM trade_agreements;
+            """
+        ).fetchall()
+        valid_statuses = {"ACTIVE", "EXECUTED", "EXPIRED", "INVALIDATED"}
+        for row in trade_agreement_rows:
+            if row["status"] not in valid_statuses:
+                raise ValueError(
+                    f"trade_agreements.status invalid for deal_id={row['deal_id']}"
+                )
+            try:
+                json.loads(row["deal_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"trade_agreements.deal_json invalid for deal_id={row['deal_id']}"
+                ) from exc
+            assets_hash = row["assets_hash"]
+            if not isinstance(assets_hash, str) or not assets_hash.strip():
+                raise ValueError(
+                    f"trade_agreements.assets_hash invalid for deal_id={row['deal_id']}"
+                )
+            for field in ("created_at", "expires_at"):
+                value = row[field]
+                try:
+                    _dt.date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    try:
+                        _dt.datetime.fromisoformat(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"trade_agreements.{field} invalid for deal_id={row['deal_id']}"
+                        ) from exc
+
+        # transactions
+        transaction_rows = self._conn.execute(
+            "SELECT transaction_id, entry_json FROM transactions;"
+        ).fetchall()
+        for row in transaction_rows:
+            try:
+                json.loads(row["entry_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"transactions.entry_json invalid for transaction_id={row['transaction_id']}"
+                ) from exc
+
+        # negotiations
+        negotiation_rows = self._conn.execute(
+            """
+            SELECT session_id, session_json, status, created_at, updated_at
+            FROM negotiations;
+            """
+        ).fetchall()
+        for row in negotiation_rows:
+            try:
+                json.loads(row["session_json"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"negotiations.session_json invalid for session_id={row['session_id']}"
+                ) from exc
+            if not row["status"]:
+                raise ValueError(
+                    f"negotiations.status invalid for session_id={row['session_id']}"
+                )
+            for field in ("created_at", "updated_at"):
+                try:
+                    _dt.datetime.fromisoformat(row[field])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"negotiations.{field} invalid for session_id={row['session_id']}"
+                    ) from exc
+
+        # player_state
+        player_state_rows = self._conn.execute(
+            "SELECT player_id, trade_return_bans_json FROM player_state;"
+        ).fetchall()
+        player_ids = {
+            row["player_id"]
+            for row in self._conn.execute("SELECT player_id FROM players;").fetchall()
+        }
+        for row in player_state_rows:
+            if row["player_id"] not in player_ids:
+                raise ValueError(
+                    f"player_state.player_id missing in players: {row['player_id']}"
+                )
+            trade_return_bans_json = row["trade_return_bans_json"]
+            if trade_return_bans_json:
+                try:
+                    json.loads(trade_return_bans_json)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "player_state.trade_return_bans_json invalid for player_id="
+                        f"{row['player_id']}"
+                    ) from exc
+
     def _smoke_check(self) -> None:
         """
         Lightweight self-check for repo wiring.
