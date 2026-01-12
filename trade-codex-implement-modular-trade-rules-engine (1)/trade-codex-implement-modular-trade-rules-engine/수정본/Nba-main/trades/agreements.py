@@ -44,45 +44,45 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    repo = LeagueRepo(get_league_db_path())
-    repo.init_db()
-    for team_id, assets in deal.legs.items():
-        for asset in assets:
-            asset_key_value = asset_key(asset)
-            if isinstance(asset, PlayerAsset):
-                pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
-                from_team_id = str(normalize_team_id(team_id, strict=True))
-                try:
-                    current_team_id = repo.get_team_id_by_player(pid)
-                except Exception as exc:
-                    raise ValueError(f"Player not found in roster: {asset.player_id}") from exc
-                if current_team_id != from_team_id:
-                    raise ValueError(
-                        f"Player {asset.player_id} not owned by {from_team_id} (current: {current_team_id})"
+    with LeagueRepo(get_league_db_path()) as repo:
+        repo.init_db()
+        for team_id, assets in deal.legs.items():
+            for asset in assets:
+                asset_key_value = asset_key(asset)
+                if isinstance(asset, PlayerAsset):
+                    pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
+                    from_team_id = str(normalize_team_id(team_id, strict=True))
+                    try:
+                        current_team_id = repo.get_team_id_by_player(pid)
+                    except Exception as exc:
+                        raise ValueError(f"Player not found in roster: {asset.player_id}") from exc
+                    if current_team_id != from_team_id:
+                        raise ValueError(
+                            f"Player {asset.player_id} not owned by {from_team_id} (current: {current_team_id})"
+                        )
+                    to_team_id = str(normalize_team_id(_resolve_receiver(deal, team_id, asset), strict=True))
+                    salary_amount = repo.get_salary_amount(pid)
+                    player_snapshots.append(
+                        {
+                            "player_id": pid,
+                            "from_team_id": from_team_id,
+                            "to_team_id": to_team_id,
+                            "salary_amount": int(salary_amount) if salary_amount is not None else None,
+                        }
                     )
-                to_team_id = str(normalize_team_id(_resolve_receiver(deal, team_id, asset), strict=True))
-                salary_amount = repo.get_salary_amount(pid)
-                player_snapshots.append(
-                    {
-                        "player_id": pid,
-                        "from_team_id": from_team_id,
-                        "to_team_id": to_team_id,
-                        "salary_amount": int(salary_amount) if salary_amount is not None else None,
+                elif isinstance(asset, PickAsset):
+                    ownership_snapshot[asset_key_value] = {
+                        "pick_id": asset.pick_id,
+                        "protection": asset.protection,
                     }
-                )
-            elif isinstance(asset, PickAsset):
-                ownership_snapshot[asset_key_value] = {
-                    "pick_id": asset.pick_id,
-                    "protection": asset.protection,
-                }
-            elif isinstance(asset, SwapAsset):
-                ownership_snapshot[asset_key_value] = {
-                    "swap_id": asset.swap_id,
-                    "pick_id_a": asset.pick_id_a,
-                    "pick_id_b": asset.pick_id_b,
-                }
-            elif isinstance(asset, FixedAsset):
-                ownership_snapshot[asset_key_value] = {"asset_id": asset.asset_id}
+                elif isinstance(asset, SwapAsset):
+                    ownership_snapshot[asset_key_value] = {
+                        "swap_id": asset.swap_id,
+                        "pick_id_a": asset.pick_id_a,
+                        "pick_id_b": asset.pick_id_b,
+                    }
+                elif isinstance(asset, FixedAsset):
+                    ownership_snapshot[asset_key_value] = {"asset_id": asset.asset_id}
 
     player_snapshots.sort(
         key=lambda row: (row["player_id"], row["from_team_id"], row["to_team_id"])
