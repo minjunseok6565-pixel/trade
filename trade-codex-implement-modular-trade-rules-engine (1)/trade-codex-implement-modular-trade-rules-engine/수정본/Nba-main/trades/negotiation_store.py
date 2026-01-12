@@ -24,10 +24,7 @@ def _load_session_row(session_id: str) -> dict:
     db_path = _get_db_path()
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        row = repo._conn.execute(
-            "SELECT session_json FROM trade_negotiations WHERE session_id=?;",
-            (session_id,),
-        ).fetchone()
+        row = repo.get_negotiation(session_id)
         if not row:
             raise TradeError(
                 NEGOTIATION_NOT_FOUND,
@@ -49,18 +46,12 @@ def _persist_session(session: Dict[str, Any]) -> None:
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
-            cur.execute(
-                """
-                UPDATE trade_negotiations
-                SET session_json=?, status=?, updated_at=?
-                WHERE session_id=?;
-                """,
-                (
-                    json.dumps(session),
-                    session.get("status", "ACTIVE"),
-                    session.get("updated_at") or _now_iso(),
-                    session["session_id"],
-                ),
+            repo.update_negotiation(
+                session_id=session["session_id"],
+                session_json=json.dumps(session),
+                status=session.get("status", "ACTIVE"),
+                updated_at=session.get("updated_at") or _now_iso(),
+                cursor=cur,
             )
         repo.validate_integrity()
 
@@ -139,23 +130,13 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
-            cur.execute(
-                """
-                INSERT INTO trade_negotiations(
-                    session_id,
-                    session_json,
-                    status,
-                    created_at,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?);
-                """,
-                (
-                    session_id,
-                    json.dumps(session),
-                    session["status"],
-                    session["created_at"],
-                    session["updated_at"],
-                ),
+            repo.save_negotiation(
+                session_id=session_id,
+                session_json=json.dumps(session),
+                status=session["status"],
+                created_at=session["created_at"],
+                updated_at=session["updated_at"],
+                cursor=cur,
             )
         repo.validate_integrity()
     return session

@@ -69,10 +69,10 @@ def append_trade_transaction(
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         with repo.transaction() as cur:
-            cur.execute(
-                "INSERT INTO trade_transactions(created_at, entry_json) VALUES (?, ?);",
-                (current_date, json.dumps(entry)),
+            entry["transaction_id"] = repo.log_transaction(
+                current_date,
+                json.dumps(entry),
+                cursor=cur,
             )
-            entry["transaction_id"] = cur.lastrowid
         repo.validate_integrity()
     return entry
