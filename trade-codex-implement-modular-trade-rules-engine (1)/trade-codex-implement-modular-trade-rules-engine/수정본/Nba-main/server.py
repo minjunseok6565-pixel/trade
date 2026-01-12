@@ -22,7 +22,7 @@ from state import (
     get_schedule_summary,
     initialize_master_schedule_if_needed,
 )
-from league_sim import simulate_single_game, advance_league_until
+from sim.league_sim import simulate_single_game, advance_league_until
 from playoffs import (
     auto_advance_current_round,
     advance_my_team_one_game,
@@ -177,7 +177,7 @@ def extract_text_from_gemini_response(resp: Any) -> str:
 # -------------------------------------------------------------------------
 @app.post("/api/simulate-game")
 async def api_simulate_game(req: SimGameRequest):
-    """match_engine.MatchEngine을 사용해 한 경기를 시뮬레이션한다."""
+    """matchengine_v3를 사용해 한 경기를 시뮬레이션한다."""
     try:
         result = simulate_single_game(
             home_team_id=req.home_team_id,
