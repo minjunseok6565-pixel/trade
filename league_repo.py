@@ -781,70 +781,70 @@ class LeagueRepo:
                 rows,
             )
 
-    def set_player_contracts(self, mapping: Mapping[str, Any]) -> None:
-        now = _utc_now_iso()
-        rows = []
-        for pid, cids in mapping.items():
-            try:
-                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
-            except Exception:
-                continue
-            if not isinstance(cids, list):
-                continue
-            for cid in cids:
-                if cid:
-                    rows.append((player_id, str(cid)))
-        with self.transaction() as cur:
-            cur.execute("DELETE FROM player_contracts;")
-            if rows:
-                cur.executemany(
-                    "INSERT OR IGNORE INTO player_contracts(player_id, contract_id) VALUES (?, ?);",
-                    rows,
-                )
+    def rebuild_contract_indices(self) -> None:
+        """Rebuild derived index tables from SSOT sources.
 
-    def set_active_contracts(self, mapping: Mapping[str, Any]) -> None:
+        SSOT rules (as agreed):
+          - free_agents: derived from roster.team_id == 'FA'
+          - active_contracts: derived from contracts.is_active == 1
+          - player_contracts: derived from contracts (player_id -> contract_id)
+
+        Intended usage:
+          - one-time migrations from legacy GAME_STATE ledgers
+          - integrity repair / deterministic rebuilds
+        """
         now = _utc_now_iso()
-        rows = []
-        contract_ids = []
-        for pid, cid in mapping.items():
-            try:
-                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
-            except Exception:
-                continue
-            if not cid:
-                continue
-            contract_id = str(cid)
-            rows.append((player_id, contract_id, now))
-            contract_ids.append(contract_id)
         with self.transaction() as cur:
+            # 1) player_contracts: one row per (player_id, contract_id) found in contracts.
+            cur.execute("DELETE FROM player_contracts;")
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO player_contracts(player_id, contract_id)
+                SELECT player_id, contract_id
+                FROM contracts
+                WHERE player_id IS NOT NULL AND contract_id IS NOT NULL;
+                """
+            )
+
+            # 2) active_contracts: one active contract per player, based on contracts.is_active.
             cur.execute("DELETE FROM active_contracts;")
-            cur.execute("UPDATE contracts SET is_active=0;")
-            if rows:
+            active_rows = cur.execute(
+                """
+                SELECT contract_id, player_id, COALESCE(updated_at, created_at, '') AS ts
+                FROM contracts
+                WHERE is_active=1 AND player_id IS NOT NULL AND contract_id IS NOT NULL;
+                """
+            ).fetchall()
+            best: Dict[str, Tuple[str, str]] = {}
+            for r in active_rows:
+                pid = str(r["player_id"])
+                cid = str(r["contract_id"])
+                ts = str(r["ts"] or "")
+                prev = best.get(pid)
+                if prev is None:
+                    best[pid] = (ts, cid)
+                    continue
+                # Prefer newest timestamp; tie-break by contract_id for determinism.
+                if ts > prev[0] or (ts == prev[0] and cid > prev[1]):
+                    best[pid] = (ts, cid)
+
+            if best:
                 cur.executemany(
                     "INSERT OR REPLACE INTO active_contracts(player_id, contract_id, updated_at) VALUES (?, ?, ?);",
-                    rows,
-                )
-                cur.executemany(
-                    "UPDATE contracts SET is_active=1, updated_at=? WHERE contract_id=?;",
-                    [(now, cid) for cid in contract_ids],
+                    [(pid, cid, now) for pid, (_, cid) in best.items()],
                 )
 
-    def set_free_agents(self, player_ids: Sequence[str]) -> None:
-        now = _utc_now_iso()
-        rows = []
-        for pid in player_ids:
-            try:
-                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
-            except Exception:
-                continue
-            rows.append((player_id, now))
-        with self.transaction() as cur:
+            # 3) free_agents: derived from roster team assignment.
             cur.execute("DELETE FROM free_agents;")
-            if rows:
-                cur.executemany(
-                    "INSERT OR REPLACE INTO free_agents(player_id, updated_at) VALUES (?, ?);",
-                    rows,
-                )
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO free_agents(player_id, updated_at)
+                SELECT player_id, ?
+                FROM roster
+                WHERE status='active' AND UPPER(team_id)='FA' AND player_id IS NOT NULL;
+                """,
+                (now,),
+            )   
 
     def ensure_contracts_bootstrapped_from_roster(self, season_year: int) -> None:
         """state에 contract ledger를 만들지 않고, DB contracts만 최소로 보장한다.
