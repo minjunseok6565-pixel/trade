@@ -100,13 +100,9 @@ GAME_STATE: Dict[str, Any] = {
     },
     "teams": {},      # 팀 성향 / 메타 정보
     "players": {},    # 선수 메타 정보
-    "transactions": [],  # 트레이드 등 기록
     "trade_agreements": {},  # deal_id -> committed deal data
     "negotiations": {},  # session_id -> negotiation sessions
-    "draft_picks": {},  # Phase 3 later
     "asset_locks": {},  # asset_key -> {deal_id, expires_at}
-    "swap_rights": {},
-    "fixed_assets": {},
     "trade_market": {
         "last_tick_date": None,
         "listings": {},
@@ -117,7 +113,6 @@ GAME_STATE: Dict[str, Any] = {
     "trade_memory": {
         "relationships": {},
     },
-    "gm_profiles": {},
 }
 
 
@@ -434,8 +429,69 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("last_gm_tick_date", None)
     from league_repo import LeagueRepo
 
+    migrations = GAME_STATE.setdefault("_migrations", {})
     with LeagueRepo(db_path) as repo:
         repo.init_db()
+        # gm_profiles is now stored in DB (SSOT). Migrate legacy in-memory data once.
+        if migrations.get("gm_profiles_migrated_to_db") is not True:
+            legacy_profiles = GAME_STATE.get("gm_profiles")
+            if isinstance(legacy_profiles, dict) and legacy_profiles:
+                repo.upsert_gm_profiles(legacy_profiles)
+        # Keep rows ready for all teams (idempotent).
+        repo.ensure_gm_profiles_seeded(ALL_TEAM_IDS)
+
+        # --- Additional DB migrations (SSOT move) ---
+        if migrations.get("trade_assets_migrated_to_db") is not True:
+            legacy_draft_picks = GAME_STATE.get("draft_picks")
+            if isinstance(legacy_draft_picks, dict) and legacy_draft_picks:
+                repo.upsert_draft_picks(legacy_draft_picks)
+            legacy_swap_rights = GAME_STATE.get("swap_rights")
+            if isinstance(legacy_swap_rights, dict) and legacy_swap_rights:
+                repo.upsert_swap_rights(legacy_swap_rights)
+            legacy_fixed_assets = GAME_STATE.get("fixed_assets")
+            if isinstance(legacy_fixed_assets, dict) and legacy_fixed_assets:
+                repo.upsert_fixed_assets(legacy_fixed_assets)
+
+        if migrations.get("transactions_migrated_to_db") is not True:
+            legacy_transactions = GAME_STATE.get("transactions")
+            if isinstance(legacy_transactions, list) and legacy_transactions:
+                repo.insert_transactions(legacy_transactions)
+
+        if migrations.get("contracts_ledger_migrated_to_db") is not True:
+            legacy_contracts = GAME_STATE.get("contracts")
+            if isinstance(legacy_contracts, dict) and legacy_contracts:
+                repo.upsert_contract_records(legacy_contracts)
+            legacy_player_contracts = GAME_STATE.get("player_contracts")
+            if isinstance(legacy_player_contracts, dict) and legacy_player_contracts:
+                repo.set_player_contracts(legacy_player_contracts)
+            legacy_active = GAME_STATE.get("active_contract_id_by_player")
+            if isinstance(legacy_active, dict) and legacy_active:
+                repo.set_active_contracts(legacy_active)
+            legacy_free_agents = GAME_STATE.get("free_agents")
+            if isinstance(legacy_free_agents, list) and legacy_free_agents:
+                repo.set_free_agents(legacy_free_agents)
+                
+    if migrations.get("gm_profiles_migrated_to_db") is not True:
+        GAME_STATE.pop("gm_profiles", None)
+        migrations["gm_profiles_migrated_to_db"] = True
+    if migrations.get("trade_assets_migrated_to_db") is not True:
+        GAME_STATE.pop("draft_picks", None)
+        GAME_STATE.pop("swap_rights", None)
+        GAME_STATE.pop("fixed_assets", None)
+        migrations["trade_assets_migrated_to_db"] = True
+
+    if migrations.get("transactions_migrated_to_db") is not True:
+        GAME_STATE.pop("transactions", None)
+        migrations["transactions_migrated_to_db"] = True
+
+    if migrations.get("contracts_ledger_migrated_to_db") is not True:
+        GAME_STATE.pop("contracts", None)
+        GAME_STATE.pop("player_contracts", None)
+        GAME_STATE.pop("active_contract_id_by_player", None)
+        GAME_STATE.pop("free_agents", None)
+        migrations["contracts_ledger_migrated_to_db"] = True
+
+
     season_year = league.get("season_year")
     salary_cap = trade_rules.get("salary_cap")
     if season_year:
@@ -447,24 +503,27 @@ def _ensure_league_state() -> Dict[str, Any]:
             # Fix legacy saves so SalaryMatchingRule doesn't treat cap/aprons as zero.
             _apply_cap_model_for_season(league, int(season_year))
     _ensure_trade_state()
-    from contracts.store import ensure_contract_state
-
-    ensure_contract_state(GAME_STATE)
     from team_utils import _init_players_and_teams_if_needed
 
     _init_players_and_teams_if_needed()
     # Normalize player IDs to canonical strings (prevents "12" vs 12 splits).
     normalize_player_ids(GAME_STATE)
 
-    # Contracts bootstrap: prefer DB-based bootstrap if available (Step 2),
-    # fall back to legacy Excel bootstrap for older saves.
-    try:
-        from contracts.bootstrap import bootstrap_contracts_from_repo as _bootstrap_contracts
-    except ImportError:
-        from contracts.bootstrap import bootstrap_contracts_from_roster_excel as _bootstrap_contracts
+    # Contracts are DB(SSOT). Ensure DB has minimum seeded contracts from roster without state ledgers.
+    if season_year:
+        try:
+            season_year_int = int(season_year)
+        except (TypeError, ValueError):
+            season_year_int = None
+        if season_year_int:
+            with LeagueRepo(db_path) as repo:
+                repo.init_db()
+                repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
  
 
-    _bootstrap_contracts(GAME_STATE, overwrite=False)
+    # Contracts bootstrap: prefer DB-based bootstrap if available (Step 2),
+    # fall back to legacy Excel bootstrap for older saves.
+   
     with LeagueRepo(db_path) as repo:
         repo.validate_integrity()
     _ensure_ingest_turn_backfilled()
@@ -629,17 +688,16 @@ _DEFAULT_TRADE_MEMORY: Dict[str, Any] = {
 
 
 def _ensure_trade_state() -> None:
-    """트레이드 관련 GAME_STATE 키를 보장한다."""
+    """트레이드 관련 GAME_STATE 키를 보장한다.
+
+    NOTE: draft_picks/swap_rights/fixed_assets/transactions 는 DB로 이동 (SSOT).
+    """
     GAME_STATE.setdefault("trade_market", dict(_DEFAULT_TRADE_MARKET))
     GAME_STATE.setdefault("trade_memory", dict(_DEFAULT_TRADE_MEMORY))
-    GAME_STATE.setdefault("gm_profiles", {})
 
     GAME_STATE.setdefault("trade_agreements", {})
     GAME_STATE.setdefault("negotiations", {})
-    GAME_STATE.setdefault("draft_picks", {})
     GAME_STATE.setdefault("asset_locks", {})
-    GAME_STATE.setdefault("swap_rights", {})
-    GAME_STATE.setdefault("fixed_assets", {})
 
 
 def _is_number(value: Any) -> bool:
@@ -728,7 +786,7 @@ def _build_master_schedule(season_year: int) -> None:
       * 한 팀은 하루에 최대 1경기
     """
     league = _ensure_league_state()
-    from trades.picks import init_draft_picks_if_needed
+    from league_repo import LeagueRepo
 
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
     # draft_year는 "드래프트 연도" (예: 2025-26 시즌이면 2026)
@@ -751,9 +809,10 @@ def _build_master_schedule(season_year: int) -> None:
         stepien_lookahead = 7
 
     years_ahead = max(max_pick_years_ahead, stepien_lookahead + 1)
-    init_draft_picks_if_needed(
-        GAME_STATE, league["draft_year"], list(ALL_TEAM_IDS), years_ahead=years_ahead
-    )
+    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        repo.ensure_draft_picks_seeded(league["draft_year"], list(ALL_TEAM_IDS), years_ahead=years_ahead)
 
     season_start = date(season_year, SEASON_START_MONTH, SEASON_START_DAY)
     teams = list(ALL_TEAM_IDS)
@@ -1416,6 +1475,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
