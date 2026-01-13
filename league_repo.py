@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
+import hashlib
 import json
 import re
 import sqlite3
@@ -45,6 +46,7 @@ try:
         TeamId,
         normalize_player_id,
         normalize_team_id,
+        season_id_from_year,
         assert_unique_ids,
         ROSTER_COL_PLAYER_ID,
         ROSTER_COL_TEAM_ID,
@@ -67,6 +69,14 @@ _WEIGHT_RE = re.compile(r"^\s*(\d+)\s*(?:lbs?)?\s*$", re.IGNORECASE)
 def _utc_now_iso() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(
+        obj,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
 
 def parse_height_in(value: Any) -> Optional[int]:
     """Convert \"6' 5\"\" to inches. If unknown, return None."""
@@ -188,6 +198,15 @@ class LeagueRepo:
     # Schema
     # ------------------------
 
+    def _ensure_table_columns(self, cur: sqlite3.Cursor, table: str, columns: Mapping[str, str]) -> None:
+        """SQLite에는 ADD COLUMN IF NOT EXISTS가 없어서 PRAGMA로 확인 후 추가한다."""
+        rows = cur.execute(f"PRAGMA table_info({table});").fetchall()
+        existing = {r["name"] for r in rows}
+        for col, ddl in columns.items():
+            if col in existing:
+                continue
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};")
+
     def init_db(self) -> None:
         """Create tables if they don't exist."""
         now = _utc_now_iso()
@@ -243,7 +262,636 @@ class LeagueRepo:
 
                 CREATE INDEX IF NOT EXISTS idx_contracts_player_id ON contracts(player_id);
                 CREATE INDEX IF NOT EXISTS idx_contracts_team_id ON contracts(team_id);
+
+                -- Draft picks (SSOT)
+                CREATE TABLE IF NOT EXISTS draft_picks (
+                    pick_id TEXT PRIMARY KEY,
+                    year INTEGER NOT NULL,
+                    round INTEGER NOT NULL,
+                    original_team TEXT NOT NULL,
+                    owner_team TEXT NOT NULL,
+                    protection_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_draft_picks_owner ON draft_picks(owner_team);
+                CREATE INDEX IF NOT EXISTS idx_draft_picks_year_round ON draft_picks(year, round);
+
+                -- Swap rights (SSOT)
+                CREATE TABLE IF NOT EXISTS swap_rights (
+                    swap_id TEXT PRIMARY KEY,
+                    pick_id_a TEXT NOT NULL,
+                    pick_id_b TEXT NOT NULL,
+                    year INTEGER,
+                    round INTEGER,
+                    owner_team TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_by_deal_id TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_swap_rights_owner ON swap_rights(owner_team);
+                CREATE INDEX IF NOT EXISTS idx_swap_rights_year_round ON swap_rights(year, round);
+
+                -- Fixed assets (SSOT)
+                CREATE TABLE IF NOT EXISTS fixed_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    label TEXT,
+                    value REAL,
+                    owner_team TEXT NOT NULL,
+                    source_pick_id TEXT,
+                    draft_year INTEGER,
+                    attrs_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_fixed_assets_owner ON fixed_assets(owner_team);
+
+                -- Transactions log (SSOT)
+                CREATE TABLE IF NOT EXISTS transactions_log (
+                    tx_hash TEXT PRIMARY KEY,
+                    tx_type TEXT NOT NULL,
+                    tx_date TEXT,
+                    deal_id TEXT,
+                    source TEXT,
+                    teams_json TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions_log(tx_date);
+
+                -- Contract indices (legacy-compatible SSOT)
+                CREATE TABLE IF NOT EXISTS player_contracts (
+                    player_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    PRIMARY KEY(player_id, contract_id),
+                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE,
+                    FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS active_contracts (
+                    player_id TEXT PRIMARY KEY,
+                    contract_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE,
+                    FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS free_agents (
+                    player_id TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
+                );
+
+
+                -- AI GM profiles (team_id -> JSON blob)
+                CREATE TABLE IF NOT EXISTS gm_profiles (
+                    team_id TEXT PRIMARY KEY,
+                    profile_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
+            )
+          
+            # Extend contracts table with full JSON storage (optional but required for SSOT migration)
+            self._ensure_table_columns(
+                cur,
+                "contracts",
+                {
+                    "signed_date": "TEXT",
+                    "start_season_year": "INTEGER",
+                    "years": "INTEGER",
+                    "options_json": "TEXT",
+                    "status": "TEXT",
+                    "contract_json": "TEXT",
+                },
+            )
+
+    # ------------------------
+    # Draft Picks / Swaps / Fixed Assets
+    # ------------------------
+
+    def upsert_draft_picks(self, picks_by_id: Mapping[str, Any]) -> None:
+        if not picks_by_id:
+            return
+        now = _utc_now_iso()
+        rows = []
+        for pick_id, pick in picks_by_id.items():
+            if not isinstance(pick, dict):
+                continue
+            pid = str(pick.get("pick_id") or pick_id)
+            try:
+                year = int(pick.get("year") or 0)
+            except Exception:
+                year = 0
+            try:
+                rnd = int(pick.get("round") or 0)
+            except Exception:
+                rnd = 0
+            original = str(pick.get("original_team") or "").upper()
+            owner = str(pick.get("owner_team") or "").upper()
+            protection = pick.get("protection")
+            rows.append((pid, year, rnd, original, owner, _json_dumps(protection) if protection is not None else None, now, now))
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT INTO draft_picks(pick_id, year, round, original_team, owner_team, protection_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pick_id) DO UPDATE SET
+                    year=excluded.year,
+                    round=excluded.round,
+                    original_team=excluded.original_team,
+                    owner_team=excluded.owner_team,
+                    protection_json=excluded.protection_json,
+                    updated_at=excluded.updated_at;
+                """,
+                rows,
+            )
+
+    def ensure_draft_picks_seeded(self, draft_year: int, team_ids: Iterable[str], *, years_ahead: int = 7) -> None:
+        now = _utc_now_iso()
+        team_ids = [str(normalize_team_id(t, strict=False)).upper() for t in team_ids]
+        with self.transaction() as cur:
+            for year in range(int(draft_year), int(draft_year) + int(years_ahead) + 1):
+                for rnd in (1, 2):
+                    for tid in team_ids:
+                        pick_id = f"{year}_R{rnd}_{tid}"
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO draft_picks(pick_id, year, round, original_team, owner_team, protection_json, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, NULL, ?, ?);
+                            """,
+                            (pick_id, year, rnd, tid, tid, now, now),
+                        )
+
+    def upsert_swap_rights(self, swaps_by_id: Mapping[str, Any]) -> None:
+        if not swaps_by_id:
+            return
+        now = _utc_now_iso()
+        rows = []
+        for sid, swap in swaps_by_id.items():
+            if not isinstance(swap, dict):
+                continue
+            swap_id = str(swap.get("swap_id") or sid)
+            rows.append(
+                (
+                    swap_id,
+                    str(swap.get("pick_id_a") or ""),
+                    str(swap.get("pick_id_b") or ""),
+                    int(swap.get("year") or 0) if str(swap.get("year") or "").isdigit() else None,
+                    int(swap.get("round") or 0) if str(swap.get("round") or "").isdigit() else None,
+                    str(swap.get("owner_team") or "").upper(),
+                    1 if swap.get("active", True) else 0,
+                    str(swap.get("created_by_deal_id") or "") if swap.get("created_by_deal_id") is not None else None,
+                    str(swap.get("created_at") or now),
+                    now,
+                )
+            )
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT INTO swap_rights(swap_id, pick_id_a, pick_id_b, year, round, owner_team, active, created_by_deal_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(swap_id) DO UPDATE SET
+                    pick_id_a=excluded.pick_id_a,
+                    pick_id_b=excluded.pick_id_b,
+                    year=excluded.year,
+                    round=excluded.round,
+                    owner_team=excluded.owner_team,
+                    active=excluded.active,
+                    created_by_deal_id=excluded.created_by_deal_id,
+                    updated_at=excluded.updated_at;
+                """,
+                rows,
+            )
+
+    def upsert_fixed_assets(self, assets_by_id: Mapping[str, Any]) -> None:
+        if not assets_by_id:
+            return
+        now = _utc_now_iso()
+        rows = []
+        for aid, asset in assets_by_id.items():
+            if not isinstance(asset, dict):
+                continue
+            asset_id = str(asset.get("asset_id") or aid)
+            label = asset.get("label")
+            value = asset.get("value")
+            try:
+                value_f = float(value) if value is not None else None
+            except Exception:
+                value_f = None
+            owner = str(asset.get("owner_team") or "").upper()
+            source_pick_id = asset.get("source_pick_id")
+            draft_year = asset.get("draft_year")
+            try:
+                draft_year_i = int(draft_year) if draft_year is not None else None
+            except Exception:
+                draft_year_i = None
+            attrs = dict(asset)
+            rows.append((asset_id, str(label) if label is not None else None, value_f, owner, str(source_pick_id) if source_pick_id is not None else None, draft_year_i, _json_dumps(attrs), now, now))
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT INTO fixed_assets(asset_id, label, value, owner_team, source_pick_id, draft_year, attrs_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    label=excluded.label,
+                    value=excluded.value,
+                    owner_team=excluded.owner_team,
+                    source_pick_id=excluded.source_pick_id,
+                    draft_year=excluded.draft_year,
+                    attrs_json=excluded.attrs_json,
+                    updated_at=excluded.updated_at;
+                """,
+                rows,
+            )
+
+    # ------------------------
+    # Transactions log
+    # ------------------------
+
+    def insert_transactions(self, entries: Sequence[Mapping[str, Any]]) -> None:
+        if not entries:
+            return
+        now = _utc_now_iso()
+        rows = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            payload = _json_dumps(e)
+            tx_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+            rows.append(
+                (
+                    tx_hash,
+                    str(e.get("type") or "unknown"),
+                    str(e.get("date") or "") if e.get("date") is not None else None,
+                    str(e.get("deal_id") or "") if e.get("deal_id") is not None else None,
+                    str(e.get("source") or "") if e.get("source") is not None else None,
+                    _json_dumps(e.get("teams") or []),
+                    payload,
+                    now,
+                )
+            )
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT OR IGNORE INTO transactions_log(tx_hash, tx_type, tx_date, deal_id, source, teams_json, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                rows,
+            )
+
+    # ------------------------
+    # Contracts ledger (legacy-compatible SSOT)
+    # ------------------------
+
+    def upsert_contract_records(self, contracts_by_id: Mapping[str, Any]) -> None:
+        if not contracts_by_id:
+            return
+        now = _utc_now_iso()
+        rows = []
+        for cid, c in contracts_by_id.items():
+            if not isinstance(c, dict):
+                continue
+            contract_id = str(c.get("contract_id") or cid)
+            player_id = str(normalize_player_id(c.get("player_id"), strict=False, allow_legacy_numeric=True))
+            team_id = c.get("team_id")
+            team_id_norm = str(normalize_team_id(team_id, strict=False)).upper() if team_id else ""
+            signed_date = c.get("signed_date")
+            start_year = c.get("start_season_year")
+            years = c.get("years")
+            status = str(c.get("status") or "")
+            options = c.get("options") or []
+            salary_by_year = c.get("salary_by_year") or {}
+            try:
+                start_year_i = int(start_year) if start_year is not None else None
+            except Exception:
+                start_year_i = None
+            try:
+                years_i = int(years) if years is not None else None
+            except Exception:
+                years_i = None
+            start_season_id = str(season_id_from_year(start_year_i)) if start_year_i else None
+            end_season_id = str(season_id_from_year(start_year_i + max((years_i or 1) - 1, 0))) if start_year_i and years_i else start_season_id
+            salary_json = _json_dumps(salary_by_year)
+            contract_json = _json_dumps(c)
+            is_active = 1 if status.strip().upper() == "ACTIVE" else 0
+            rows.append(
+                (
+                    contract_id,
+                    player_id,
+                    team_id_norm,
+                    start_season_id,
+                    end_season_id,
+                    salary_json,
+                    "STANDARD",
+                    is_active,
+                    now,
+                    now,
+                    str(signed_date) if signed_date is not None else None,
+                    start_year_i,
+                    years_i,
+                    _json_dumps(options),
+                    status,
+                    contract_json,
+                )
+            )
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT INTO contracts(
+                    contract_id, player_id, team_id, start_season_id, end_season_id,
+                    salary_by_season_json, contract_type, is_active, created_at, updated_at,
+                    signed_date, start_season_year, years, options_json, status, contract_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(contract_id) DO UPDATE SET
+                    player_id=excluded.player_id,
+                    team_id=excluded.team_id,
+                    start_season_id=excluded.start_season_id,
+                    end_season_id=excluded.end_season_id,
+                    salary_by_season_json=excluded.salary_by_season_json,
+                    contract_type=excluded.contract_type,
+                    is_active=excluded.is_active,
+                    updated_at=excluded.updated_at,
+                    signed_date=excluded.signed_date,
+                    start_season_year=excluded.start_season_year,
+                    years=excluded.years,
+                    options_json=excluded.options_json,
+                    status=excluded.status,
+                    contract_json=excluded.contract_json;
+                """,
+                rows,
+            )
+
+    def set_player_contracts(self, mapping: Mapping[str, Any]) -> None:
+        now = _utc_now_iso()
+        rows = []
+        for pid, cids in mapping.items():
+            try:
+                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            except Exception:
+                continue
+            if not isinstance(cids, list):
+                continue
+            for cid in cids:
+                if cid:
+                    rows.append((player_id, str(cid)))
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM player_contracts;")
+            if rows:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO player_contracts(player_id, contract_id) VALUES (?, ?);",
+                    rows,
+                )
+
+    def set_active_contracts(self, mapping: Mapping[str, Any]) -> None:
+        now = _utc_now_iso()
+        rows = []
+        contract_ids = []
+        for pid, cid in mapping.items():
+            try:
+                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            except Exception:
+                continue
+            if not cid:
+                continue
+            contract_id = str(cid)
+            rows.append((player_id, contract_id, now))
+            contract_ids.append(contract_id)
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM active_contracts;")
+            cur.execute("UPDATE contracts SET is_active=0;")
+            if rows:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO active_contracts(player_id, contract_id, updated_at) VALUES (?, ?, ?);",
+                    rows,
+                )
+                cur.executemany(
+                    "UPDATE contracts SET is_active=1, updated_at=? WHERE contract_id=?;",
+                    [(now, cid) for cid in contract_ids],
+                )
+
+    def set_free_agents(self, player_ids: Sequence[str]) -> None:
+        now = _utc_now_iso()
+        rows = []
+        for pid in player_ids:
+            try:
+                player_id = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            except Exception:
+                continue
+            rows.append((player_id, now))
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM free_agents;")
+            if rows:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO free_agents(player_id, updated_at) VALUES (?, ?);",
+                    rows,
+                )
+
+    def ensure_contracts_bootstrapped_from_roster(self, season_year: int) -> None:
+        \"\"\"state에 contract ledger를 만들지 않고, DB contracts만 최소로 보장한다.
+
+        - roster.status='active' 이면서 team_id != 'FA' 인 선수에 대해
+          ACTIVE contract가 없으면 BOOT_{season_id}_{player_id} 로 1년 계약 생성
+        \"\"\"
+        now = _utc_now_iso()
+        season_year = int(season_year)
+        season_id = str(season_id_from_year(season_year))
+        rows = self._conn.execute(
+            "SELECT player_id, team_id, salary_amount FROM roster WHERE status='active';"
+        ).fetchall()
+        with self.transaction() as cur:
+            for r in rows:
+                pid = str(normalize_player_id(r["player_id"], strict=False, allow_legacy_numeric=True))
+                tid = str(r["team_id"] or "").upper()
+                if tid == "FA":
+                    continue
+                # 이미 ACTIVE가 있으면 스킵
+                exists = cur.execute(
+                    "SELECT 1 FROM contracts WHERE player_id=? AND is_active=1 LIMIT 1;",
+                    (pid,),
+                ).fetchone()
+                if exists:
+                    continue
+                contract_id = f"BOOT_{season_id}_{pid}"
+                salary = float(r["salary_amount"] or 0.0)
+                salary_by_year = {str(season_year): salary}
+                contract_json = _json_dumps(
+                    {
+                        "contract_id": contract_id,
+                        "player_id": pid,
+                        "team_id": tid,
+                        "signed_date": "1900-01-01",
+                        "start_season_year": season_year,
+                        "years": 1,
+                        "salary_by_year": salary_by_year,
+                        "options": [],
+                        "status": "ACTIVE",
+                    }
+                )
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO contracts(
+                        contract_id, player_id, team_id,
+                        start_season_id, end_season_id,
+                        salary_by_season_json, contract_type, is_active,
+                        created_at, updated_at,
+                        signed_date, start_season_year, years, options_json, status, contract_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        contract_id,
+                        pid,
+                        tid,
+                        season_id,
+                        season_id,
+                        _json_dumps(salary_by_year),
+                        "STANDARD",
+                        1,
+                        now,
+                        now,
+                        "1900-01-01",
+                        season_year,
+                        1,
+                        "[]",
+                        "ACTIVE",
+                        contract_json,
+                    ),
+                )
+                # legacy-compatible indices
+                cur.execute(
+                    "INSERT OR IGNORE INTO player_contracts(player_id, contract_id) VALUES (?, ?);",
+                    (pid, contract_id),
+                )
+                cur.execute(
+                    "INSERT OR REPLACE INTO active_contracts(player_id, contract_id, updated_at) VALUES (?, ?, ?);",
+                    (pid, contract_id, now),
+                )           
+
+    # ------------------------
+    # GM Profiles (AI)
+    # ------------------------
+
+    def upsert_gm_profile(self, team_id: str, profile: Mapping[str, Any] | None) -> None:
+        """Insert or update a single GM profile (stored as JSON)."""
+        tid = normalize_team_id(team_id, strict=False)
+        now = _utc_now_iso()
+        payload = json.dumps(
+            profile or {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        )
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                INSERT INTO gm_profiles(team_id, profile_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(team_id) DO UPDATE SET
+                    profile_json=excluded.profile_json,
+                    updated_at=excluded.updated_at;
+                """,
+                (str(tid), payload, now, now),
+           )
+
+    def upsert_gm_profiles(self, profiles_by_team: Mapping[str, Any]) -> None:
+        """Bulk upsert GM profiles."""
+        if not profiles_by_team:
+            return
+        now = _utc_now_iso()
+        rows: List[Tuple[str, str, str, str]] = []
+        for raw_team_id, raw_profile in profiles_by_team.items():
+            tid = normalize_team_id(raw_team_id, strict=False)
+            payload = json.dumps(
+                raw_profile or {},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            )
+            rows.append((str(tid), payload, now, now))
+
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT INTO gm_profiles(team_id, profile_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(team_id) DO UPDATE SET
+                    profile_json=excluded.profile_json,
+                    updated_at=excluded.updated_at;
+                """,
+                rows,
+            )
+
+    def get_gm_profile(self, team_id: str) -> Optional[Dict[str, Any]]:
+        """Return the GM profile dict for a team, or None if missing."""
+        tid = normalize_team_id(team_id, strict=False)
+        row = self._conn.execute(
+            "SELECT profile_json FROM gm_profiles WHERE team_id=?;", (str(tid),)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            value = json.loads(row["profile_json"])
+            return value if isinstance(value, dict) else {"value": value}
+        except Exception:
+            # Defensive: if JSON is corrupted, don't crash the game loop.
+            return None
+
+    def get_all_gm_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """Return all GM profiles keyed by team_id."""
+        out: Dict[str, Dict[str, Any]] = {}
+        rows = self._conn.execute(
+            "SELECT team_id, profile_json FROM gm_profiles;"
+        ).fetchall()
+        for r in rows:
+            try:
+                value = json.loads(r["profile_json"])
+                out[str(r["team_id"])] = value if isinstance(value, dict) else {"value": value}
+            except Exception:
+                continue
+        return out
+
+    def ensure_gm_profiles_seeded(
+        self,
+        team_ids: Iterable[str],
+        *,
+        default_profile: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Ensure each team_id has a row in gm_profiles (idempotent)."""
+        ids = [str(normalize_team_id(t, strict=False)) for t in team_ids]
+        if not ids:
+            return
+        existing = {
+            str(r["team_id"])
+            for r in self._conn.execute(
+                "SELECT team_id FROM gm_profiles WHERE team_id IN (%s);"
+                % ",".join(["?"] * len(ids)),
+                ids,
+            ).fetchall()
+        }
+        missing = [tid for tid in ids if tid not in existing]
+        if not missing:
+            return
+        now = _utc_now_iso()
+        payload = json.dumps(
+            default_profile or {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+           default=str,
+        )
+        rows = [(tid, payload, now, now) for tid in missing]
+        with self.transaction() as cur:
+            cur.executemany(
+                """
+                INSERT OR IGNORE INTO gm_profiles(team_id, profile_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                rows,
             )
 
     # ------------------------
