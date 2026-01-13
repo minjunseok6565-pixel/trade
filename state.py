@@ -117,7 +117,7 @@ GAME_STATE: Dict[str, Any] = {
 
 
 def get_current_date() -> Optional[str]:
-    """Return the league's current in-game date, keeping legacy mirrors in sync."""
+    """Return the league's current in-game date, keeping mirrors in sync."""
     league = _ensure_league_state()
     current = league.get("current_date")
     legacy_current = GAME_STATE.get("current_date")
@@ -154,7 +154,7 @@ def get_current_date_as_date() -> date:
 
 
 def set_current_date(date_str: Optional[str]) -> None:
-    """Update the league's current date and mirror it at the legacy location."""
+    """Update the league's current date and mirror it at the root location."""
     league = _ensure_league_state()
     league["current_date"] = date_str
     if date_str is None:
@@ -202,7 +202,7 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
     Policy:
     - Keys of GAME_STATE["players"] are canonical player_id strings.
     - player_meta["player_id"] must exist and must match the dict key.
-    - free_agents (if present) is a list[str] of canonical player_id.
+    - (Optional) if free_agents list exists, its items are canonical player_id strings.
     """
     try:
         from schema import normalize_player_id, normalize_team_id
@@ -429,63 +429,12 @@ def _ensure_league_state() -> Dict[str, Any]:
     league.setdefault("last_gm_tick_date", None)
     from league_repo import LeagueRepo
 
-    migrations = GAME_STATE.setdefault("_migrations", {})
+    # DB is the single source of truth (SSOT) for league data. state.py only keeps
+    # simulation progress and transient gameplay state.
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        # gm_profiles is now stored in DB (SSOT). Migrate legacy in-memory data once.
-        if migrations.get("gm_profiles_migrated_to_db") is not True:
-            legacy_profiles = GAME_STATE.get("gm_profiles")
-            if isinstance(legacy_profiles, dict) and legacy_profiles:
-                repo.upsert_gm_profiles(legacy_profiles)
         # Keep rows ready for all teams (idempotent).
         repo.ensure_gm_profiles_seeded(ALL_TEAM_IDS)
-
-        # --- Additional DB migrations (SSOT move) ---
-        if migrations.get("trade_assets_migrated_to_db") is not True:
-            legacy_draft_picks = GAME_STATE.get("draft_picks")
-            if isinstance(legacy_draft_picks, dict) and legacy_draft_picks:
-                repo.upsert_draft_picks(legacy_draft_picks)
-            legacy_swap_rights = GAME_STATE.get("swap_rights")
-            if isinstance(legacy_swap_rights, dict) and legacy_swap_rights:
-                repo.upsert_swap_rights(legacy_swap_rights)
-            legacy_fixed_assets = GAME_STATE.get("fixed_assets")
-            if isinstance(legacy_fixed_assets, dict) and legacy_fixed_assets:
-                repo.upsert_fixed_assets(legacy_fixed_assets)
-
-        if migrations.get("transactions_migrated_to_db") is not True:
-            legacy_transactions = GAME_STATE.get("transactions")
-            if isinstance(legacy_transactions, list) and legacy_transactions:
-                repo.insert_transactions(legacy_transactions)
-
-        if migrations.get("contracts_ledger_migrated_to_db") is not True:
-            legacy_contracts = GAME_STATE.get("contracts")
-            if isinstance(legacy_contracts, dict) and legacy_contracts:
-                repo.upsert_contract_records(legacy_contracts)
-            # NOTE: Derived indices are rebuilt from SSOT sources.
-            # - player_contracts: derived from contracts
-            # - active_contracts: derived from contracts.is_active
-            # - free_agents: derived from roster.team_id == 'FA'
-            repo.rebuild_contract_indices()
-                
-    if migrations.get("gm_profiles_migrated_to_db") is not True:
-        GAME_STATE.pop("gm_profiles", None)
-        migrations["gm_profiles_migrated_to_db"] = True
-    if migrations.get("trade_assets_migrated_to_db") is not True:
-        GAME_STATE.pop("draft_picks", None)
-        GAME_STATE.pop("swap_rights", None)
-        GAME_STATE.pop("fixed_assets", None)
-        migrations["trade_assets_migrated_to_db"] = True
-
-    if migrations.get("transactions_migrated_to_db") is not True:
-        GAME_STATE.pop("transactions", None)
-        migrations["transactions_migrated_to_db"] = True
-
-    if migrations.get("contracts_ledger_migrated_to_db") is not True:
-        GAME_STATE.pop("contracts", None)
-        GAME_STATE.pop("player_contracts", None)
-        GAME_STATE.pop("active_contract_id_by_player", None)
-        GAME_STATE.pop("free_agents", None)
-        migrations["contracts_ledger_migrated_to_db"] = True
 
 
     season_year = league.get("season_year")
@@ -496,7 +445,7 @@ def _ensure_league_state() -> Dict[str, Any]:
         except (TypeError, ValueError):
             salary_cap_value = 0
         if salary_cap_value <= 0:
-            # Fix legacy saves so SalaryMatchingRule doesn't treat cap/aprons as zero.
+            # Ensure cap/aprons are populated when unset/zero.
             _apply_cap_model_for_season(league, int(season_year))
     _ensure_trade_state()
     from team_utils import _init_players_and_teams_if_needed
@@ -517,10 +466,7 @@ def _ensure_league_state() -> Dict[str, Any]:
                 repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
                 # Keep derived indices in sync (especially free_agents derived from roster).
                 repo.rebuild_contract_indices()
- 
 
-    # Contracts bootstrap: prefer DB-based bootstrap if available (Step 2),
-    # fall back to legacy Excel bootstrap for older saves.
    
     with LeagueRepo(db_path) as repo:
         repo.validate_integrity()
@@ -1473,6 +1419,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
