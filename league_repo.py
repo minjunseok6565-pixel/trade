@@ -78,6 +78,22 @@ def _json_dumps(obj: Any) -> str:
         default=str,
     )
 
+def _json_loads(value: Any, default: Any):
+    """
+    Safe JSON loader:
+    - None -> default
+    - already dict/list -> returns as-is
+    - invalid JSON -> default
+    """
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
 def parse_height_in(value: Any) -> Optional[int]:
     """Convert \"6' 5\"\" to inches. If unknown, return None."""
     if value is None:
@@ -507,6 +523,105 @@ class LeagueRepo:
                 rows,
             )
 
+    def _read_draft_picks_map(self, cur: sqlite3.Cursor) -> Dict[str, Dict[str, Any]]:
+        rows = cur.execute(
+            """
+            SELECT pick_id, year, round, original_team, owner_team, protection_json
+            FROM draft_picks;
+            """
+        ).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            protection = _json_loads(r["protection_json"], None)
+            pick = {
+                "pick_id": str(r["pick_id"]),
+                "year": int(r["year"]),
+                "round": int(r["round"]),
+                "original_team": str(r["original_team"]).upper(),
+                "owner_team": str(r["owner_team"]).upper(),
+                "protection": protection,
+            }
+            out[pick["pick_id"]] = pick
+        return out
+
+    def _read_swap_rights_map(self, cur: sqlite3.Cursor) -> Dict[str, Dict[str, Any]]:
+        rows = cur.execute(
+            """
+            SELECT
+                swap_id, pick_id_a, pick_id_b, year, round,
+                owner_team, active, created_by_deal_id, created_at
+            FROM swap_rights;
+            """
+        ).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            swap = {
+                "swap_id": str(r["swap_id"]),
+                "pick_id_a": str(r["pick_id_a"]),
+                "pick_id_b": str(r["pick_id_b"]),
+                "year": int(r["year"]) if r["year"] is not None else None,
+                "round": int(r["round"]) if r["round"] is not None else None,
+                "owner_team": str(r["owner_team"]).upper(),
+                "active": bool(int(r["active"]) if r["active"] is not None else 1),
+                "created_by_deal_id": str(r["created_by_deal_id"]) if r["created_by_deal_id"] else None,
+                "created_at": str(r["created_at"]) if r["created_at"] else None,
+            }
+            out[swap["swap_id"]] = swap
+        return out
+
+    def _read_fixed_assets_map(self, cur: sqlite3.Cursor) -> Dict[str, Dict[str, Any]]:
+        rows = cur.execute(
+            """
+            SELECT
+                asset_id, label, value, owner_team,
+                source_pick_id, draft_year, attrs_json
+            FROM fixed_assets;
+            """
+        ).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            attrs = _json_loads(r["attrs_json"], {})
+            if not isinstance(attrs, dict):
+                attrs = {"value": attrs}
+            asset = {
+                "asset_id": str(r["asset_id"]),
+                "label": str(r["label"]) if r["label"] is not None else None,
+                "value": float(r["value"]) if r["value"] is not None else None,
+                "owner_team": str(r["owner_team"]).upper(),
+                "source_pick_id": str(r["source_pick_id"]) if r["source_pick_id"] else None,
+                "draft_year": int(r["draft_year"]) if r["draft_year"] is not None else None,
+                "attrs": attrs,
+            }
+            out[asset["asset_id"]] = asset
+        return out
+
+    def get_draft_picks_map(self) -> Dict[str, Dict[str, Any]]:
+        """Legacy-compatible map: {pick_id -> pick_dict}"""
+        cur = self._conn.cursor()
+        return self._read_draft_picks_map(cur)
+
+    def get_swap_rights_map(self) -> Dict[str, Dict[str, Any]]:
+        """Legacy-compatible map: {swap_id -> swap_dict}"""
+        cur = self._conn.cursor()
+        return self._read_swap_rights_map(cur)
+
+    def get_fixed_assets_map(self) -> Dict[str, Dict[str, Any]]:
+        """Legacy-compatible map: {asset_id -> asset_dict}"""
+        cur = self._conn.cursor()
+        return self._read_fixed_assets_map(cur)
+
+    def get_trade_assets_snapshot(self) -> Dict[str, Any]:
+        """
+        Read draft_picks / swap_rights / fixed_assets in one DB transaction
+        so trade validation can use a consistent snapshot.
+        """
+        with self.transaction() as cur:
+            return {
+                "draft_picks": self._read_draft_picks_map(cur),
+                "swap_rights": self._read_swap_rights_map(cur),
+                "fixed_assets": self._read_fixed_assets_map(cur),
+            }
+
     # ------------------------
     # Transactions log
     # ------------------------
@@ -541,6 +656,47 @@ class LeagueRepo:
                 """,
                 rows,
             )
+
+    def list_transactions(
+        self,
+        *,
+        limit: int = 200,
+        since_date: Optional[str] = None,
+        deal_id: Optional[str] = None,
+        tx_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Legacy-compatible list: returns list[dict] where each dict is the original payload_json.
+        Filters are optional.
+        """
+        limit_i = max(1, int(limit))
+        where = []
+        params: List[Any] = []
+        if since_date:
+            where.append("tx_date >= ?")
+            params.append(str(since_date))
+        if deal_id:
+            where.append("deal_id = ?")
+            params.append(str(deal_id))
+        if tx_type:
+            where.append("tx_type = ?")
+            params.append(str(tx_type))
+
+        sql = "SELECT payload_json FROM transactions_log"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY COALESCE(tx_date,'') DESC, created_at DESC LIMIT ?"
+        params.append(limit_i)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            payload = _json_loads(r["payload_json"], None)
+            if isinstance(payload, dict):
+                out.append(payload)
+            else:
+                out.append({"value": payload})
+        return out
 
     # ------------------------
     # Contracts ledger (legacy-compatible SSOT)
@@ -691,11 +847,11 @@ class LeagueRepo:
                 )
 
     def ensure_contracts_bootstrapped_from_roster(self, season_year: int) -> None:
-        \"\"\"state에 contract ledger를 만들지 않고, DB contracts만 최소로 보장한다.
+        """state에 contract ledger를 만들지 않고, DB contracts만 최소로 보장한다.
 
         - roster.status='active' 이면서 team_id != 'FA' 인 선수에 대해
           ACTIVE contract가 없으면 BOOT_{season_id}_{player_id} 로 1년 계약 생성
-        \"\"\"
+        """
         now = _utc_now_iso()
         season_year = int(season_year)
         season_id = str(season_id_from_year(season_year))
@@ -768,7 +924,139 @@ class LeagueRepo:
                 cur.execute(
                     "INSERT OR REPLACE INTO active_contracts(player_id, contract_id, updated_at) VALUES (?, ?, ?);",
                     (pid, contract_id, now),
-                )           
+                )         
+
+
+    def _contract_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        """
+        Prefer contract_json if present (keeps old shape).
+        Otherwise, synthesize a minimal legacy-friendly dict.
+        """
+        raw_json = None
+        try:
+            raw_json = row["contract_json"]
+        except Exception:
+            raw_json = None
+
+        if raw_json:
+            obj = _json_loads(raw_json, None)
+            if isinstance(obj, dict):
+                # Ensure key fields exist even if legacy json omitted them
+                obj.setdefault("contract_id", str(row["contract_id"]))
+                obj.setdefault("player_id", str(row["player_id"]))
+                obj.setdefault("team_id", str(row["team_id"]).upper())
+                return obj
+
+        salary_by_year = _json_loads(row["salary_by_season_json"], {})
+        if not isinstance(salary_by_year, dict):
+            salary_by_year = {}
+        options = _json_loads(getattr(row, "options_json", None) or row.get("options_json") if isinstance(row, dict) else None, [])
+        if not isinstance(options, list):
+            options = []
+
+        return {
+            "contract_id": str(row["contract_id"]),
+            "player_id": str(row["player_id"]),
+            "team_id": str(row["team_id"]).upper(),
+            "signed_date": row["signed_date"] if "signed_date" in row.keys() else None,
+            "start_season_year": row["start_season_year"] if "start_season_year" in row.keys() else None,
+            "years": row["years"] if "years" in row.keys() else None,
+            "salary_by_year": salary_by_year,
+            "options": options,
+            "status": row["status"] if "status" in row.keys() else None,
+            "is_active": bool(int(row["is_active"]) if row["is_active"] is not None else 0),
+        }
+
+    def get_contracts_map(self, *, active_only: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Legacy-compatible map: {contract_id -> contract_dict}"""
+        sql = "SELECT * FROM contracts"
+        params: List[Any] = []
+        if active_only:
+            sql += " WHERE is_active=1"
+        rows = self._conn.execute(sql, params).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            c = self._contract_row_to_dict(r)
+            out[str(c.get("contract_id"))] = c
+        return out
+
+    def get_player_contracts_map(self) -> Dict[str, List[str]]:
+        """Legacy-compatible map: {player_id -> [contract_id, ...]}"""
+        rows = self._conn.execute(
+            "SELECT player_id, contract_id FROM player_contracts;"
+        ).fetchall()
+        out: Dict[str, List[str]] = {}
+        for r in rows:
+            pid = str(r["player_id"])
+            cid = str(r["contract_id"])
+            out.setdefault(pid, []).append(cid)
+        # deterministic ordering
+        for pid in list(out.keys()):
+            out[pid] = sorted(out[pid])
+        return out
+
+    def get_active_contract_id_by_player(self) -> Dict[str, str]:
+        """
+        Legacy-compatible map: {player_id -> contract_id}
+        Prefer active_contracts table; fallback to contracts.is_active=1.
+        """
+        rows = self._conn.execute(
+            "SELECT player_id, contract_id FROM active_contracts;"
+        ).fetchall()
+        if rows:
+            return {str(r["player_id"]): str(r["contract_id"]) for r in rows}
+
+        # Fallback: derive from contracts table
+        rows2 = self._conn.execute(
+            """
+            SELECT player_id, contract_id
+            FROM contracts
+            WHERE is_active=1
+            ORDER BY updated_at DESC;
+            """
+        ).fetchall()
+        out: Dict[str, str] = {}
+        for r in rows2:
+            pid = str(r["player_id"])
+            if pid in out:
+                continue
+            out[pid] = str(r["contract_id"])
+        return out
+
+    def list_free_agents(self, *, source: str = "roster") -> List[str]:
+        """
+        Legacy-compatible list: [player_id, ...]
+        - source="roster" (default): derived from roster.team_id == 'FA' (recommended)
+        - source="table": reads free_agents table (legacy)
+        """
+        src = (source or "roster").strip().lower()
+        if src == "roster":
+            rows = self._conn.execute(
+                """
+                SELECT player_id
+                FROM roster
+                WHERE status='active' AND UPPER(team_id)='FA';
+                """
+            ).fetchall()
+            return [str(r["player_id"]) for r in rows]
+        if src == "table":
+            rows = self._conn.execute(
+                "SELECT player_id FROM free_agents;"
+            ).fetchall()
+            return [str(r["player_id"]) for r in rows]
+        raise ValueError(f"Unknown source for list_free_agents: {source}")
+
+    def get_contract_ledger_snapshot(self) -> Dict[str, Any]:
+        """Read contracts-related legacy keys in one transaction for consistency."""
+        with self.transaction() as cur:
+            # Use public methods for shape; reads happen under the same BEGIN snapshot.
+            # (We intentionally call the public methods so any future normalization stays centralized.)
+            return {
+                "contracts": self.get_contracts_map(active_only=False),
+                "player_contracts": self.get_player_contracts_map(),
+                "active_contract_id_by_player": self.get_active_contract_id_by_player(),
+                "free_agents": self.list_free_agents(source="roster"),
+            }
 
     # ------------------------
     # GM Profiles (AI)
