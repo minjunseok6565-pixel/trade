@@ -1,0 +1,6 @@
+@echo off
+echo Starting Uvicorn server...
+start "" cmd /k "uvicorn server:app --reload"
+timeout /t 2 >nul
+echo Opening browser...
+start http://localhost:8000
