@@ -370,7 +370,7 @@ class LeagueRepo:
                 """
             )
           
-            # Extend contracts table with full JSON storage (optional but required for SSOT migration)
+            # Extend contracts table with full JSON storage (keeps contract shape stable across versions)
             self._ensure_table_columns(
                 cur,
                 "contracts",
@@ -790,7 +790,6 @@ class LeagueRepo:
           - player_contracts: derived from contracts (player_id -> contract_id)
 
         Intended usage:
-          - one-time migrations from legacy GAME_STATE ledgers
           - integrity repair / deterministic rebuilds
         """
         now = _utc_now_iso()
@@ -915,16 +914,7 @@ class LeagueRepo:
                         "ACTIVE",
                         contract_json,
                     ),
-                )
-                # legacy-compatible indices
-                cur.execute(
-                    "INSERT OR IGNORE INTO player_contracts(player_id, contract_id) VALUES (?, ?);",
-                    (pid, contract_id),
-                )
-                cur.execute(
-                    "INSERT OR REPLACE INTO active_contracts(player_id, contract_id, updated_at) VALUES (?, ?, ?);",
-                    (pid, contract_id, now),
-                )         
+                )  
 
 
     def _contract_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
