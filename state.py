@@ -461,15 +461,11 @@ def _ensure_league_state() -> Dict[str, Any]:
             legacy_contracts = GAME_STATE.get("contracts")
             if isinstance(legacy_contracts, dict) and legacy_contracts:
                 repo.upsert_contract_records(legacy_contracts)
-            legacy_player_contracts = GAME_STATE.get("player_contracts")
-            if isinstance(legacy_player_contracts, dict) and legacy_player_contracts:
-                repo.set_player_contracts(legacy_player_contracts)
-            legacy_active = GAME_STATE.get("active_contract_id_by_player")
-            if isinstance(legacy_active, dict) and legacy_active:
-                repo.set_active_contracts(legacy_active)
-            legacy_free_agents = GAME_STATE.get("free_agents")
-            if isinstance(legacy_free_agents, list) and legacy_free_agents:
-                repo.set_free_agents(legacy_free_agents)
+            # NOTE: Derived indices are rebuilt from SSOT sources.
+            # - player_contracts: derived from contracts
+            # - active_contracts: derived from contracts.is_active
+            # - free_agents: derived from roster.team_id == 'FA'
+            repo.rebuild_contract_indices()
                 
     if migrations.get("gm_profiles_migrated_to_db") is not True:
         GAME_STATE.pop("gm_profiles", None)
@@ -519,6 +515,8 @@ def _ensure_league_state() -> Dict[str, Any]:
             with LeagueRepo(db_path) as repo:
                 repo.init_db()
                 repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
+                # Keep derived indices in sync (especially free_agents derived from roster).
+                repo.rebuild_contract_indices()
  
 
     # Contracts bootstrap: prefer DB-based bootstrap if available (Step 2),
@@ -1475,6 +1473,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
