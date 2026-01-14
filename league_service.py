@@ -87,6 +87,8 @@ class LeagueService:
     def open(cls, db_path: str):
         """Open a repo and yield a service bound to it."""
         with LeagueRepo(db_path) as repo:
+            # Make all service calls safe even if caller forgot to init explicitly.
+            repo.init_db()
             yield cls(repo)
 
     # ----------------------------
@@ -102,7 +104,7 @@ class LeagueService:
 
     def ensure_draft_picks_seeded(self, draft_year: int, team_ids: Sequence[str], years_ahead: int) -> None:
         """Ensure draft_picks have baseline rows for validation/lookahead."""
-        self.repo.ensure_draft_picks_seeded(int(draft_year), list(team_ids), int(years_ahead))
+        self.repo.ensure_draft_picks_seeded(int(draft_year), list(team_ids), years_ahead=int(years_ahead))
 
     def ensure_contracts_bootstrapped_from_roster(self, season_year: int) -> None:
         """Ensure roster players have at least a minimal active contract entry."""
@@ -198,8 +200,8 @@ class LeagueService:
         so this method only needs to update the roster (and optionally contracts team sync).
         """
         # released_date currently used only for logging; the roster update is date-agnostic.
-        with self.repo.transaction():
-            self.repo.release_to_free_agency(player_id)
+        # repo.release_to_free_agency -> repo.trade_player already runs in a transaction.
+        self.repo.release_to_free_agency(player_id)
 
         event = ServiceEvent(
             type="release_to_free_agency",
