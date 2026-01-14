@@ -183,10 +183,13 @@ class RosterRow:
 class LeagueRepo:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path)
+        # autocommit mode; we manage BEGIN/COMMIT manually to guarantee atomic multi-table writes
+        self._conn = sqlite3.connect(self.db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA journal_mode = WAL;")  # good safety for frequent writes
+        self._conn.execute("PRAGMA busy_timeout = 5000;")  # reduce transient 'database is locked'
+        self._tx_depth = 0
 
     def close(self) -> None:
         try:
@@ -195,20 +198,50 @@ class LeagueRepo:
             pass
 
     @contextlib.contextmanager
-    def transaction(self):
-        """Atomic transaction helper (safe even if executescript commits internally)."""
+    def transaction(self, *, write: bool = True):
+        """Transaction helper.
+
+        - Outermost: BEGIN (read) or BEGIN IMMEDIATE (write) on the connection.
+        - Nested: SAVEPOINT/RELEASE so callers can safely nest repo/service transactions.
+        """
         cur = self._conn.cursor()
+        depth0 = self._tx_depth
+        sp_name: str | None = None
         try:
-            self._conn.execute("BEGIN;")
-            yield cur
-            # conn.commit() is safe even if no transaction is active
-            self._conn.commit()
-        except Exception:
-            # conn.rollback() is safe even if no transaction is active
-            self._conn.rollback()
-            raise
+            if depth0 == 0:
+                self._conn.execute("BEGIN IMMEDIATE;" if write else "BEGIN;")
+            else:
+                sp_name = f"sp_{depth0}"
+                cur.execute(f"SAVEPOINT {sp_name};")
+
+            self._tx_depth += 1
+            try:
+                yield cur
+            except Exception:
+                if depth0 == 0:
+                    self._conn.rollback()
+                else:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                raise
+            else:
+                if depth0 == 0:
+                    self._conn.commit()
+                else:
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+            finally:
+                self._tx_depth -= 1
         finally:
             cur.close()
+
+    @contextlib.contextmanager
+    def _maybe_transaction(self, cur: sqlite3.Cursor | None, *, write: bool = True):
+        """Use provided cursor, or open a transaction and create a new cursor."""
+        if cur is not None:
+            yield cur
+        else:
+            with self.transaction(write=write) as cur2:
+                yield cur2
 
     # ------------------------
     # Schema
@@ -224,9 +257,12 @@ class LeagueRepo:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};")
 
     def init_db(self) -> None:
-        """Create tables if they don't exist."""
+        if self._tx_depth != 0:
+            # sqlite3 executescript() issues an implicit COMMIT; never run it inside an active transaction.
+            raise RuntimeError("init_db() must not run inside an active transaction")
         now = _utc_now_iso()
-        with self.transaction() as cur:
+        cur = self._conn.cursor()
+        try:
             cur.executescript(
                 f"""
                 CREATE TABLE IF NOT EXISTS meta (
@@ -370,9 +406,14 @@ class LeagueRepo:
                 """
             )
           
+        finally:
+            cur.close()
+
+        # Post-DDL migrations / column backfills should run in a normal write transaction.
+        with self.transaction(write=True) as cur2:
             # Extend contracts table with full JSON storage (keeps contract shape stable across versions)
             self._ensure_table_columns(
-                cur,
+                cur2,
                 "contracts",
                 {
                     "signed_date": "TEXT",
@@ -388,7 +429,7 @@ class LeagueRepo:
     # Draft Picks / Swaps / Fixed Assets
     # ------------------------
 
-    def upsert_draft_picks(self, picks_by_id: Mapping[str, Any]) -> None:
+    def upsert_draft_picks(self, picks_by_id: Mapping[str, Any], *, cur: sqlite3.Cursor | None = None) -> None:
         if not picks_by_id:
             return
         now = _utc_now_iso()
@@ -409,7 +450,7 @@ class LeagueRepo:
             owner = str(pick.get("owner_team") or "").upper()
             protection = pick.get("protection")
             rows.append((pid, year, rnd, original, owner, _json_dumps(protection) if protection is not None else None, now, now))
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT INTO draft_picks(pick_id, year, round, original_team, owner_team, protection_json, created_at, updated_at)
@@ -425,10 +466,10 @@ class LeagueRepo:
                 rows,
             )
 
-    def ensure_draft_picks_seeded(self, draft_year: int, team_ids: Iterable[str], *, years_ahead: int = 7) -> None:
+    def ensure_draft_picks_seeded(self, draft_year: int, team_ids: Iterable[str], *, years_ahead: int = 7, cur: sqlite3.Cursor | None = None) -> None:
         now = _utc_now_iso()
         team_ids = [str(normalize_team_id(t, strict=False)).upper() for t in team_ids]
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             for year in range(int(draft_year), int(draft_year) + int(years_ahead) + 1):
                 for rnd in (1, 2):
                     for tid in team_ids:
@@ -441,7 +482,7 @@ class LeagueRepo:
                             (pick_id, year, rnd, tid, tid, now, now),
                         )
 
-    def upsert_swap_rights(self, swaps_by_id: Mapping[str, Any]) -> None:
+    def upsert_swap_rights(self, swaps_by_id: Mapping[str, Any], *, cur: sqlite3.Cursor | None = None) -> None:
         if not swaps_by_id:
             return
         now = _utc_now_iso()
@@ -464,7 +505,7 @@ class LeagueRepo:
                     now,
                 )
             )
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT INTO swap_rights(swap_id, pick_id_a, pick_id_b, year, round, owner_team, active, created_by_deal_id, created_at, updated_at)
@@ -482,7 +523,7 @@ class LeagueRepo:
                 rows,
             )
 
-    def upsert_fixed_assets(self, assets_by_id: Mapping[str, Any]) -> None:
+    def upsert_fixed_assets(self, assets_by_id: Mapping[str, Any], *, cur: sqlite3.Cursor | None = None) -> None:
         if not assets_by_id:
             return
         now = _utc_now_iso()
@@ -506,7 +547,7 @@ class LeagueRepo:
                 draft_year_i = None
             attrs = dict(asset)
             rows.append((asset_id, str(label) if label is not None else None, value_f, owner, str(source_pick_id) if source_pick_id is not None else None, draft_year_i, _json_dumps(attrs), now, now))
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT INTO fixed_assets(asset_id, label, value, owner_team, source_pick_id, draft_year, attrs_json, created_at, updated_at)
@@ -610,12 +651,12 @@ class LeagueRepo:
         cur = self._conn.cursor()
         return self._read_fixed_assets_map(cur)
 
-    def get_trade_assets_snapshot(self) -> Dict[str, Any]:
+    def get_trade_assets_snapshot(self, *, cur: sqlite3.Cursor | None = None) -> Dict[str, Any]:
         """
         Read draft_picks / swap_rights / fixed_assets in one DB transaction
         so trade validation can use a consistent snapshot.
         """
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=False) as cur:
             return {
                 "draft_picks": self._read_draft_picks_map(cur),
                 "swap_rights": self._read_swap_rights_map(cur),
@@ -626,7 +667,7 @@ class LeagueRepo:
     # Transactions log
     # ------------------------
 
-    def insert_transactions(self, entries: Sequence[Mapping[str, Any]]) -> None:
+    def insert_transactions(self, entries: Sequence[Mapping[str, Any]], *, cur: sqlite3.Cursor | None = None) -> None:
         if not entries:
             return
         now = _utc_now_iso()
@@ -648,7 +689,7 @@ class LeagueRepo:
                     now,
                 )
             )
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT OR IGNORE INTO transactions_log(tx_hash, tx_type, tx_date, deal_id, source, teams_json, payload_json, created_at)
@@ -702,7 +743,7 @@ class LeagueRepo:
     # Contracts ledger (legacy-compatible SSOT)
     # ------------------------
 
-    def upsert_contract_records(self, contracts_by_id: Mapping[str, Any]) -> None:
+    def upsert_contract_records(self, contracts_by_id: Mapping[str, Any], *, cur: sqlite3.Cursor | None = None) -> None:
         if not contracts_by_id:
             return
         now = _utc_now_iso()
@@ -753,7 +794,7 @@ class LeagueRepo:
                     contract_json,
                 )
             )
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT INTO contracts(
@@ -781,7 +822,7 @@ class LeagueRepo:
                 rows,
             )
 
-    def rebuild_contract_indices(self) -> None:
+    def rebuild_contract_indices(self, *, cur: sqlite3.Cursor | None = None) -> None:
         """Rebuild derived index tables from SSOT sources.
 
         SSOT rules (as agreed):
@@ -793,7 +834,7 @@ class LeagueRepo:
           - integrity repair / deterministic rebuilds
         """
         now = _utc_now_iso()
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             # 1) player_contracts: one row per (player_id, contract_id) found in contracts.
             cur.execute("DELETE FROM player_contracts;")
             cur.execute(
@@ -845,7 +886,7 @@ class LeagueRepo:
                 (now,),
             )   
 
-    def ensure_contracts_bootstrapped_from_roster(self, season_year: int) -> None:
+    def ensure_contracts_bootstrapped_from_roster(self, season_year: int, *, cur: sqlite3.Cursor | None = None) -> None:
         """state에 contract ledger를 만들지 않고, DB contracts만 최소로 보장한다.
 
         - roster.status='active' 이면서 team_id != 'FA' 인 선수에 대해
@@ -854,10 +895,8 @@ class LeagueRepo:
         now = _utc_now_iso()
         season_year = int(season_year)
         season_id = str(season_id_from_year(season_year))
-        rows = self._conn.execute(
-            "SELECT player_id, team_id, salary_amount FROM roster WHERE status='active';"
-        ).fetchall()
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
+            rows = cur.execute("SELECT player_id, team_id, salary_amount FROM roster WHERE status='active';").fetchall()
             for r in rows:
                 pid = str(normalize_player_id(r["player_id"], strict=False, allow_legacy_numeric=True))
                 tid = str(r["team_id"] or "").upper()
@@ -1036,9 +1075,9 @@ class LeagueRepo:
             return [str(r["player_id"]) for r in rows]
         raise ValueError(f"Unknown source for list_free_agents: {source}")
 
-    def get_contract_ledger_snapshot(self) -> Dict[str, Any]:
+    def get_contract_ledger_snapshot(self, *, cur: sqlite3.Cursor | None = None) -> Dict[str, Any]:
         """Read contracts-related legacy keys in one transaction for consistency."""
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=False) as _cur:
             # Use public methods for shape; reads happen under the same BEGIN snapshot.
             # (We intentionally call the public methods so any future normalization stays centralized.)
             return {
@@ -1052,7 +1091,7 @@ class LeagueRepo:
     # GM Profiles (AI)
     # ------------------------
 
-    def upsert_gm_profile(self, team_id: str, profile: Mapping[str, Any] | None) -> None:
+    def upsert_gm_profile(self, team_id: str, profile: Mapping[str, Any] | None, *, cur: sqlite3.Cursor | None = None) -> None:
         """Insert or update a single GM profile (stored as JSON)."""
         tid = normalize_team_id(team_id, strict=False)
         now = _utc_now_iso()
@@ -1063,7 +1102,7 @@ class LeagueRepo:
             sort_keys=True,
             default=str,
         )
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.execute(
                 """
                 INSERT INTO gm_profiles(team_id, profile_json, created_at, updated_at)
@@ -1075,7 +1114,7 @@ class LeagueRepo:
                 (str(tid), payload, now, now),
            )
 
-    def upsert_gm_profiles(self, profiles_by_team: Mapping[str, Any]) -> None:
+    def upsert_gm_profiles(self, profiles_by_team: Mapping[str, Any], *, cur: sqlite3.Cursor | None = None) -> None:
         """Bulk upsert GM profiles."""
         if not profiles_by_team:
             return
@@ -1092,7 +1131,7 @@ class LeagueRepo:
             )
             rows.append((str(tid), payload, now, now))
 
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.executemany(
                 """
                 INSERT INTO gm_profiles(team_id, profile_json, created_at, updated_at)
@@ -1138,21 +1177,11 @@ class LeagueRepo:
         team_ids: Iterable[str],
         *,
         default_profile: Optional[Mapping[str, Any]] = None,
+        cur: sqlite3.Cursor | None = None,
     ) -> None:
         """Ensure each team_id has a row in gm_profiles (idempotent)."""
         ids = [str(normalize_team_id(t, strict=False)) for t in team_ids]
         if not ids:
-            return
-        existing = {
-            str(r["team_id"])
-            for r in self._conn.execute(
-                "SELECT team_id FROM gm_profiles WHERE team_id IN (%s);"
-                % ",".join(["?"] * len(ids)),
-                ids,
-            ).fetchall()
-        }
-        missing = [tid for tid in ids if tid not in existing]
-        if not missing:
             return
         now = _utc_now_iso()
         payload = json.dumps(
@@ -1162,9 +1191,20 @@ class LeagueRepo:
             sort_keys=True,
            default=str,
         )
-        rows = [(tid, payload, now, now) for tid in missing]
-        with self.transaction() as cur:
-            cur.executemany(
+        with self._maybe_transaction(cur, write=True) as cur2:
+            existing = {
+                str(r["team_id"])
+                for r in cur2.execute(
+                    "SELECT team_id FROM gm_profiles WHERE team_id IN (%s);"
+                    % ",".join(["?"] * len(ids)),
+                    ids,
+                ).fetchall()
+            }
+            missing = [tid for tid in ids if tid not in existing]
+            if not missing:
+                return
+            rows = [(tid, payload, now, now) for tid in missing]
+            cur2.executemany(
                 """
                 INSERT OR IGNORE INTO gm_profiles(team_id, profile_json, created_at, updated_at)
                 VALUES (?, ?, ?, ?);
@@ -1183,6 +1223,7 @@ class LeagueRepo:
         sheet_name: Optional[str] = None,
         mode: str = "replace",  # "replace" or "upsert"
         strict_ids: bool = True,
+        cur: sqlite3.Cursor | None = None,
     ) -> None:
         """
         Import roster Excel into SQLite.
@@ -1305,9 +1346,10 @@ class LeagueRepo:
             roster.append(RosterRow(player_id=str(pid), team_id=str(tid), salary_amount=salary_amount))
 
         now = _utc_now_iso()
-        # Ensure schema exists before transactional import
-        self.init_db()
-        with self.transaction() as cur:
+        # Ensure schema exists before transactional import (only when we manage the transaction here)
+        if cur is None:
+            self.init_db()
+        with self._maybe_transaction(cur, write=True) as cur:
 
             if mode == "replace":
                 cur.execute("DELETE FROM roster;")
@@ -1462,13 +1504,13 @@ class LeagueRepo:
     # Writes (Roster operations)
     # ------------------------
 
-    def trade_player(self, player_id: str, to_team_id: str) -> None:
+    def trade_player(self, player_id: str, to_team_id: str, *, cur: sqlite3.Cursor | None = None) -> None:
         """Move player to another team."""
         pid = normalize_player_id(player_id, strict=False)
         to_tid = normalize_team_id(to_team_id, strict=True)
         now = _utc_now_iso()
 
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             # Must exist in roster
             exists = cur.execute("SELECT team_id FROM roster WHERE player_id=? AND status='active';", (str(pid),)).fetchone()
             if not exists:
@@ -1484,14 +1526,14 @@ class LeagueRepo:
                 (str(to_tid), now, str(pid)),
             )
 
-    def release_to_free_agency(self, player_id: str) -> None:
+    def release_to_free_agency(self, player_id: str, *, cur: sqlite3.Cursor | None = None) -> None:
         """Set team_id to FA."""
-        self.trade_player(player_id, "FA")
+        self.trade_player(player_id, "FA", cur=cur)
 
-    def set_salary(self, player_id: str, salary_amount: int) -> None:
+    def set_salary(self, player_id: str, salary_amount: int, *, cur: sqlite3.Cursor | None = None) -> None:
         pid = normalize_player_id(player_id, strict=False)
         now = _utc_now_iso()
-        with self.transaction() as cur:
+        with self._maybe_transaction(cur, write=True) as cur:
             cur.execute(
                 "UPDATE roster SET salary_amount=?, updated_at=? WHERE player_id=?;",
                 (int(salary_amount), now, str(pid)),
