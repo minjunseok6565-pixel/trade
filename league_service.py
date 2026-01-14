@@ -539,8 +539,6 @@ class LeagueService:
         # released_date currently used only for logging; the roster update is date-agnostic.
         with self._atomic() as cur:
             self._move_player_team_in_cur(cur, player_id, "FA")
-        # repo.release_to_free_agency -> repo.trade_player already runs in a transaction.
-        self.repo.release_to_free_agency(player_id)
 
         event = ServiceEvent(
             type="release_to_free_agency",
