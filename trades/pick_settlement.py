@@ -1,8 +1,36 @@
 from __future__ import annotations
 
+import os
+import contextlib
 from typing import Any, Dict, List
 
 from .errors import PROTECTION_INVALID, SWAP_INVALID, TradeError
+
+
+def _get_db_path_from_game_state(game_state: dict) -> str:
+    league = game_state.get("league", {}) if isinstance(game_state, dict) else {}
+    if isinstance(league, dict):
+        db_path = league.get("db_path")
+        if db_path:
+            return str(db_path)
+    return os.environ.get("LEAGUE_DB_PATH", "league.db")
+
+
+@contextlib.contextmanager
+def _open_service(db_path: str):
+    from league_service import LeagueService
+    svc_or_cm = LeagueService.open(db_path)
+    if hasattr(svc_or_cm, "__enter__"):
+        with svc_or_cm as svc:
+            yield svc
+        return
+    svc = svc_or_cm
+    try:
+        yield svc
+    finally:
+        close = getattr(svc, "close", None)
+        if callable(close):
+            close()
 
 
 def _validate_pick_order(pick_order: Dict[str, int], pick_id: str) -> int:
@@ -80,6 +108,27 @@ def _validate_protection(pick_id: str, protection: Dict[str, Any]) -> Dict[str, 
 
 
 def settle_draft_year(
+    game_state: dict, draft_year: int, pick_order: Dict[str, int]
+) -> List[Dict[str, Any]]:
+    """
+    ✅ DB-SSOT adapter.
+    Legacy call sites may still call trades.pick_settlement.settle_draft_year(GAME_STATE,...).
+    After migration, in-memory ledgers are unreliable; route to LeagueService.settle_draft_year.
+    """
+    db_path = _get_db_path_from_game_state(game_state)
+    year_i = int(draft_year)
+    pick_order_i: Dict[str, int] = {}
+    for k, v in dict(pick_order).items():
+        try:
+            pick_order_i[str(k)] = int(v)
+        except Exception:
+            continue
+    with _open_service(db_path) as svc:
+        return svc.settle_draft_year(year_i, pick_order_i)
+
+
+# ---- Legacy in-memory implementation (service can import this to avoid recursion) ----
+def settle_draft_year_in_memory(
     game_state: dict, draft_year: int, pick_order: Dict[str, int]
 ) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
