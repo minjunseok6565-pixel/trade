@@ -59,10 +59,10 @@ def _compute_assets_hash(deal: Deal) -> str:
         swap_rights = (snap.get("swap_rights") or {}) if isinstance(snap, dict) else {}
         fixed_assets = (snap.get("fixed_assets") or {}) if isinstance(snap, dict) else {}
 
-    for team_id, assets in deal.legs.items():
-        for asset in assets:
-            asset_key_value = asset_key(asset)
-            if isinstance(asset, PlayerAsset):
+        for team_id, assets in deal.legs.items():
+            for asset in assets:
+                asset_key_value = asset_key(asset)
+                if isinstance(asset, PlayerAsset):
                 pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
                 from_team_id = str(normalize_team_id(team_id, strict=True))
                 try:
@@ -100,13 +100,13 @@ def _compute_assets_hash(deal: Deal) -> str:
                     "owner_team": str(fixed.get("owner_team", "")).upper()
                 }
 
-    player_snapshots.sort(
-        key=lambda row: (row["player_id"], row["from_team_id"], row["to_team_id"])
-    )
-    ownership_snapshot["players"] = player_snapshots
-    payload = {"deal": serialize_deal(deal), "ownership": ownership_snapshot}
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        player_snapshots.sort(
+            key=lambda row: (row["player_id"], row["from_team_id"], row["to_team_id"])
+        )
+        ownership_snapshot["players"] = player_snapshots
+        payload = {"deal": serialize_deal(deal), "ownership": ownership_snapshot}
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def create_committed_deal(
