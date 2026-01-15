@@ -425,6 +425,28 @@ class LeagueRepo:
                 },
             )
 
+            # Ensure transactions_log has idempotency fields on older DBs (created before these columns existed)
+            self._ensure_table_columns(
+                cur2,
+                "transactions_log",
+                {
+                    "tx_type": "TEXT",
+                    "tx_date": "TEXT",
+                    "deal_id": "TEXT",
+                    "source": "TEXT",
+                    "teams_json": "TEXT",
+                },
+            )
+            # Idempotency: prevent two committed events sharing the same deal_id
+            # (allow NULL/empty deal_id for events that don't use idempotency keys)
+            cur2.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_log_deal_id
+                ON transactions_log(deal_id)
+                WHERE deal_id IS NOT NULL AND deal_id <> '';
+                """
+            )
+
     # ------------------------
     # Draft Picks / Swaps / Fixed Assets
     # ------------------------
