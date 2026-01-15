@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Dict
 
 from ...errors import DEAL_INVALIDATED, MISSING_TO_TEAM, TradeError
 from ...models import PickAsset
@@ -37,7 +38,10 @@ class PickRulesRule:
                 },
             )
 
-        draft_picks = ctx.game_state.get("draft_picks", {})
+        assets_snapshot = _get_assets_snapshot(ctx)
+        draft_picks = assets_snapshot.get("draft_picks") or {}
+        if not isinstance(draft_picks, dict):
+            draft_picks = {}
         # Safety guard: Stepien rule checks (year, year+1) pairs.
         # If draft_picks data doesn't include year+1 at all (older saves / partial state),
         # a missing year would be misread as "0 picks" and can cause false violations.
@@ -158,3 +162,30 @@ def _count_first_round_picks_for_year(
         if owner_after.get(pick_id) == team_id:
             count += 1
     return count
+
+
+def _get_assets_snapshot(ctx: TradeContext) -> Dict[str, Any]:
+    """Return a consistent DB snapshot of trade-relevant assets.
+
+    This rule MUST NOT depend on state dicts for draft_picks/swap_rights/fixed_assets because
+    those ledgers have been migrated to DB SSOT. We cache the snapshot on ctx.extra so:
+      - multiple rules don't re-query the DB repeatedly
+      - all rules see a consistent view during validation
+    """
+    cached = ctx.extra.get("assets_snapshot")
+    if isinstance(cached, dict):
+        return cached  # type: ignore[return-value]
+
+    try:
+        snap = ctx.repo.get_trade_assets_snapshot()
+    except Exception:
+        # Fallback keeps validation usable even if a minimal repo implementation lacks
+        # the combined snapshot method.
+        snap = {
+            "draft_picks": getattr(ctx.repo, "get_draft_picks_map", lambda: {})(),
+            "swap_rights": getattr(ctx.repo, "get_swap_rights_map", lambda: {})(),
+            "fixed_assets": getattr(ctx.repo, "get_fixed_assets_map", lambda: {})(),
+        }
+
+    ctx.extra["assets_snapshot"] = snap
+    return snap
