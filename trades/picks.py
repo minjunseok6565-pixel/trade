@@ -1,8 +1,36 @@
 from __future__ import annotations
 
+import os
+import contextlib
 from typing import List
 
 from .errors import TradeError, PICK_NOT_OWNED
+
+
+def _get_db_path_from_game_state(game_state: dict) -> str:
+    league = game_state.get("league", {}) if isinstance(game_state, dict) else {}
+    if isinstance(league, dict):
+        db_path = league.get("db_path")
+        if db_path:
+            return str(db_path)
+    return os.environ.get("LEAGUE_DB_PATH", "league.db")
+
+
+@contextlib.contextmanager
+def _open_service(db_path: str):
+    from league_service import LeagueService
+    svc_or_cm = LeagueService.open(db_path)
+    if hasattr(svc_or_cm, "__enter__"):
+        with svc_or_cm as svc:
+            yield svc
+        return
+    svc = svc_or_cm
+    try:
+        yield svc
+    finally:
+        close = getattr(svc, "close", None)
+        if callable(close):
+            close()
 
 
 def init_draft_picks_if_needed(
@@ -11,38 +39,33 @@ def init_draft_picks_if_needed(
     all_team_ids: List[str],
     years_ahead: int = 7,
 ) -> None:
-    draft_picks = game_state.setdefault("draft_picks", {})
-    # NOTE:
-    # 기존 구현은 draft_picks가 조금이라도 있으면 return 하여,
-    # 규정(예: Stepien lookahead) 변경이나 버그 수정으로 "미래 연도 픽"이 더 필요해져도
-    # 기존 세이브 상태에서는 생성 범위를 확장할 수 없었다.
-    # 아래는 "누락된 픽만" 추가 생성하는 방식(idempotent)이라 기존 상태를 깨지 않으면서 확장 가능하다.
-
-    for year in range(draft_year, draft_year + years_ahead + 1):
-        for round_num in (1, 2):
-            for team_id in all_team_ids:
-                pick_id = f"{year}_R{round_num}_{team_id}"
-                if pick_id in draft_picks:
-                    continue
-                draft_picks[pick_id] = {
-                    "pick_id": pick_id,
-                    "year": year,
-                    "round": round_num,
-                    "original_team": team_id,
-                    "owner_team": team_id,
-                    "protection": None,
-                }
-
+    """
+    ✅ DB-SSOT seed (idempotent).
+    draft_picks state ledger has been migrated away; ensure presence in DB instead.
+    """
+    db_path = _get_db_path_from_game_state(game_state)
+    team_ids = [str(t).upper() for t in (all_team_ids or [])]
+    with _open_service(db_path) as svc:
+        svc.ensure_draft_picks_seeded(int(draft_year), team_ids, years_ahead=int(years_ahead))
+ 
 
 def transfer_pick(game_state: dict, pick_id: str, from_team: str, to_team: str) -> None:
-    draft_picks = game_state.get("draft_picks") or {}
-    pick = draft_picks.get(pick_id)
-    if not pick:
-        raise TradeError(PICK_NOT_OWNED, "Pick not found", {"pick_id": pick_id})
-    if str(pick.get("owner_team", "")).upper() != from_team.upper():
-        raise TradeError(
-            PICK_NOT_OWNED,
-            "Pick not owned by team",
-            {"pick_id": pick_id, "team_id": from_team},
-        )
-    pick["owner_team"] = to_team.upper()
+    """
+    Deprecated for normal trade flow (execute_trade should move picks).
+    Kept for legacy callers: ownership-check then DB update via Repo.
+    """
+    from league_repo import LeagueRepo
+    db_path = _get_db_path_from_game_state(game_state)
+    pid = str(pick_id)
+    f = str(from_team).upper()
+    t = str(to_team).upper()
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        with repo.transaction() as cur:
+            row = cur.execute("SELECT owner_team FROM draft_picks WHERE pick_id=?;", (pid,)).fetchone()
+            if not row:
+                raise TradeError(PICK_NOT_OWNED, "Pick not found", {"pick_id": pid})
+            owner = str(row["owner_team"]).upper()
+            if owner != f:
+                raise TradeError(PICK_NOT_OWNED, "Pick not owned by team", {"pick_id": pid, "team_id": f, "owner_team": owner})
+            cur.execute("UPDATE draft_picks SET owner_team=? WHERE pick_id=?;", (t, pid))
