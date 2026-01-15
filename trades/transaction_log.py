@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import os
+import contextlib
 from typing import Any, Dict, Optional
+from typing import Mapping, Iterator
 
 from state import GAME_STATE, get_current_date, get_current_date_as_date
 
 from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
+
+
+def _get_db_path() -> str:
+    league = GAME_STATE.get("league", {})
+    if isinstance(league, dict):
+        db_path = league.get("db_path")
+        if db_path:
+            return str(db_path)
+    return os.environ.get("LEAGUE_DB_PATH", "league.db")
+
+
+@contextlib.contextmanager
+def _open_service(db_path: str) -> Iterator[Any]:
+    """
+    Open LeagueService using the project's canonical entrypoint: LeagueService.open(db_path).
+    Supports both:
+      - open() returning a context manager (preferred)
+      - open() returning a service object with optional .close()
+    """
+    from league_service import LeagueService  # local import to avoid cycles
+
+    svc_or_cm = LeagueService.open(db_path)  # canonical style
+    if hasattr(svc_or_cm, "__enter__"):
+        with svc_or_cm as svc:
+            yield svc
+        return
+
+    svc = svc_or_cm
+    try:
+        yield svc
+    finally:
+        close = getattr(svc, "close", None)
+        if callable(close):
+            close()
+
+
+def _persist_transaction(entry: Mapping[str, Any]) -> None:
+    """
+    Persist to DB (SSOT). No more GAME_STATE['transactions'] ledger.
+    """
+    db_path = _get_db_path()
+    with _open_service(db_path) as svc:
+        if hasattr(svc, "append_transaction"):
+            svc.append_transaction(dict(entry))
+            return
+        if hasattr(svc, "append_transactions"):
+            svc.append_transactions([dict(entry)])
+            return
+        raise RuntimeError("LeagueService missing append_transaction(s) API")
 
 
 def append_trade_transaction(
@@ -62,5 +114,7 @@ def append_trade_transaction(
     if extra_meta:
         entry["meta"] = dict(extra_meta)
 
-    GAME_STATE.setdefault("transactions", []).append(entry)
+    # DB is SSOT for transactions_log after migration.
+    # Keep this function as a legacy adapter: build the entry and persist to DB.
+    _persist_transaction(entry)
     return entry
