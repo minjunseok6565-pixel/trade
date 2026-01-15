@@ -58,6 +58,16 @@ except Exception as e:  # pragma: no cover
     )
 
 
+
+# ----------------------------
+# DB schema versioning
+# ----------------------------
+# NOTE: schema.SCHEMA_VERSION ('2.0') is the *game result* schema version.
+# The DB schema version is tracked separately to support safe, stepwise migrations.
+DB_SCHEMA_VERSION: int = 2
+META_KEY_DB_SCHEMA_VERSION: str = "db_schema_version"
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -274,6 +284,8 @@ class LeagueRepo:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
                 INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', '{now}');
 
+                INSERT OR IGNORE INTO meta(key, value) VALUES ('db_schema_version', '0');
+
                 CREATE TABLE IF NOT EXISTS players (
                     player_id TEXT PRIMARY KEY,
                     name TEXT,
@@ -408,44 +420,104 @@ class LeagueRepo:
           
         finally:
             cur.close()
+        # Stepwise DB schema migrations / backfills (idempotent, versioned).
+        self._migrate_db_schema()
 
-        # Post-DDL migrations / column backfills should run in a normal write transaction.
-        with self.transaction(write=True) as cur2:
-            # Extend contracts table with full JSON storage (keeps contract shape stable across versions)
-            self._ensure_table_columns(
-                cur2,
-                "contracts",
-                {
-                    "signed_date": "TEXT",
-                    "start_season_year": "INTEGER",
-                    "years": "INTEGER",
-                    "options_json": "TEXT",
-                    "status": "TEXT",
-                    "contract_json": "TEXT",
-                },
-            )
+    def _get_db_schema_version(self, cur: sqlite3.Cursor) -> int:
+        row = cur.execute("SELECT value FROM meta WHERE key=?;", (META_KEY_DB_SCHEMA_VERSION,)).fetchone()
+        if not row:
+            return 0
+        try:
+            return int(str(row["value"]))
+        except Exception:
+            return 0
 
-            # Ensure transactions_log has idempotency fields on older DBs (created before these columns existed)
-            self._ensure_table_columns(
-                cur2,
-                "transactions_log",
-                {
-                    "tx_type": "TEXT",
-                    "tx_date": "TEXT",
-                    "deal_id": "TEXT",
-                    "source": "TEXT",
-                    "teams_json": "TEXT",
-                },
+    def _set_db_schema_version(self, cur: sqlite3.Cursor, version: int) -> None:
+        cur.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+            """,
+            (META_KEY_DB_SCHEMA_VERSION, str(int(version))),
+        )
+
+    def _migration_001_contracts_shape(self, cur: sqlite3.Cursor) -> None:
+        # Extend contracts table with full JSON storage (keeps contract shape stable across versions)
+        self._ensure_table_columns(
+            cur,
+            "contracts",
+            {
+                "signed_date": "TEXT",
+                "start_season_year": "INTEGER",
+                "years": "INTEGER",
+                "options_json": "TEXT",
+                "status": "TEXT",
+                "contract_json": "TEXT",
+            },
+        )
+
+    def _migration_002_transactions_idempotency(self, cur: sqlite3.Cursor) -> None:
+        # Ensure transactions_log has idempotency fields on older DBs (created before these columns existed)
+        self._ensure_table_columns(
+            cur,
+            "transactions_log",
+            {
+                "tx_type": "TEXT",
+                "tx_date": "TEXT",
+                "deal_id": "TEXT",
+                "source": "TEXT",
+                "teams_json": "TEXT",
+            },
+        )
+        # If duplicates exist, UNIQUE index creation would fail. Fail early with a clear message.
+        dups = cur.execute(
+            """
+            SELECT deal_id, COUNT(*) AS c
+            FROM transactions_log
+            WHERE deal_id IS NOT NULL AND deal_id <> ''
+            GROUP BY deal_id
+            HAVING c > 1
+            ORDER BY c DESC, deal_id ASC
+            LIMIT 20;
+            """
+        ).fetchall()
+        if dups:
+            sample = [(r["deal_id"], r["c"]) for r in dups]
+            raise ValueError(
+                "transactions_log has duplicate deal_id values; cannot enforce idempotency. "
+                f"Sample duplicates: {sample}"
             )
-            # Idempotency: prevent two committed events sharing the same deal_id
-            # (allow NULL/empty deal_id for events that don't use idempotency keys)
-            cur2.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_log_deal_id
-                ON transactions_log(deal_id)
-                WHERE deal_id IS NOT NULL AND deal_id <> '';
-                """
+        # Idempotency: prevent two committed events sharing the same deal_id
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_log_deal_id
+            ON transactions_log(deal_id)
+            WHERE deal_id IS NOT NULL AND deal_id <> '';
+            """
+        )
+
+    def _migrate_db_schema(self) -> None:
+        """Upgrade the DB schema to DB_SCHEMA_VERSION in small, verifiable steps."""
+        with self.transaction(write=True) as cur:
+            # Ensure db_schema_version key exists (0 means 'unknown/legacy')
+            cur.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '0');",
+                (META_KEY_DB_SCHEMA_VERSION,),
             )
+            current = self._get_db_schema_version(cur)
+            target = int(DB_SCHEMA_VERSION)
+            if current > target:
+                raise ValueError(f"DB db_schema_version {current} > supported {target}")
+            while current < target:
+                next_v = current + 1
+                if next_v == 1:
+                    self._migration_001_contracts_shape(cur)
+                elif next_v == 2:
+                    self._migration_002_transactions_idempotency(cur)
+                else:
+                    raise ValueError(f"Missing migration step for db_schema_version {next_v}")
+                self._set_db_schema_version(cur, next_v)
+                current = next_v
 
     # ------------------------
     # Draft Picks / Swaps / Fixed Assets
@@ -1576,6 +1648,16 @@ class LeagueRepo:
             raise ValueError("DB meta.schema_version missing (run init_db)")
         if row["value"] != SCHEMA_VERSION:
             raise ValueError(f"DB schema_version {row['value']} != expected {SCHEMA_VERSION}")
+        # db schema version check (stepwise migrations)
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?;", (META_KEY_DB_SCHEMA_VERSION,)).fetchone()
+        if not row:
+            raise ValueError("DB meta.db_schema_version missing (run init_db)")
+        try:
+            dbv = int(str(row["value"]))
+        except Exception:
+            dbv = 0
+        if dbv != DB_SCHEMA_VERSION:
+            raise ValueError(f"DB db_schema_version {dbv} != expected {DB_SCHEMA_VERSION} (run init_db)")
 
         # player_id uniqueness is enforced by PK; also validate format if strict
         if strict_ids:
