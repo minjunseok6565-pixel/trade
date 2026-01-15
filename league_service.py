@@ -1117,7 +1117,7 @@ class LeagueService:
     def settle_draft_year(self, draft_year: int, pick_order_by_pick_id: Mapping[str, int]) -> List[Dict[str, Any]]:
         """Settle protections and swap rights for a given draft year (DB)."""
         try:
-            from trades.pick_settlement import settle_draft_year as _legacy_settle_draft_year  # type: ignore
+            from trades.pick_settlement import settle_draft_year_in_memory as _legacy_settle_draft_year  # type: ignore
         except Exception as exc:  # pragma: no cover
             raise ImportError("trades.pick_settlement.settle_draft_year is required") from exc
 
