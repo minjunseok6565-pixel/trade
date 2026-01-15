@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from datetime import date, timedelta
@@ -48,11 +49,16 @@ def _compute_assets_hash(deal: Deal) -> str:
     db_path = league.get("db_path") if isinstance(league, dict) else None
     if not db_path:
         raise ValueError("db_path is required to compute trade agreement hash")
-    repo = LeagueRepo(db_path)
-    repo.init_db()
-    draft_picks = GAME_STATE.get("draft_picks", {})
-    swap_rights = GAME_STATE.get("swap_rights", {})
-    fixed_assets = GAME_STATE.get("fixed_assets", {})
+
+    # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in GAME_STATE.
+    # Use one DB transaction snapshot and ensure repo is closed to avoid connection leaks.
+    with contextlib.closing(LeagueRepo(db_path)) as repo:
+        repo.init_db()
+        snap = repo.get_trade_assets_snapshot() or {}
+        draft_picks = (snap.get("draft_picks") or {}) if isinstance(snap, dict) else {}
+        swap_rights = (snap.get("swap_rights") or {}) if isinstance(snap, dict) else {}
+        fixed_assets = (snap.get("fixed_assets") or {}) if isinstance(snap, dict) else {}
+
     for team_id, assets in deal.legs.items():
         for asset in assets:
             asset_key_value = asset_key(asset)
