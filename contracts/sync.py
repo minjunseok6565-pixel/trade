@@ -1,89 +1,122 @@
-"""Contract state helpers (DB-first)."""
+"""DB -> GAME_STATE cache refresh helpers (SSOT = DB).
+
+After migration, contract ledgers are no longer stored in GAME_STATE:
+  - contracts / player_contracts / active_contract_id_by_player / free_agents
+
+This module must NOT create or depend on those legacy keys.
+Its only responsibility (if needed) is to refresh lightweight cached fields
+inside GAME_STATE["players"] from the DB roster.
+"""
 
 from __future__ import annotations
 
-from math import isnan
+import contextlib
+from typing import Dict, Iterator, List, Optional
 
-from contracts.models import get_active_salary_for_season
-from contracts.store import ensure_contract_state, get_league_season_year
-
-
-def sync_roster_salaries_for_season(
-    game_state: dict, season_year: int, roster_df=None
-) -> None:
-    """Deprecated: roster DataFrame sync is removed (DB is SSOT)."""
-    raise RuntimeError(
-        "sync_roster_salaries_for_season is deprecated; "
-        "use LeagueRepo for roster updates or export roster from DB."
-    )
+from league_repo import LeagueRepo
+from schema import normalize_player_id
 
 
-def sync_roster_teams_from_state(game_state: dict, roster_df=None) -> None:
-    """Deprecated: roster DataFrame sync is removed (DB is SSOT)."""
-    raise RuntimeError(
-        "sync_roster_teams_from_state is deprecated; "
-        "use LeagueRepo for roster updates or export roster from DB."
-    )
+def _get_db_path(game_state: dict) -> str:
+    league_state = game_state.get("league") or {}
+    db_path = league_state.get("db_path")
+    if not db_path:
+        raise ValueError("game_state['league']['db_path'] is required")
+    return str(db_path)
 
 
-def sync_contract_team_ids_from_players(game_state: dict) -> None:
-    from contracts.store import ensure_contract_state
+@contextlib.contextmanager
+def _open_repo(game_state: dict, repo: LeagueRepo | None) -> Iterator[LeagueRepo]:
+    if repo is not None:
+        yield repo
+        return
 
-    ensure_contract_state(game_state)
-
-    for player_id_str, contract_id in game_state.get(
-        "active_contract_id_by_player", {}
-    ).items():
-        player_id = str(player_id_str).strip()
-        if not player_id:
-            continue
-        contract = game_state.get("contracts", {}).get(contract_id)
-        if not contract:
-            continue
-        player_meta = game_state.get("players", {}).get(player_id)
-        if not player_meta:
-            contract["team_id"] = ""
-            continue
-        team_id = player_meta.get("team_id")
-        if team_id is None or team_id == "":
-            normalized_team_id = ""
-        else:
-            normalized_team_id = str(team_id).strip().upper()
-        contract["team_id"] = normalized_team_id
+    db_path = _get_db_path(game_state)
+    with LeagueRepo(db_path) as managed_repo:
+        managed_repo.init_db()
+        yield managed_repo
 
 
-def sync_players_salary_from_active_contract(
-    game_state: dict, season_year: int
-) -> None:
-    from contracts import models
-    from contracts.store import ensure_contract_state
-
-    ensure_contract_state(game_state)
-
-    active_contract_map = game_state.get("active_contract_id_by_player", {})
-    contracts = game_state.get("contracts", {})
-    for player_id, player_meta in game_state.get("players", {}).items():
-        contract_id = active_contract_map.get(str(player_id))
-        contract = contracts.get(contract_id) if contract_id else None
-        if contract:
-            expected_salary = models.get_active_salary_for_season(contract, season_year)
-            if isinstance(expected_salary, float) and isnan(expected_salary):
-                expected_salary = 0.0
-            player_meta["salary"] = float(expected_salary)
-        else:
-            # Zero missing contracts to prevent stale payroll in cached player data.
-            player_meta["salary"] = 0.0
-
-
-def assert_state_vs_roster_consistency(
+def refresh_player_cache_from_db(
     game_state: dict,
-    season_year: int | None = None,
-    roster_df=None,
-    max_errors: int = 20,
-) -> None:
-    """Deprecated: roster DataFrame consistency checks removed (DB is SSOT)."""
-    ensure_contract_state(game_state)
-    if season_year is None:
-        season_year = get_league_season_year(game_state)
-    _ = (season_year, roster_df, max_errors)
-    return None
+    *,
+    player_ids: Optional[List[str]] = None,
+    repo: LeagueRepo | None = None,
+) -> Dict[str, int]:
+    """Refresh GAME_STATE["players"] cache from DB roster.
+
+    Updates (best-effort) cached player dict fields:
+      - team_id  (from roster.team_id)
+      - salary   (float, from roster.salary_amount)
+
+    Does NOT create missing cache entries. DB remains SSOT.
+    Returns a small summary dict: {"db_rows":..., "updated":..., "missing_in_cache":..., "not_found_in_db":...}
+    """
+    players_cache = game_state.get("players")
+    if not isinstance(players_cache, dict):
+        # No cache to refresh; still validate DB access path.
+        with _open_repo(game_state, repo) as r:
+            _ = r  # touch
+        return {"db_rows": 0, "updated": 0, "missing_in_cache": 0, "not_found_in_db": 0}
+ 
+    normalized_ids: List[str] = []
+    if player_ids:
+        seen = set()
+        for pid in player_ids:
+            try:
+                nid = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            except Exception:
+                continue
+            if nid in seen:
+                continue
+            seen.add(nid)
+            normalized_ids.append(nid)
+
+
+    rows = []
+    with _open_repo(game_state, repo) as r:
+        if normalized_ids:
+            placeholders = ",".join(["?"] * len(normalized_ids))
+            sql = (
+                f"SELECT player_id, team_id, salary_amount "
+                f"FROM roster WHERE status='active' AND player_id IN ({placeholders});"
+            )
+            with r.transaction() as cur:
+                rows = cur.execute(sql, tuple(normalized_ids)).fetchall()
+        else:
+            with r.transaction() as cur:
+                rows = cur.execute(
+                    "SELECT player_id, team_id, salary_amount FROM roster WHERE status='active';"
+                ).fetchall()
+
+    db_rows = len(rows)
+    updated = 0
+    missing_in_cache = 0
+
+    for row in rows:
+        pid = str(row["player_id"])
+        team_id = str(row["team_id"]).upper() if row["team_id"] is not None else ""
+        salary_amount = row["salary_amount"]
+        salary_f = float(salary_amount or 0.0)
+
+        cached = players_cache.get(pid)
+        if not isinstance(cached, dict):
+            missing_in_cache += 1
+            continue
+
+        cached["team_id"] = team_id
+        cached["salary"] = salary_f
+        updated += 1
+ 
+    not_found_in_db = 0
+    if normalized_ids:
+        found = {str(r["player_id"]) for r in rows}
+        not_found_in_db = sum(1 for pid in normalized_ids if pid not in found)
+
+
+    return {
+        "db_rows": db_rows,
+        "updated": updated,
+        "missing_in_cache": missing_in_cache,
+        "not_found_in_db": not_found_in_db,
+    }
