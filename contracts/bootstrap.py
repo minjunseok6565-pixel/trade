@@ -186,4 +186,3 @@ def bootstrap_contracts_from_roster_excel(
     """
     _ = roster_df  # legacy arg ignored
     return bootstrap_contracts_from_roster(game_state, overwrite=overwrite)
-*** End Patch\nPATCH"]}
