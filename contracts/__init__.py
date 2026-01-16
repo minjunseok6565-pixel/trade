@@ -1,4 +1,8 @@
-"""Contracts package."""
+"""Contracts package.
+
+This package exposes DB-backed contract / free-agency operations.
+Legacy GAME_STATE-ledger helpers are intentionally not exported.
+"""
 
 from contracts.bootstrap import (
     bootstrap_contracts_from_repo,
@@ -24,10 +28,8 @@ from contracts.options import (
 )
 from contracts.options_policy import default_option_decision_policy
 from contracts.ops import re_sign_or_extend, release_to_free_agents, sign_free_agent
-from contracts.store import ensure_contract_state
 
 __all__ = [
-    "ensure_contract_state",
     "bootstrap_contracts_from_repo",
     "bootstrap_contracts_from_roster_excel",
     "new_contract_id",
