@@ -1,12 +1,18 @@
-"""Contract operations."""
+"""Contract operations.
+
+Legacy adapter that delegates all writes to DB (SSOT) via LeagueService.
+It updates only minimal, best-effort caches inside GAME_STATE.
+
+Do not create or mutate contract/FA ledgers in GAME_STATE from this module.
+"""
 
 from __future__ import annotations
 
 from datetime import date
 
 from league_repo import LeagueRepo
-from schema import normalize_player_id, normalize_team_id
 from league_service import LeagueService
+from schema import normalize_player_id, normalize_team_id
 
 
 def _resolve_date_iso(game_state: dict, value: date | str | None) -> str:
@@ -29,10 +35,12 @@ def _ensure_team_state(game_state: dict) -> None:
 
 def _get_db_path(game_state: dict) -> str:
     league_state = game_state.get("league") or {}
+    if not isinstance(league_state, dict):
+        raise ValueError("game_state['league'] must be a dict containing 'db_path'")
     db_path = league_state.get("db_path")
     if not db_path:
         raise ValueError("game_state['league']['db_path'] is required for contract ops")
-    return db_path
+    return str(db_path)
 
 
 def _normalize_player_id_str(value) -> str:
@@ -42,12 +50,6 @@ def _normalize_player_id_str(value) -> str:
 def _normalize_team_id_str(value) -> str:
     return str(normalize_team_id(value, strict=True, allow_fa=False))
 
-
-
-def _utc_now_iso() -> str:
-    from datetime import datetime
-
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def _update_player_cache_if_present(game_state: dict, player_id: str, updates: dict) -> None:
     """Best-effort cache update: do nothing if players cache isn't ready."""
@@ -68,7 +70,6 @@ def release_to_free_agents(
     released_date: date | str | None = None,
     *,
     repo: LeagueRepo | None = None,
-    cursor=None,
     validate: bool | None = None,
 ) -> dict:
     """Release a player to free agency (DB SSOT).
@@ -105,7 +106,11 @@ def release_to_free_agents(
     _update_player_cache_if_present(
         game_state,
         normalized_player_id,
-        {"team_id": "FA", "acquired_date": released_date_iso, "acquired_via_trade": False},
+        {
+            "team_id": "FA",
+            "acquired_date": released_date_iso,
+            "acquired_via_trade": False,
+        },
     )
 
     return {
@@ -124,7 +129,6 @@ def sign_free_agent(
     salary_by_year: dict | None = None,
     *,
     repo: LeagueRepo | None = None,
-    cursor=None,
     validate: bool | None = None,
 ) -> dict:
     """Sign a free agent (DB SSOT).
@@ -196,12 +200,11 @@ def re_sign_or_extend(
     game_state: dict,
     team_id: str,
     player_id: str,
-    signed_date: "date | str | None" = None,
+    signed_date: date | str | None = None,
     years: int = 1,
     salary_by_year: dict | None = None,
     *,
     repo: LeagueRepo | None = None,
-    cursor=None,
     validate: bool | None = None,
 ) -> dict:
     """Re-sign / extend a player (DB SSOT).
