@@ -1,2 +1,0 @@
-# Nba
-Make nba simulator
