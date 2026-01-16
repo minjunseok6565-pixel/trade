@@ -70,10 +70,11 @@ def release_to_free_agents(
     normalized_player_id = _normalize_player_id_str(player_id)
     released_date_iso = _resolve_date_iso(game_state, released_date)
 
-    player = game_state["players"][normalized_player_id]
-    player["team_id"] = ""
-    player["acquired_date"] = released_date_iso
-    player["acquired_via_trade"] = False
+    _update_player_cache_if_present(
+        game_state,
+        normalized_player_id,
+        {"team_id": "", "acquired_date": released_date_iso, "acquired_via_trade": False},
+    )
 
     db_path = _get_db_path(game_state)
     if repo is None:
@@ -153,14 +154,19 @@ def sign_free_agent(
             repo.validate_integrity()
 
     # Keep minimal workflow/UI cache in GAME_STATE.
-    player = game_state["players"][normalized_player_id]
-    player["team_id"] = normalized_team_id
-    player["signed_date"] = signed_date_iso
-    player["last_contract_action_date"] = signed_date_iso
-    player["last_contract_action_type"] = "SIGN_FREE_AGENT"
-    player["signed_via_free_agency"] = True
-    player["acquired_date"] = signed_date_iso
-    player["acquired_via_trade"] = False
+    _update_player_cache_if_present(
+        game_state,
+        normalized_player_id,
+        {
+            "team_id": normalized_team_id,
+            "signed_date": signed_date_iso,
+            "last_contract_action_date": signed_date_iso,
+            "last_contract_action_type": "SIGN_FREE_AGENT",
+            "signed_via_free_agency": True,
+            "acquired_date": signed_date_iso,
+            "acquired_via_trade": False,
+        },
+    )
 
     contract_id = str(evt.payload.get("contract_id") or "")
 
@@ -224,14 +230,19 @@ def re_sign_or_extend(
             repo.validate_integrity()
 
     # Keep minimal workflow/UI cache in GAME_STATE.
-    player = game_state["players"][normalized_player_id]
-    player["team_id"] = normalized_team_id
-    player["signed_date"] = signed_date_iso
-    player["last_contract_action_date"] = signed_date_iso
-    player["last_contract_action_type"] = "RE_SIGN_OR_EXTEND"
-    player["signed_via_free_agency"] = False
-    player["acquired_date"] = signed_date_iso
-    player["acquired_via_trade"] = False
+    _update_player_cache_if_present(
+        game_state,
+        normalized_player_id,
+        {
+            "team_id": normalized_team_id,
+            "signed_date": signed_date_iso,
+            "last_contract_action_date": signed_date_iso,
+            "last_contract_action_type": "RE_SIGN_OR_EXTEND",
+            "signed_via_free_agency": False,
+            "acquired_date": signed_date_iso,
+            "acquired_via_trade": False,
+        },
+    )
 
     contract_id = str(evt.payload.get("contract_id") or "")
 
