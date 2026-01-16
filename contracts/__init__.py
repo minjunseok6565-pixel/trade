@@ -10,10 +10,8 @@ from contracts.bootstrap import (
 )
 from contracts.free_agents import (
     FREE_AGENT_TEAM_ID,
-    add_free_agent,
     is_free_agent,
     list_free_agents,
-    remove_free_agent,
 )
 from contracts.models import (
     get_active_salary_for_season,
@@ -43,8 +41,6 @@ __all__ = [
     "FREE_AGENT_TEAM_ID",
     "list_free_agents",
     "is_free_agent",
-    "add_free_agent",
-    "remove_free_agent",
     "sign_free_agent",
     "re_sign_or_extend",
     "release_to_free_agents",
