@@ -606,10 +606,57 @@ async def team_schedule(team_id: str):
 # -------------------------------------------------------------------------
 # STATE 요약 조회 API (프론트/디버그용)
 # -------------------------------------------------------------------------
+
 @app.get("/api/state/summary")
 async def state_summary():
-    """현재 GAME_STATE를 그대로 반환."""
-    return GAME_STATE
+    """
+    Return a structured state summary:
+      - workflow_state: in-memory workflow/cache state (GAME_STATE) with legacy ledgers stripped
+      - db_snapshot: DB SSOT snapshot (trade assets, contracts ledger, transactions, gm profiles)
+    """
+    # 1) Workflow state (shallow copy) — never expose legacy ledgers here.
+    workflow_state: Dict[str, Any] = dict(GAME_STATE)
+    for k in (
+        # Trade assets ledger (DB SSOT)
+        "draft_picks",
+        "swap_rights",
+        "fixed_assets",
+        # Transactions ledger (DB SSOT)
+        "transactions",
+        # Contracts/FA ledger (DB SSOT)
+        "contracts",
+        "player_contracts",
+        "active_contract_id_by_player",
+        "free_agents",
+        # GM profiles (DB SSOT)
+        "gm_profiles",
+    ):
+        workflow_state.pop(k, None)
+
+    # 2) DB snapshot (SSOT). Keep response stable even if DB access fails.
+    db_snapshot: Dict[str, Any]
+    try:
+        db_path = _require_db_path()
+        with LeagueRepo(db_path) as repo:
+            repo.init_db()
+            db_snapshot = {
+                "ok": True,
+                "db_path": db_path,
+                "trade_assets": repo.get_trade_assets_snapshot(),
+                "contracts_ledger": repo.get_contract_ledger_snapshot(),
+                "transactions": repo.list_transactions(limit=200),
+                "gm_profiles": repo.get_all_gm_profiles(),
+            }
+    except Exception as exc:
+        db_snapshot = {
+            "ok": False,
+            "error": str(exc),
+        }
+
+    return {
+        "workflow_state": workflow_state,
+        "db_snapshot": db_snapshot,
+    }
 
 
 @app.get("/api/debug/schedule-summary")
