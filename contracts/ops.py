@@ -49,6 +49,18 @@ def _utc_now_iso() -> str:
 
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+def _update_player_cache_if_present(game_state: dict, player_id: str, updates: dict) -> None:
+    """Best-effort cache update: do nothing if players cache isn't ready."""
+    try:
+        players = game_state.get("players")
+        if not isinstance(players, dict):
+            return
+        p = players.get(player_id)
+        if not isinstance(p, dict):
+            return
+        p.update(updates)
+    except Exception:
+        return
 
 def release_to_free_agents(
     game_state: dict,
@@ -70,12 +82,6 @@ def release_to_free_agents(
     normalized_player_id = _normalize_player_id_str(player_id)
     released_date_iso = _resolve_date_iso(game_state, released_date)
 
-    _update_player_cache_if_present(
-        game_state,
-        normalized_player_id,
-        {"team_id": "", "acquired_date": released_date_iso, "acquired_via_trade": False},
-    )
-
     db_path = _get_db_path(game_state)
     if repo is None:
         with LeagueRepo(db_path) as managed_repo:
@@ -94,6 +100,13 @@ def release_to_free_agents(
         )
         if validate:
             repo.validate_integrity()
+
+    # Update cache only after DB write succeeds.
+    _update_player_cache_if_present(
+        game_state,
+        normalized_player_id,
+        {"team_id": "FA", "acquired_date": released_date_iso, "acquired_via_trade": False},
+    )
 
     return {
         "event": "RELEASE_TO_FREE_AGENTS",
