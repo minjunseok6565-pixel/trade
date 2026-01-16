@@ -633,13 +633,12 @@ async def state_summary():
     ):
         workflow_state.pop(k, None)
 
-    # 2) DB snapshot (SSOT). Keep response stable even if DB access fails.
-    db_snapshot: Dict[str, Any]
+    # 2) DB snapshot (SSOT). Fail loud on DB path/schema issues.
+    db_path = _require_db_path()
     try:
-        db_path = _require_db_path()
         with LeagueRepo(db_path) as repo:
             repo.init_db()
-            db_snapshot = {
+            db_snapshot: Dict[str, Any] = {
                 "ok": True,
                 "db_path": db_path,
                 "trade_assets": repo.get_trade_assets_snapshot(),
@@ -648,10 +647,14 @@ async def state_summary():
                 "gm_profiles": repo.get_all_gm_profiles(),
             }
     except Exception as exc:
-        db_snapshot = {
-            "ok": False,
-            "error": str(exc),
-        }
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "DB snapshot failed",
+                "db_path": db_path,
+                "error": str(exc),
+            },
+        )
 
     return {
         "workflow_state": workflow_state,
@@ -663,3 +666,4 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return get_schedule_summary()
+
