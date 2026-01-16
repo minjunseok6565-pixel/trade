@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from league_repo import LeagueRepo
+from league_service import LeagueService
 
 
 def process_offseason(
@@ -14,85 +15,48 @@ def process_offseason(
     decision_policy=None,
     draft_pick_order_by_pick_id: dict[str, int] | None = None,
 ) -> dict:
-    from contracts.options import (
-        apply_option_decision,
-        get_pending_options_for_season,
-        normalize_option_record,
-        recompute_contract_years_from_salary,
-    )
     from contracts.options_policy import default_option_decision_policy
-    from contracts.store import ensure_contract_state, get_current_date_iso
-    from contracts.ops import release_to_free_agents
+    from trades.pick_settlement import settle_draft_year
+    from trades.errors import TradeError
 
-    ensure_contract_state(game_state)
+    """
+    Offseason handler (DB SSOT).
 
-    contracts = game_state.get("contracts", {})
-    active_map = game_state.get("active_contract_id_by_player", {})
-    expired = 0
-    released = 0
-    decision_date_iso = get_current_date_iso(game_state)
+    이전 구현은 GAME_STATE의 계약 장부(contracts/active_contract_id_by_player 등)를
+    주 데이터로 삼았지만, 마이그레이션 이후 계약 SSOT는 DB다.
+    따라서 오프시즌 계약 만료/옵션 처리는 LeagueService로 위임한다.
+    """
+
     if decision_policy is None:
         decision_policy = default_option_decision_policy
 
     league_state = game_state.get("league") or {}
     db_path = league_state.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
     league_state["db_path"] = db_path
+
+    # 1) 계약 만료/옵션 처리: DB에서 처리 (SSOT)
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        with repo.transaction() as cur:
-            for player_id_str, contract_id in list(active_map.items()):
-                contract = contracts.get(contract_id)
-                if not contract:
-                    continue
-                contract_options = contract.get("options") or []
-                try:
-                    contract["options"] = [
-                        normalize_option_record(option) for option in contract_options
-                    ]
-                except ValueError:
-                    contract["options"] = []
-                try:
-                    player_id = int(player_id_str)
-                except (TypeError, ValueError):
-                    player_id = None
-                pending = get_pending_options_for_season(contract, to_season_year)
-                if pending:
-                    for option_index, option in enumerate(contract["options"]):
-                        if option.get("season_year") != to_season_year:
-                            continue
-                        if option.get("status") != "PENDING":
-                            continue
-                        decision = decision_policy(option, player_id, contract, game_state)
-                        apply_option_decision(
-                            contract,
-                            option_index,
-                            decision,
-                            decision_date_iso,
-                        )
-                    recompute_contract_years_from_salary(contract)
-                try:
-                    start = int(contract.get("start_season_year") or 0)
-                except (TypeError, ValueError):
-                    start = 0
-                try:
-                    years = int(contract.get("years") or 0)
-                except (TypeError, ValueError):
-                    years = 0
-                end_exclusive = start + years
-                if to_season_year >= end_exclusive:
-                    contract["status"] = "EXPIRED"
-                    active_map.pop(player_id_str, None)
-                    release_to_free_agents(
-                        game_state,
-                        player_id_str,
-                        released_date=None,
-                        repo=repo,
-                        cursor=cur,
-                        validate=False,
-                    )
-                    expired += 1
-                    released += 1
+        svc = LeagueService(repo)
+        expire_result = svc.expire_contracts_for_season_transition(
+            int(from_season_year),
+            int(to_season_year),
+            decision_policy=decision_policy,
+        )
         repo.validate_integrity()
+
+    # Maintain minimal workflow/UI cache in GAME_STATE for released players
+    expired = int(expire_result.get("expired") or 0)
+    released = int(expire_result.get("released") or 0)
+    released_ids = expire_result.get("released_player_ids") or []
+    players_cache = game_state.get("players") or {}
+    for pid in released_ids:
+        p = players_cache.get(str(pid))
+        if isinstance(p, dict):
+            p["team_id"] = ""
+            # acquired_date/etc are not strictly required for offseason,
+            # but keeping prior semantics helps UI/debug
+            # (decision date not exposed here; leave existing fields untouched)
 
     try:
         draft_year_to_settle = int(from_season_year) + 1
@@ -127,7 +91,6 @@ def process_offseason(
         }
     else:
         from trades.errors import TradeError
-        from trades.pick_settlement import settle_draft_year
 
         try:
             events = settle_draft_year(game_state, draft_year_to_settle, pick_order)
