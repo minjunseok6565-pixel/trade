@@ -11,7 +11,6 @@ from .agreements import (
     release_locks_for_deal,
     gc_expired_agreements,
 )
-from .transaction_log import append_trade_transaction
 
 __all__ = [
     "Deal",
@@ -28,5 +27,4 @@ __all__ = [
     "mark_executed",
     "release_locks_for_deal",
     "gc_expired_agreements",
-    "append_trade_transaction",
 ]
