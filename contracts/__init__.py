@@ -3,11 +3,6 @@
 This package exposes DB-backed contract / free-agency operations.
 Legacy GAME_STATE-ledger helpers are intentionally not exported.
 """
-
-from contracts.bootstrap import (
-    bootstrap_contracts_from_repo,
-    bootstrap_contracts_from_roster_excel,
-)
 from contracts.free_agents import (
     FREE_AGENT_TEAM_ID,
     is_free_agent,
@@ -28,8 +23,6 @@ from contracts.options_policy import default_option_decision_policy
 from contracts.ops import re_sign_or_extend, release_to_free_agents, sign_free_agent
 
 __all__ = [
-    "bootstrap_contracts_from_repo",
-    "bootstrap_contracts_from_roster_excel",
     "new_contract_id",
     "make_contract_record",
     "get_active_salary_for_season",
