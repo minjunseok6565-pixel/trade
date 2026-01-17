@@ -322,12 +322,6 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
     debug.setdefault("normalization", []).append(report)
     return report
 
-
-def normalize_player_keys(game_state: dict) -> dict:
-    """Backward-compatible alias."""
-    return normalize_player_ids(game_state)
-
-
 def _backfill_ingest_turns_once() -> None:
     """Backfill missing ingest_turn values across stored games."""
     all_games: List[Dict[str, Any]] = []
@@ -1419,6 +1413,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
