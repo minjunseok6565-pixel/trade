@@ -36,10 +36,6 @@ def init_draft_picks_if_needed(
     all_team_ids: List[str],
     years_ahead: int = 7,
 ) -> None:
-    """
-    ✅ DB-SSOT seed (idempotent).
-    draft_picks state ledger has been migrated away; ensure presence in DB instead.
-    """
     db_path = _get_db_path_from_game_state(game_state)
     team_ids = [str(t).upper() for t in (all_team_ids or [])]
     with _open_service(db_path) as svc:
