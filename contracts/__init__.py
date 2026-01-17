@@ -1,8 +1,4 @@
-"""Contracts package.
 
-This package exposes DB-backed contract / free-agency operations.
-Legacy GAME_STATE-ledger helpers are intentionally not exported.
-"""
 from contracts.free_agents import (
     FREE_AGENT_TEAM_ID,
     is_free_agent,
