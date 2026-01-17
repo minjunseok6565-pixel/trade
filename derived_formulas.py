@@ -1,10 +1,3 @@
-"""derived_formulas.py
-
-Shared derived-ability formulas used by both roster_adapter and team_utils.
-
-- Input: a pandas Series (a row from the roster dataframe)
-- Output: dict[str, float] with values clamped to [0, 100]
-"""
 
 from __future__ import annotations
 
