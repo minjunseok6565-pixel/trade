@@ -25,16 +25,6 @@ def process_offseason(
     draft_pick_order_by_pick_id: dict[str, int] | None = None,
 ) -> dict:
 
-    """
-    Offseason handler (DB SSOT).
-    - 계약 SSOT는 DB (contracts/active_contracts/player_contracts/free_agents 포함).
-    - 이 함수는 GAME_STATE의 레거시 계약 장부를 읽거나 생성하지 않는다.
-    - 오프시즌 계약 만료/옵션 처리:
-        LeagueService.expire_contracts_for_season_transition(...)
-    - (선택) 드래프트 픽/스왑/보호 정산:
-        LeagueService.settle_draft_year(...)
-    - GAME_STATE는 workflow/UI 캐시만 best-effort로 갱신한다.
-    """
 
     from trades.errors import TradeError
     from contracts.options_policy import default_option_decision_policy
