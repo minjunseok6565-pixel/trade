@@ -159,30 +159,3 @@ def import_roster_and_bootstrap_contracts(
             "overwrite": bool(overwrite_contracts),
         },
     }
-
-def bootstrap_contracts_from_repo(game_state: dict, *, overwrite: bool = False) -> Dict[str, Any]:
-    """Deprecated alias (kept temporarily for compatibility).
-
-    Previous implementation wrote legacy ledgers into GAME_STATE; this no longer does.
-    """
-    result = bootstrap_contracts_from_roster(game_state, overwrite=overwrite)
-    # Keep a couple legacy keys used by older callers.
-    return {
-        **result,
-        "created": result.get("created_contracts", 0),
-    }
-
-
-def bootstrap_contracts_from_roster_excel(
-    game_state: dict,
-    roster_df=None,
-    overwrite: bool = False,
-) -> dict:
-    """Deprecated legacy API.
-
-    - roster_df 기반 계약 부트스트랩은 제거되었다 (DB SSOT).
-    - DB가 있으면 bootstrap_contracts_from_roster(...) 로 대체된다.
-    - Excel import가 필요하면 import_roster_and_bootstrap_contracts(...) 를 사용.
-    """
-    _ = roster_df  # legacy arg ignored
-    return bootstrap_contracts_from_roster(game_state, overwrite=overwrite)
