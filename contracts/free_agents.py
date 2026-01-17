@@ -1,13 +1,3 @@
-"""Free agent queries (DB SSOT).
-
-After migration, free agency is derived from the canonical SQLite DB.
-- Source of truth: roster.team_id == 'FA' (status='active')
-- GAME_STATE is treated as workflow/cache only (no FA ledger stored in state).
-
-This module intentionally provides *read* helpers only.
-Any write operations (release/sign) should go through contracts.ops (LeagueService).
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -28,7 +18,6 @@ def _get_db_path(game_state: dict) -> str:
 
 
 def _normalize_player_id(value) -> str:
-    # Be lenient for legacy callers; DB stores normalized ids.
     return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
 
 
