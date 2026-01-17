@@ -536,7 +536,6 @@ def validate_v2_game_result(game_result: Dict[str, Any]) -> None:
 
 
 def _ensure_master_schedule_indices() -> None:
-    """Legacy state를 위해 master_schedule의 by_id 인덱스를 보장한다."""
     league = _ensure_league_state()
     master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
@@ -1413,6 +1412,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
