@@ -15,13 +15,6 @@ class SwapUniquenessRule:
     enabled: bool = True
 
     def _get_swap_rights_map(self, ctx: TradeContext) -> Dict[str, Dict[str, Any]]:
-        """
-        Read swap_rights from DB (SSOT), with a robust fallback strategy:
-          1) ctx.extra["assets_snapshot"]["swap_rights"] if provided
-          2) ctx.repo.get_trade_assets_snapshot()["swap_rights"] (consistent snapshot)
-          3) ctx.repo.get_swap_rights_map()
-          4) (legacy fallback) ctx.game_state.get("swap_rights", {})
-        """
         extra = getattr(ctx, "extra", None)
         if isinstance(extra, dict):
             snap = extra.get("assets_snapshot")
@@ -43,7 +36,6 @@ class SwapUniquenessRule:
                 if isinstance(sr, dict):
                     return sr  # type: ignore[return-value]
 
-        # Legacy fallback (should become unused once state keys are removed)
         gs = getattr(ctx, "game_state", None)
         if isinstance(gs, dict):
             sr = gs.get("swap_rights", {})
@@ -53,10 +45,6 @@ class SwapUniquenessRule:
 
     @staticmethod
     def _is_active(record: Mapping[str, Any]) -> bool:
-        """
-        Interpret active flag robustly across legacy/state and DB (0/1) representations.
-        Default is active=True if missing.
-        """
         v = record.get("active", True)
         if isinstance(v, bool):
             return v
