@@ -50,17 +50,6 @@ RAW_SIDE_KEYS: Tuple[str, str] = (SIDE_HOME, SIDE_AWAY)
 # 1) Roster / Data Columns (Excel / DataFrame)
 # ============================================================================
 
-# Current Excel columns observed in your roster sample.
-# (We keep these as "legacy" column names for import.)
-ROSTER_COL_TEAM_LEGACY = "Team"
-ROSTER_COL_NAME_LEGACY = "Name"
-ROSTER_COL_POS_LEGACY = "POS"
-ROSTER_COL_AGE_LEGACY = "Age"
-ROSTER_COL_HEIGHT_LEGACY = "HT"
-ROSTER_COL_WEIGHT_LEGACY = "WT"
-ROSTER_COL_SALARY_LEGACY = "Salary"
-ROSTER_COL_OVR_LEGACY = "OVR"
-
 # Canonical columns we want going forward.
 ROSTER_COL_PLAYER_ID = "player_id"   # REQUIRED long-term
 ROSTER_COL_TEAM_ID = "team_id"       # REQUIRED long-term
