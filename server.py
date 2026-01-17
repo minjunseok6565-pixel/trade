@@ -92,7 +92,6 @@ class SimGameRequest(BaseModel):
 
 class ChatMainRequest(BaseModel):
     apiKey: str
-    # JS 쪽에서 userMessage라는 필드명을 사용하는 경우도 받아줄 수 있게 alias 지정
     userInput: str = Field(..., alias="userMessage")
     mainPrompt: Optional[str] = ""
     context: Any = ""
@@ -403,7 +402,6 @@ async def chat_main(req: ChatMainRequest):
 
 @app.post("/api/main-llm")
 async def chat_main_legacy(req: ChatMainRequest):
-    """프론트 JS가 /api/main-llm, userMessage 필드로 호출하던 버전을 위한 호환 엔드포인트."""
     return await chat_main(req)
 
 
@@ -609,12 +607,6 @@ async def team_schedule(team_id: str):
 
 @app.get("/api/state/summary")
 async def state_summary():
-    """
-    Return a structured state summary:
-      - workflow_state: in-memory workflow/cache state (GAME_STATE) with legacy ledgers stripped
-      - db_snapshot: DB SSOT snapshot (trade assets, contracts ledger, transactions, gm profiles)
-    """
-    # 1) Workflow state (shallow copy) — never expose legacy ledgers here.
     workflow_state: Dict[str, Any] = dict(GAME_STATE)
     for k in (
         # Trade assets ledger (DB SSOT)
@@ -666,4 +658,5 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return get_schedule_summary()
+
 
