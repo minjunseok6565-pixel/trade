@@ -165,13 +165,6 @@ def _count_first_round_picks_for_year(
 
 
 def _get_assets_snapshot(ctx: TradeContext) -> Dict[str, Any]:
-    """Return a consistent DB snapshot of trade-relevant assets.
-
-    This rule MUST NOT depend on state dicts for draft_picks/swap_rights/fixed_assets because
-    those ledgers have been migrated to DB SSOT. We cache the snapshot on ctx.extra so:
-      - multiple rules don't re-query the DB repeatedly
-      - all rules see a consistent view during validation
-    """
     cached = ctx.extra.get("assets_snapshot")
     if isinstance(cached, dict):
         return cached  # type: ignore[return-value]
