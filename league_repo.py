@@ -596,17 +596,14 @@ class LeagueRepo:
         return out
 
     def get_draft_picks_map(self) -> Dict[str, Dict[str, Any]]:
-        """Legacy-compatible map: {pick_id -> pick_dict}"""
         cur = self._conn.cursor()
         return self._read_draft_picks_map(cur)
 
     def get_swap_rights_map(self) -> Dict[str, Dict[str, Any]]:
-        """Legacy-compatible map: {swap_id -> swap_dict}"""
         cur = self._conn.cursor()
         return self._read_swap_rights_map(cur)
 
     def get_fixed_assets_map(self) -> Dict[str, Dict[str, Any]]:
-        """Legacy-compatible map: {asset_id -> asset_dict}"""
         cur = self._conn.cursor()
         return self._read_fixed_assets_map(cur)
 
@@ -665,10 +662,6 @@ class LeagueRepo:
         deal_id: Optional[str] = None,
         tx_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Legacy-compatible list: returns list[dict] where each dict is the original payload_json.
-        Filters are optional.
-        """
         limit_i = max(1, int(limit))
         where = []
         params: List[Any] = []
@@ -918,10 +911,6 @@ class LeagueRepo:
 
 
     def _contract_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
-        """
-        Prefer contract_json if present (keeps old shape).
-        Otherwise, synthesize a minimal legacy-friendly dict.
-        """
         raw_json = None
         try:
             raw_json = row["contract_json"]
@@ -931,7 +920,6 @@ class LeagueRepo:
         if raw_json:
             obj = _json_loads(raw_json, None)
             if isinstance(obj, dict):
-                # Ensure key fields exist even if legacy json omitted them
                 obj.setdefault("contract_id", str(row["contract_id"]))
                 obj.setdefault("player_id", str(row["player_id"]))
                 obj.setdefault("team_id", str(row["team_id"]).upper())
@@ -958,7 +946,6 @@ class LeagueRepo:
         }
 
     def get_contracts_map(self, *, active_only: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Legacy-compatible map: {contract_id -> contract_dict}"""
         sql = "SELECT * FROM contracts"
         params: List[Any] = []
         if active_only:
@@ -971,7 +958,6 @@ class LeagueRepo:
         return out
 
     def get_player_contracts_map(self) -> Dict[str, List[str]]:
-        """Legacy-compatible map: {player_id -> [contract_id, ...]}"""
         rows = self._conn.execute(
             "SELECT player_id, contract_id FROM player_contracts;"
         ).fetchall()
@@ -986,10 +972,6 @@ class LeagueRepo:
         return out
 
     def get_active_contract_id_by_player(self) -> Dict[str, str]:
-        """
-        Legacy-compatible map: {player_id -> contract_id}
-        Prefer active_contracts table; fallback to contracts.is_active=1.
-        """
         rows = self._conn.execute(
             "SELECT player_id, contract_id FROM active_contracts;"
         ).fetchall()
@@ -1014,11 +996,6 @@ class LeagueRepo:
         return out
 
     def list_free_agents(self, *, source: str = "roster") -> List[str]:
-        """
-        Legacy-compatible list: [player_id, ...]
-        - source="roster" (default): derived from roster.team_id == 'FA' (recommended)
-        - source="table": reads free_agents table (legacy)
-        """
         src = (source or "roster").strip().lower()
         if src == "roster":
             rows = self._conn.execute(
@@ -1037,7 +1014,6 @@ class LeagueRepo:
         raise ValueError(f"Unknown source for list_free_agents: {source}")
 
     def get_contract_ledger_snapshot(self) -> Dict[str, Any]:
-        """Read contracts-related legacy keys in one transaction for consistency."""
         with self.transaction() as cur:
             # Use public methods for shape; reads happen under the same BEGIN snapshot.
             # (We intentionally call the public methods so any future normalization stays centralized.)
