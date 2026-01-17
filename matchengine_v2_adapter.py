@@ -1,28 +1,3 @@
-"""matchengine_v3 (raw) -> GameResultV2 adapter.
-
-This adapter is designed to work with:
-- sim/league_sim.py: uses master_schedule entries with fields {game_id, date, home_team_id, away_team_id}
-- state.py: ingest_game_result() only accepts GameResultV2 schema_version == "2.0"
-
-Raw engine output expected (from matchengine_v3/sim_game.py):
-- result: {
-    "meta": {"engine_version", "era", "era_version", "replay_token", "overtime_periods", "validation", "internal_debug"},
-    "possessions_per_team": int,
-    "teams": { <home.name>: summarize_team(...), <away.name>: summarize_team(...) },
-    "game_state": {
-        "team_fouls": {"home": int, "away": int},
-        "player_fouls": {"home": {pid: int}, "away": {...}},
-        "fatigue": {"home": {pid: float}, "away": {...}},
-        "minutes_played_sec": {"home": {pid: int}, "away": {...}},
-    }
-  }
-
-Important philosophy:
-- No silent guessing: if we cannot map raw teams to (home_team_id, away_team_id) deterministically,
-  we raise ValueError with actionable details.
-- We keep only additive/counted stats in totals; derived percentages are moved to `derived`.
-
-"""
 
 from __future__ import annotations
 
@@ -35,17 +10,6 @@ Phase = Literal["regular", "play_in", "playoffs", "preseason"]
 
 
 class AdapterContext(TypedDict, total=False):
-    """Context required to build GameResultV2.
-
-    sim/league_sim.py can build most of these from master_schedule + league state.
-
-    Required:
-      - game_id, date, season_id, phase, home_team_id, away_team_id
-
-    Optional:
-      - home_raw_team_key, away_raw_team_key: keys in raw_result['teams'] corresponding to home/away.
-        If omitted, the adapter will only accept raw keys that exactly match team ids.
-    """
 
     game_id: str
     date: str
@@ -111,18 +75,6 @@ def build_context_from_master_schedule_entry(
     date_override: Optional[str] = None,
     phase: Phase = "regular",
 ) -> AdapterContext:
-    """Build AdapterContext from a master_schedule game entry.
-
-    master_schedule entries are created in state.py with:
-      - game_id, date, home_team_id, away_team_id
-
-    league_state is GAME_STATE['league'] (state.py), which includes:
-      - season_year
-
-    The raw team keys default to team_id values; if your matchengine_v3 setup uses a different
-    naming scheme for raw_result['teams'] keys, provide home_raw_team_key/away_raw_team_key
-    explicitly later.
-    """
     game_id = _require_str(entry.get("game_id"), "entry.game_id")
     date_str = _require_str(date_override or entry.get("date"), "entry.date")
     home_team_id = _normalize_team_id_strict(entry.get("home_team_id"), path="entry.home_team_id")
@@ -166,10 +118,6 @@ def build_context_from_team_ids(
     home_raw_team_key: Optional[str] = None,
     away_raw_team_key: Optional[str] = None,
 ) -> AdapterContext:
-    """Build AdapterContext when you don't have a master_schedule entry.
-
-    This is useful for simulate_single_game() in sim/league_sim.py.
-    """
     base = build_context_from_master_schedule_entry(
         entry={
             "game_id": game_id,
@@ -533,17 +481,6 @@ def adapt_matchengine_result_to_v2(
     engine_name: str = "matchengine_v3",
     include_raw: bool = False,
 ) -> Dict[str, Any]:
-    """Convert matchengine_v3 raw result to GameResultV2 dict.
-
-    This returns a dict compatible with state.py::ingest_game_result().
-
-    Parameters
-    - raw_result: output from matchengine_v3.sim_game.simulate_game()
-    - context: required game metadata (usually from master_schedule + league state)
-
-    Raises
-    - ValueError: if raw_result or context lacks required fields or cannot be mapped deterministically.
-    """
 
     raw = _require_dict(raw_result, "raw")
     meta = _require_dict(raw.get("meta"), "raw.meta")
