@@ -79,26 +79,3 @@ def is_free_agent(
         except Exception:
             return False
     return str(team_id).upper() == FREE_AGENT_TEAM_ID
-
-
-# ---------------------------------------------------------------------------
-# Legacy write helpers (removed)
-# ---------------------------------------------------------------------------
-
-
-def add_free_agent(*_args, **_kwargs) -> None:  # pragma: no cover
-    """Deprecated.
-
-    Free agency is derived from DB (roster.team_id == 'FA').
-    Use contracts.ops.release_to_free_agents(...) to create/maintain FA state.
-    """
-    raise RuntimeError("add_free_agent is deprecated: FA is derived from DB roster")
-
-
-def remove_free_agent(*_args, **_kwargs) -> None:  # pragma: no cover
-    """Deprecated.
-
-    Free agency is derived from DB (roster.team_id == 'FA').
-    Use contracts.ops.sign_free_agent(...) to move a player out of FA.
-    """
-    raise RuntimeError("remove_free_agent is deprecated: FA is derived from DB roster")
