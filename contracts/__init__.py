@@ -20,7 +20,6 @@ from contracts.options import (
     recompute_contract_years_from_salary,
 )
 from contracts.options_policy import default_option_decision_policy
-from contracts.ops import re_sign_or_extend, release_to_free_agents, sign_free_agent
 
 __all__ = [
     "new_contract_id",
@@ -34,7 +33,4 @@ __all__ = [
     "FREE_AGENT_TEAM_ID",
     "list_free_agents",
     "is_free_agent",
-    "sign_free_agent",
-    "re_sign_or_extend",
-    "release_to_free_agents",
 ]
