@@ -110,11 +110,6 @@ def _validate_protection(pick_id: str, protection: Dict[str, Any]) -> Dict[str, 
 def settle_draft_year(
     game_state: dict, draft_year: int, pick_order: Dict[str, int]
 ) -> List[Dict[str, Any]]:
-    """
-    ✅ DB-SSOT adapter.
-    Legacy call sites may still call trades.pick_settlement.settle_draft_year(GAME_STATE,...).
-    After migration, in-memory ledgers are unreliable; route to LeagueService.settle_draft_year.
-    """
     db_path = _get_db_path_from_game_state(game_state)
     year_i = int(draft_year)
     pick_order_i: Dict[str, int] = {}
@@ -127,7 +122,6 @@ def settle_draft_year(
         return svc.settle_draft_year(year_i, pick_order_i)
 
 
-# ---- Legacy in-memory implementation (service can import this to avoid recursion) ----
 def settle_draft_year_in_memory(
     game_state: dict, draft_year: int, pick_order: Dict[str, int]
 ) -> List[Dict[str, Any]]:
