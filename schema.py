@@ -216,14 +216,6 @@ def normalize_player_id(
     strict: bool = True,
     allow_legacy_numeric: bool = False,
 ) -> PlayerId:
-    """
-    Normalize player id into canonical form.
-
-    Recommended canonical format: P000001.
-    - strict=True enforces 'P' + 6 digits.
-    - allow_legacy_numeric=True allows "12" style IDs (NOT recommended long-term).
-      If allowed, it returns the string as-is (still str), so you avoid int/str split.
-    """
     s = str(value).strip()
     if not s:
         raise ValueError("player_id is empty")
@@ -232,7 +224,6 @@ def normalize_player_id(
         return PlayerId(s)
 
     if allow_legacy_numeric and s.isdigit():
-        # Legacy mode: keep as str, never int.
         return PlayerId(s)
 
     if strict:
@@ -245,11 +236,9 @@ def season_id_from_year(season_year: int) -> SeasonId:
     return SeasonId(f"{int(season_year)}-{yy}")
 
 def make_player_id_seq(n: int) -> PlayerId:
-    """Helper for migrations: 1 -> P000001"""
     return PlayerId(f"P{int(n):06d}")
 
 def make_player_id_uuid() -> PlayerId:
-    """Alternative migration strategy (very stable, less human-friendly)."""
     # Example: P_2f1c1f...  (If you use this, relax PLAYER_ID_RE and adjust strict checks.)
     return PlayerId("P" + uuid.uuid4().hex[:10].upper())
 
@@ -379,4 +368,3 @@ def normalize_player_keyed_map(
 # - NEVER int
 
 # Any module that produces game results should produce GameResultV2 as defined above.
-# matchengine_v2_adapter should be the only boundary module that knows about raw engine quirks.
