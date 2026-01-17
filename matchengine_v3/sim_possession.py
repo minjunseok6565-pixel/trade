@@ -37,7 +37,7 @@ from .sim_clock import (
 )
 
 if TYPE_CHECKING:
-    from config.game_config import GameConfig
+    from .game_config import GameConfig
 
 def apply_quality_to_turnover_priors(
     pri: Dict[str, float],
