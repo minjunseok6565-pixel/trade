@@ -7,8 +7,8 @@ import sys
 from .core import clamp
 from .era import get_mvp_rules
 from .models import Player, TeamState
-from .sim import simulate_game
-from .sim.team_keys import team_key
+from .sim_game import simulate_game
+from .team_keys import team_key
 from .tactics import TacticsConfig
 
 
