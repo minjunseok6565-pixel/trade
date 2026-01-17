@@ -187,10 +187,6 @@ class LeagueService:
         return out
 
     def _salary_for_season(self, contract: Mapping[str, Any], season_year: int) -> Optional[int]:
-        """
-        Best-effort salary lookup from a contract dict (legacy-friendly).
-        Returns integer dollars if present.
-        """
         salary_by_year = contract.get("salary_by_year") or {}
         if isinstance(salary_by_year, dict):
             v = salary_by_year.get(str(int(season_year)))
@@ -635,7 +631,6 @@ class LeagueService:
     # (A) Boot / Migration / Seed
     # ----------------------------
     def init_or_migrate_db(self) -> None:
-        """Create tables and apply light-weight migrations (safe to call repeatedly)."""
         self.repo.init_db()
 
     def ensure_gm_profiles_seeded(self, team_ids: Sequence[str]) -> None:
@@ -1129,7 +1124,6 @@ class LeagueService:
             except Exception:
                 continue
 
-        # Build a minimal in-memory state snapshot for the legacy settlement logic,
         # then persist the mutated results back to DB.
         game_state: Dict[str, Any] = {"draft_picks": {}, "swap_rights": {}, "fixed_assets": {}}
 
@@ -1188,7 +1182,6 @@ class LeagueService:
                 attrs.setdefault("draft_year", r["draft_year"])
                 game_state["fixed_assets"][str(r["asset_id"])] = attrs
 
-            # Run legacy settlement (mutates game_state dicts)
             events = _legacy_settle_draft_year(game_state, year_i, pick_order)
 
             # Persist: picks (owner_team + protection cleared)
@@ -1292,7 +1285,6 @@ class LeagueService:
             if season_salary is not None:
                 self._set_roster_salary_in_cur(cur, pid, int(float(season_salary)))
 
-            # Keep legacy free_agents index table consistent (best-effort)
             try:
                 cur.execute("DELETE FROM free_agents WHERE player_id=?;", (pid,))
             except Exception:
