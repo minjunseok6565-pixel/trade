@@ -116,7 +116,6 @@ BREAKDOWN_KEYS: Tuple[str, ...] = (
     "PossessionEndCounts",
     "ShotZoneDetail",
     "OffActionCounts",
-    "DefActionCounts",
     "OutcomeCounts",
     "ShotZones",
 )
