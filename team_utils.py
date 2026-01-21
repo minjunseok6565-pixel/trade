@@ -5,7 +5,12 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
-from state import GAME_STATE, _ensure_league_state, initialize_master_schedule_if_needed
+from state import (
+    GAME_STATE,
+    ensure_league_block,
+    ensure_cap_model_populated_if_needed,
+    initialize_master_schedule_if_needed,
+)
 
 # Division/Conference mapping can stay in config (static).
 # We intentionally do NOT import ROSTER_DF anymore.
@@ -168,7 +173,9 @@ def _compute_team_payroll(team_id: str) -> float:
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
-    league = _ensure_league_state()
+    # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
+    ensure_cap_model_populated_if_needed()
+    league = ensure_league_block()
     trade_rules = league.get("trade_rules", {})
     try:
         salary_cap = float(trade_rules.get("salary_cap") or 0.0)
@@ -180,7 +187,7 @@ def _compute_cap_space(team_id: str) -> float:
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
     initialize_master_schedule_if_needed()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league["master_schedule"]
     games = master_schedule.get("games") or []
 
@@ -383,5 +390,6 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
