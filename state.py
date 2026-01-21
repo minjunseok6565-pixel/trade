@@ -1443,7 +1443,7 @@ def get_schedule_summary() -> Dict[str, Any]:
     - 팀별 총 경기 수(82 보장 여부)와 홈/원정 분배
     """
     initialize_master_schedule_if_needed()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master = league.get("master_schedule") or {}
     games = master.get("games") or []
     by_team = master.get("by_team") or {}
@@ -1480,6 +1480,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
