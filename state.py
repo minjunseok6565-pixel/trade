@@ -118,7 +118,7 @@ GAME_STATE: Dict[str, Any] = {
 
 def get_current_date() -> Optional[str]:
     """Return the league's current in-game date, keeping mirrors in sync."""
-    league = _ensure_league_state()
+    league = ensure_league_block()
     current = league.get("current_date")
     legacy_current = GAME_STATE.get("current_date")
 
@@ -142,7 +142,7 @@ def get_current_date_as_date() -> date:
         except ValueError:
             pass
 
-    league = _ensure_league_state()
+    league = ensure_league_block()
     season_start = league.get("season_start")
     if season_start:
         try:
@@ -155,7 +155,7 @@ def get_current_date_as_date() -> date:
 
 def set_current_date(date_str: Optional[str]) -> None:
     """Update the league's current date and mirror it at the root location."""
-    league = _ensure_league_state()
+    league = ensure_league_block()
     league["current_date"] = date_str
     if date_str is None:
         GAME_STATE.pop("current_date", None)
@@ -402,70 +402,190 @@ def _ensure_ingest_turn_backfilled() -> None:
     _backfill_ingest_turns_once()
     migrations["ingest_turn_backfilled"] = True
 
+# -------------------------------------------------------------------------
+# 1A. League/DB bootstrap helpers (refactor: split former _ensure_league_state)
+# -------------------------------------------------------------------------
 
-def _ensure_league_state() -> Dict[str, Any]:
-    """GAME_STATE 안에 league 상태 블록을 보장한다."""
-    league = GAME_STATE.setdefault("league", {})
-    master_schedule = league.setdefault("master_schedule", {})
-    master_schedule.setdefault("games", [])
-    master_schedule.setdefault("by_team", {})
-    master_schedule.setdefault("by_date", {})
-    master_schedule.setdefault("by_id", {})
-    trade_rules = league.setdefault("trade_rules", {})
+def ensure_league_block() -> Dict[str, Any]:
+    """Ensure the minimal in-memory league scaffold exists.
+
+    This is intentionally *in-memory only*: no DB init, no roster seeding, no integrity checks.
+    """
+    league = GAME_STATE.setdefault('league', {})
+    master_schedule = league.setdefault('master_schedule', {})
+    master_schedule.setdefault('games', [])
+    master_schedule.setdefault('by_team', {})
+    master_schedule.setdefault('by_date', {})
+    master_schedule.setdefault('by_id', {})
+
+    trade_rules = league.setdefault('trade_rules', {})
+    if not isinstance(trade_rules, dict):
+        trade_rules = {}
+        league['trade_rules'] = trade_rules
     for key, value in DEFAULT_TRADE_RULES.items():
         trade_rules.setdefault(key, value)
-    league.setdefault("season_year", None)
-    league.setdefault("draft_year", None)
-    league.setdefault("season_start", None)
-    league.setdefault("current_date", None)
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
-    league["db_path"] = db_path
-    league.setdefault("last_gm_tick_date", None)
+        
+    league.setdefault('season_year', None)
+    league.setdefault('draft_year', None)
+    league.setdefault('season_start', None)
+    league.setdefault('current_date', None)
+    league.setdefault('last_gm_tick_date', None)
+
+    db_path = league.get('db_path') or os.environ.get('LEAGUE_DB_PATH') or 'league.db'
+    league['db_path'] = db_path
+    return league
+
+
+def ensure_db_initialized_and_seeded() -> None:
+    """Ensure LeagueRepo is initialized and GM profiles are seeded (startup-only)."""
+    league = ensure_league_block()
+    db_path = str(league.get('db_path') or 'league.db')
+
+    migrations = GAME_STATE.setdefault('_migrations', {})
+    if migrations.get('db_initialized') is True and migrations.get('db_initialized_db_path') == db_path:
+        return
+
     from league_repo import LeagueRepo
 
-    # DB is the single source of truth (SSOT) for league data. state.py only keeps
-    # simulation progress and transient gameplay state.
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         # Keep rows ready for all teams (idempotent).
         repo.ensure_gm_profiles_seeded(ALL_TEAM_IDS)
 
+    migrations['db_initialized'] = True
+    migrations['db_initialized_db_path'] = db_path
 
-    season_year = league.get("season_year")
-    salary_cap = trade_rules.get("salary_cap")
+
+def ensure_cap_model_populated_if_needed() -> None:
+    """Populate cap/aprons in league.trade_rules if season_year is known and unset/zero."""
+    league = ensure_league_block()
+    trade_rules = league.get('trade_rules') or {}
+    season_year = league.get('season_year')
+    salary_cap = trade_rules.get('salary_cap') if isinstance(trade_rules, dict) else None
+    if not season_year:
+        return
+    try:
+        season_year_int = int(season_year)
+    except (TypeError, ValueError):
+        return
+    try:
+        salary_cap_value = float(salary_cap or 0)
+    except (TypeError, ValueError):
+        salary_cap_value = 0.0
+    if salary_cap_value <= 0:
+        _apply_cap_model_for_season(league, season_year_int)
+
+
+def ensure_trade_state_keys() -> None:
+    """Ensure trade-related GAME_STATE keys exist (startup-only)."""
+    _ensure_trade_state()
+
+
+def ensure_player_ids_normalized(*, allow_legacy_numeric: bool = True) -> dict:
+    """Normalize player IDs in GAME_STATE (startup-only)."""
+    return normalize_player_ids(GAME_STATE, allow_legacy_numeric=allow_legacy_numeric)
+
+
+def ensure_contracts_bootstrapped_after_schedule_creation_once() -> None:
+    """Bootstrap contracts from roster once right after schedule creation (per season)."""
+    league = ensure_league_block()
+    season_year = league.get('season_year')
+    try:
+        season_year_int = int(season_year)
+    except (TypeError, ValueError):
+        return
+
+    migrations = GAME_STATE.setdefault('_migrations', {})
+    boot = migrations.setdefault('contracts_bootstrapped_seasons', {})
+    if isinstance(boot, dict) and boot.get(str(season_year_int)) is True:
+        return
+
+    from league_repo import LeagueRepo
+
+    db_path = str(league.get('db_path') or 'league.db')
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
+        # Keep derived indices in sync (especially free_agents derived from roster).
+        repo.rebuild_contract_indices()
+
+    if isinstance(boot, dict):
+        boot[str(season_year_int)] = True
+
+
+def validate_repo_integrity_once_startup() -> None:
+    """Validate DB integrity once at startup (per db_path)."""
+    league = ensure_league_block()
+    db_path = str(league.get('db_path') or 'league.db')
+    migrations = GAME_STATE.setdefault('_migrations', {})
+    if migrations.get('repo_integrity_validated') is True and migrations.get('repo_integrity_validated_db_path') == db_path:
+        return
+    from league_repo import LeagueRepo
+    with LeagueRepo(db_path) as repo:
+        repo.validate_integrity()
+    migrations['repo_integrity_validated'] = True
+    migrations['repo_integrity_validated_db_path'] = db_path
+
+
+def ensure_ingest_turn_backfilled_once_startup() -> None:
+    """Run ingest_turn backfill once per GAME_STATE instance (startup-only)."""
+    _ensure_ingest_turn_backfilled()
+
+
+def _ensure_league_state() -> Dict[str, Any]:
+    """DEPRECATED: Legacy bootstrap that performed DB init/seeding/normalization.
+
+    Kept temporarily for external callers. New code should call the granular ensure_* helpers
+    (startup vs schedule-creation responsibilities) and this function will be removed.
+    """
+    league = ensure_league_block()
+    trade_rules = league.get('trade_rules') or {}
+    ensure_db_initialized_and_seeded()
+
+    # Cap auto-fill when season_year is already known.
+    season_year = league.get('season_year')
+    salary_cap = trade_rules.get('salary_cap') if isinstance(trade_rules, dict) else None
     if season_year:
         try:
             salary_cap_value = float(salary_cap or 0)
         except (TypeError, ValueError):
-            salary_cap_value = 0
-        if salary_cap_value <= 0:
-            # Ensure cap/aprons are populated when unset/zero.
-            _apply_cap_model_for_season(league, int(season_year))
-    _ensure_trade_state()
-    from team_utils import _init_players_and_teams_if_needed
+            salary_cap_value = 0.0
+        try:
+            season_year_int = int(season_year)
+        except (TypeError, ValueError):
+            season_year_int = None
+        if season_year_int and salary_cap_value <= 0:
+            _apply_cap_model_for_season(league, season_year_int)
 
+    ensure_trade_state_keys()
+
+    # Legacy behavior: initialize players/teams + normalize IDs.
+    from team_utils import _init_players_and_teams_if_needed
     _init_players_and_teams_if_needed()
-    # Normalize player IDs to canonical strings (prevents "12" vs 12 splits).
     normalize_player_ids(GAME_STATE)
 
-    # Contracts are DB(SSOT). Ensure DB has minimum seeded contracts from roster without state ledgers.
+    # Legacy behavior: contracts bootstrap when season_year is known.
     if season_year:
         try:
             season_year_int = int(season_year)
         except (TypeError, ValueError):
             season_year_int = None
         if season_year_int:
+            from league_repo import LeagueRepo
+            db_path = str(league.get('db_path') or 'league.db')
             with LeagueRepo(db_path) as repo:
                 repo.init_db()
                 repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
-                # Keep derived indices in sync (especially free_agents derived from roster).
                 repo.rebuild_contract_indices()
 
-   
+    # Legacy behavior: validate integrity and backfill ingest_turn.
+    from league_repo import LeagueRepo
+    db_path = str(league.get('db_path') or 'league.db')
     with LeagueRepo(db_path) as repo:
         repo.validate_integrity()
     _ensure_ingest_turn_backfilled()
     return league
+
 
 # -------------------------------------------------------------------------
 # 1B. 인터페이스 계약(Contract) 검증 유틸
@@ -536,7 +656,7 @@ def validate_v2_game_result(game_result: Dict[str, Any]) -> None:
 
 
 def _ensure_master_schedule_indices() -> None:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
     # Contract check: master_schedule entries must satisfy the minimal schema.
@@ -722,7 +842,7 @@ def _build_master_schedule(season_year: int) -> None:
       * 하루 최대 MAX_GAMES_PER_DAY 경기
       * 한 팀은 하루에 최대 1경기
     """
-    league = _ensure_league_state()
+    league = ensure_league_block()
     from league_repo import LeagueRepo
 
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
@@ -943,7 +1063,7 @@ def _build_master_schedule(season_year: int) -> None:
 
 def initialize_master_schedule_if_needed() -> None:
     """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league["master_schedule"]
     if master_schedule.get("games"):
         _ensure_master_schedule_indices()
@@ -953,6 +1073,9 @@ def initialize_master_schedule_if_needed() -> None:
     season_year = INITIAL_SEASON_YEAR
     _build_master_schedule(season_year)
     _ensure_master_schedule_indices()
+
+    # Schedule creation is the agreed contract-bootstrap checkpoint (once per season).
+    ensure_contracts_bootstrapped_after_schedule_creation_once()
 
 
 def _mark_master_schedule_game_final(
@@ -964,7 +1087,7 @@ def _mark_master_schedule_game_final(
     away_score: int,
 ) -> None:
     """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league.setdefault("master_schedule", {})
     games = master_schedule.get("games") or []
     by_id = master_schedule.setdefault("by_id", {})
@@ -1289,7 +1412,7 @@ def get_team_schedule_view(
 
     initialize_master_schedule_if_needed()
     _ensure_master_schedule_indices()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league.get("master_schedule") or {}
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
@@ -1412,6 +1535,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
