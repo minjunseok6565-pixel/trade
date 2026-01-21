@@ -16,7 +16,13 @@ from league_repo import LeagueRepo
 from schema import normalize_team_id
 from state import (
     GAME_STATE,
-    _ensure_league_state,
+    ensure_league_block,
+    ensure_db_initialized_and_seeded,
+    ensure_trade_state_keys,
+    ensure_player_ids_normalized,
+    ensure_cap_model_populated_if_needed,
+    validate_repo_integrity_once_startup,
+    ensure_ingest_turn_backfilled_once_startup,
     get_current_date,
     get_current_date_as_date,
     get_schedule_summary,
@@ -34,6 +40,7 @@ from playoffs import (
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
 from team_utils import (
+    _init_players_and_teams_if_needed,
     get_conference_standings,
     get_team_cards,
     get_team_detail,
@@ -54,8 +61,21 @@ app = FastAPI(title="느바 시뮬 GM 서버")
 
 @app.on_event("startup")
 def _startup_init_state() -> None:
-    _ensure_league_state()
+    # Startup-only bootstraps (agreed policy):
+    # 1) DB init + seed once
+    # 2) players/teams cache init + player_id normalize once
+    # 3) repo integrity validate once
+    # 4) ingest_turn backfill once
+    ensure_league_block()
+    ensure_db_initialized_and_seeded()
+    ensure_trade_state_keys()
+    _init_players_and_teams_if_needed()
+    ensure_player_ids_normalized()
     initialize_master_schedule_if_needed()
+    # In case season_year exists and cap fields are still unset/zero.
+    ensure_cap_model_populated_if_needed()
+    validate_repo_integrity_once_startup()
+    ensure_ingest_turn_backfilled_once_startup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -420,7 +440,7 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     return JSONResponse(status_code=400, content=payload)
 
 def _require_db_path() -> str:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
     if not db_path:
         raise HTTPException(status_code=500, detail="db_path is required for trade operations")
@@ -564,7 +584,7 @@ async def team_schedule(team_id: str):
 
     # 마스터 스케줄이 없다면 생성
     initialize_master_schedule_if_needed()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league["master_schedule"]
     games = master_schedule.get("games") or []
 
@@ -658,5 +678,6 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return get_schedule_summary()
+
 
 
