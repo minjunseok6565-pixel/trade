@@ -403,7 +403,7 @@ def _ensure_ingest_turn_backfilled() -> None:
     migrations["ingest_turn_backfilled"] = True
 
 # -------------------------------------------------------------------------
-# 1A. League/DB bootstrap helpers (refactor: split former _ensure_league_state)
+# 1A. League/DB bootstrap helpers (refactor: split former monolithic bootstrap)
 # -------------------------------------------------------------------------
 
 def ensure_league_block() -> Dict[str, Any]:
@@ -530,61 +530,6 @@ def validate_repo_integrity_once_startup() -> None:
 def ensure_ingest_turn_backfilled_once_startup() -> None:
     """Run ingest_turn backfill once per GAME_STATE instance (startup-only)."""
     _ensure_ingest_turn_backfilled()
-
-
-def _ensure_league_state() -> Dict[str, Any]:
-    """DEPRECATED: Legacy bootstrap that performed DB init/seeding/normalization.
-
-    Kept temporarily for external callers. New code should call the granular ensure_* helpers
-    (startup vs schedule-creation responsibilities) and this function will be removed.
-    """
-    league = ensure_league_block()
-    trade_rules = league.get('trade_rules') or {}
-    ensure_db_initialized_and_seeded()
-
-    # Cap auto-fill when season_year is already known.
-    season_year = league.get('season_year')
-    salary_cap = trade_rules.get('salary_cap') if isinstance(trade_rules, dict) else None
-    if season_year:
-        try:
-            salary_cap_value = float(salary_cap or 0)
-        except (TypeError, ValueError):
-            salary_cap_value = 0.0
-        try:
-            season_year_int = int(season_year)
-        except (TypeError, ValueError):
-            season_year_int = None
-        if season_year_int and salary_cap_value <= 0:
-            _apply_cap_model_for_season(league, season_year_int)
-
-    ensure_trade_state_keys()
-
-    # Legacy behavior: initialize players/teams + normalize IDs.
-    from team_utils import _init_players_and_teams_if_needed
-    _init_players_and_teams_if_needed()
-    normalize_player_ids(GAME_STATE)
-
-    # Legacy behavior: contracts bootstrap when season_year is known.
-    if season_year:
-        try:
-            season_year_int = int(season_year)
-        except (TypeError, ValueError):
-            season_year_int = None
-        if season_year_int:
-            from league_repo import LeagueRepo
-            db_path = str(league.get('db_path') or 'league.db')
-            with LeagueRepo(db_path) as repo:
-                repo.init_db()
-                repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
-                repo.rebuild_contract_indices()
-
-    # Legacy behavior: validate integrity and backfill ingest_turn.
-    from league_repo import LeagueRepo
-    db_path = str(league.get('db_path') or 'league.db')
-    with LeagueRepo(db_path) as repo:
-        repo.validate_integrity()
-    _ensure_ingest_turn_backfilled()
-    return league
 
 
 # -------------------------------------------------------------------------
@@ -1535,6 +1480,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
