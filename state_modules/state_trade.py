@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from state_store import GAME_STATE, _DEFAULT_TRADE_MARKET, _DEFAULT_TRADE_MEMORY
+from .state_store import GAME_STATE, _DEFAULT_TRADE_MARKET, _DEFAULT_TRADE_MEMORY
 
 
 def _ensure_trade_state() -> None:
