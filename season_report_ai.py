@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 import google.generativeai as genai
 
-from state import GAME_STATE, _ensure_league_state
+from state import GAME_STATE, ensure_league_block
 from stats_util import compute_league_leaders
 from team_utils import get_conference_standings, get_team_detail
 from config import ALL_TEAM_IDS
@@ -236,7 +236,7 @@ def build_season_context(user_team_id: str) -> Dict[str, Any]:
     if user_team_id not in ALL_TEAM_IDS:
         raise ValueError(f"Unknown team id: {user_team_id}")
 
-    league = _ensure_league_state()
+    league = ensure_league_block()
     current_date = league.get("current_date") or GAME_STATE.get("current_date") or date.today().isoformat()
 
     standings = get_conference_standings()
