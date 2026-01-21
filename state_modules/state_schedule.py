@@ -24,7 +24,7 @@ from .state_core import (
     ensure_league_block,
     set_current_date,
 )
-from state_store import GAME_STATE, _ALLOWED_SCHEDULE_STATUSES
+from .state_store import GAME_STATE, _ALLOWED_SCHEDULE_STATUSES
 
 
 def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
