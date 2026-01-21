@@ -7,7 +7,7 @@ import random
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, _ensure_league_state, get_current_date_as_date
+from state import GAME_STATE, ensure_league_block, get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
 from trades.apply import apply_deal
 from trades.errors import TradeError
@@ -17,7 +17,7 @@ from trades import agreements
 
 
 def _run_ai_gm_tick_if_needed(target_date: date) -> None:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     trade_deadline_str = league.get("trade_rules", {}).get("trade_deadline")
     if trade_deadline_str:
         try:
@@ -53,7 +53,7 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     from state import initialize_master_schedule_if_needed
 
     initialize_master_schedule_if_needed()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     db_path = league.get("db_path")
     if not db_path:
         raise ValueError("db_path is required for AI trade evaluation")
