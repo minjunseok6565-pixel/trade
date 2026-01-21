@@ -15,7 +15,7 @@ from sim.roster_adapter import build_team_state_from_db
 from state import (
     GAME_STATE,
     _accumulate_player_rows,
-    _ensure_league_state,
+    ensure_league_block,
     ingest_game_result,
     set_current_date,
 )
@@ -30,7 +30,7 @@ HomePattern = [True, True, False, False, True, False, True]
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
 
     with LeagueRepo(str(db_path)) as repo:
@@ -61,7 +61,7 @@ def _safe_date_fromisoformat(date_str: Optional[str]) -> Optional[date]:
 
 
 def _regular_season_end_date() -> date:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league.get("master_schedule") or {}
     by_date = master_schedule.get("by_date") or {}
 
@@ -236,7 +236,7 @@ def _simulate_postseason_game(
 
     set_current_date(game_date)
 
-    league = _ensure_league_state()
+    league = ensure_league_block()
     game_id = f"playoffs_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
     context = build_context_from_team_ids(
         game_id=game_id,
