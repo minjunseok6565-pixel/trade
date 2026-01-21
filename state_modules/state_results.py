@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from state_cache import _mark_views_dirty
-from state_core import _ensure_active_season_id, _get_phase_container
-from state_schedule import _mark_master_schedule_game_final
-from state_store import GAME_STATE, _ALLOWED_PHASES, _META_PLAYER_KEYS
-from state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
+from .state_cache import _mark_views_dirty
+from .state_core import _ensure_active_season_id, _get_phase_container
+from .state_schedule import _mark_master_schedule_game_final
+from .state_store import GAME_STATE, _ALLOWED_PHASES, _META_PLAYER_KEYS
+from .state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
 
 
 def _validate_game_result_v2(game_result: Dict[str, Any]) -> None:
