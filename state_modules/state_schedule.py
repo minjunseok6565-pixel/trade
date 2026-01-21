@@ -15,9 +15,9 @@ from config import (
     SEASON_START_MONTH,
     TEAM_TO_CONF_DIV,
 )
-from state_bootstrap import ensure_contracts_bootstrapped_after_schedule_creation_once
-from state_cap import _apply_cap_model_for_season
-from state_core import (
+from .state_bootstrap import ensure_contracts_bootstrapped_after_schedule_creation_once
+from .state_cap import _apply_cap_model_for_season
+from .state_core import (
     _archive_and_reset_season_accumulators,
     _ensure_active_season_id,
     _season_id_from_year,
