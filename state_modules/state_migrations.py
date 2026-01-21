@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List
 
-from state_store import GAME_STATE
+from .state_store import GAME_STATE
 
 
 def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True) -> dict:
