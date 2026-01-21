@@ -117,19 +117,11 @@ GAME_STATE: Dict[str, Any] = {
 
 
 def get_current_date() -> Optional[str]:
-    """Return the league's current in-game date, keeping mirrors in sync."""
+    """Return the league's current in-game date (SSOT: GAME_STATE['league']['current_date'])."""
     league = ensure_league_block()
     current = league.get("current_date")
-    legacy_current = GAME_STATE.get("current_date")
-
     if current:
-        GAME_STATE["current_date"] = current
         return current
-
-    if legacy_current:
-        league["current_date"] = legacy_current
-        return legacy_current
-
     return None
 
 
@@ -154,13 +146,9 @@ def get_current_date_as_date() -> date:
 
 
 def set_current_date(date_str: Optional[str]) -> None:
-    """Update the league's current date and mirror it at the root location."""
+    """Update the league's current date (SSOT: GAME_STATE['league']['current_date'])."""
     league = ensure_league_block()
     league["current_date"] = date_str
-    if date_str is None:
-        GAME_STATE.pop("current_date", None)
-    else:
-        GAME_STATE["current_date"] = date_str
 
 
 def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
@@ -1480,6 +1468,7 @@ def get_schedule_summary() -> Dict[str, Any]:
         "status_counts": status_counts,
         "team_breakdown": team_breakdown,
     }
+
 
 
 
