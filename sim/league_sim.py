@@ -15,7 +15,7 @@ from matchengine_v2_adapter import (
 )
 from matchengine_v3.sim_game import simulate_game
 from state import (
-    _ensure_league_state,
+    ensure_league_block,
     ingest_game_result,
     initialize_master_schedule_if_needed,
     set_current_date,
@@ -26,7 +26,7 @@ from sim.roster_adapter import build_team_state_from_db
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
 
     with LeagueRepo(str(db_path)) as repo:
@@ -65,7 +65,7 @@ def advance_league_until(
     user_team_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     initialize_master_schedule_if_needed()
-    league = _ensure_league_state()
+    league = ensure_league_block()
     master_schedule = league["master_schedule"]
     by_date: Dict[str, List[str]] = master_schedule.get("by_date") or {}
     games: List[Dict[str, Any]] = master_schedule.get("games") or []
@@ -144,7 +144,7 @@ def simulate_single_game(
     home_tactics: Optional[Dict[str, Any]] = None,
     away_tactics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     game_date_str = game_date or date.today().isoformat()
     game_id = f"single_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
 
