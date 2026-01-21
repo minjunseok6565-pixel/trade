@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
 
-from state import GAME_STATE, _ensure_league_state
+from state import GAME_STATE, ensure_league_block
 from team_utils import get_conference_standings
 
 
@@ -53,7 +53,7 @@ def _playoff_round_label(round_name: Optional[str]) -> str:
 
 
 def _get_current_date() -> date:
-    league = _ensure_league_state()
+    league = ensure_league_block()
     cur = league.get("current_date") or date.today().isoformat()
     try:
         return date.fromisoformat(cur)
