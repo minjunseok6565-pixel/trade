@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from state_store import GAME_STATE
+from .state_store import GAME_STATE
 
 
 def _ensure_cached_views_meta() -> Dict[str, Any]:
