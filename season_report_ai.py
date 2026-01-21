@@ -237,7 +237,7 @@ def build_season_context(user_team_id: str) -> Dict[str, Any]:
         raise ValueError(f"Unknown team id: {user_team_id}")
 
     league = ensure_league_block()
-    current_date = league.get("current_date") or GAME_STATE.get("current_date") or date.today().isoformat()
+    current_date = league.get("current_date") or date.today().isoformat()
 
     standings = get_conference_standings()
     team_detail = get_team_detail(user_team_id)
