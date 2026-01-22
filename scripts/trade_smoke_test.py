@@ -10,7 +10,8 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 from config import ROSTER_DF
-from state import GAME_STATE, initialize_master_schedule_if_needed, get_current_date_as_date
+import state as state_facade
+from state_modules.state_core import get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed
 from trades.apply import apply_deal
 from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
@@ -47,7 +48,7 @@ def _pick_three_teams() -> Tuple[str, str, str]:
 
 def main() -> None:
     _init_players_and_teams_if_needed()
-    initialize_master_schedule_if_needed()
+    state_facade.initialize_master_schedule_if_needed()
     current_date = get_current_date_as_date()
 
     # Test A: basic 2-team player trade
@@ -55,7 +56,7 @@ def main() -> None:
     player_a = _first_player_for_team(team_a)
     player_b = _first_player_for_team(team_b)
 
-    tx_count = len(GAME_STATE.get("transactions", []))
+    tx_count = len(state_facade.export_state().get("transactions", []))
 
     payload = {
         "teams": [team_a, team_b],
@@ -70,7 +71,7 @@ def main() -> None:
 
     assert str(ROSTER_DF.at[player_a, "Team"]).upper() == team_b
     assert str(ROSTER_DF.at[player_b, "Team"]).upper() == team_a
-    assert len(GAME_STATE.get("transactions", [])) == tx_count + 1
+    assert len(state_facade.export_state().get("transactions", [])) == tx_count + 1
 
     # Test B: committed deal flow
     player_a2 = _first_player_for_team(team_a)
@@ -103,7 +104,7 @@ def main() -> None:
     for assets in deal_verified.legs.values():
         for asset in assets:
             lock_key = f"{asset.kind}:{getattr(asset, 'player_id', getattr(asset, 'pick_id', ''))}"
-            assert lock_key not in GAME_STATE.get("asset_locks", {})
+            assert lock_key not in state_facade.export_state().get("asset_locks", {})
 
     # Test C: lock conflict
     player_c = _first_player_for_team(team_a)
@@ -124,7 +125,7 @@ def main() -> None:
         assert exc.code == ASSET_LOCKED
 
     agreements.release_locks_for_deal(committed_c["deal_id"])
-    entry = GAME_STATE.get("trade_agreements", {}).get(committed_c["deal_id"])
+    entry = state_facade.export_state().get("trade_agreements", {}).get(committed_c["deal_id"])
     if entry:
         entry["status"] = "INVALIDATED"
 
@@ -151,7 +152,7 @@ def main() -> None:
         deal_c, current_date=current_date
     )
     asset_lock_key = f"player:{player_c}"
-    lock = GAME_STATE.get("asset_locks", {}).get(asset_lock_key)
+    lock = state_facade.export_state().get("asset_locks", {}).get(asset_lock_key)
     if lock:
         lock["expires_at"] = (get_current_date_as_date() - timedelta(days=1)).isoformat()
     try:
@@ -183,7 +184,7 @@ def main() -> None:
     assert str(ROSTER_DF.at[player_z, "Team"]).upper() == team_x
 
     # Test E: pick ownership in committed deal hash
-    picks = GAME_STATE.get("draft_picks", {})
+    picks = state_facade.export_state().get("draft_picks", {})
     pick_candidates = [
         pick for pick in picks.values() if pick.get("owner_team") == team_a
     ]

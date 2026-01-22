@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from config import ALL_TEAM_IDS
 from state_cap import _apply_cap_model_for_season
-from state_core import ensure_league_block
-from state_migrations import normalize_player_ids
-from state_store import GAME_STATE
+from state_modules.state_core import ensure_league_block
+from state_modules.state_migrations import normalize_player_ids
+from state_modules.state_store import get_state_ref
 
 
 def ensure_db_initialized_and_seeded() -> None:
@@ -12,7 +12,7 @@ def ensure_db_initialized_and_seeded() -> None:
     league = ensure_league_block()
     db_path = str(league.get("db_path") or "league.db")
 
-    migrations = GAME_STATE.setdefault("_migrations", {})
+    migrations = get_state_ref().setdefault("_migrations", {})
     if migrations.get("db_initialized") is True and migrations.get("db_initialized_db_path") == db_path:
         return
 
@@ -48,8 +48,8 @@ def ensure_cap_model_populated_if_needed() -> None:
 
 
 def ensure_player_ids_normalized(*, allow_legacy_numeric: bool = True) -> dict:
-    """Normalize player IDs in GAME_STATE (startup-only)."""
-    return normalize_player_ids(GAME_STATE, allow_legacy_numeric=allow_legacy_numeric)
+    """Normalize player IDs in state (startup-only)."""
+    return normalize_player_ids(get_state_ref(), allow_legacy_numeric=allow_legacy_numeric)
 
 
 def ensure_contracts_bootstrapped_after_schedule_creation_once() -> None:
@@ -61,7 +61,7 @@ def ensure_contracts_bootstrapped_after_schedule_creation_once() -> None:
     except (TypeError, ValueError):
         return
 
-    migrations = GAME_STATE.setdefault("_migrations", {})
+    migrations = get_state_ref().setdefault("_migrations", {})
     boot = migrations.setdefault("contracts_bootstrapped_seasons", {})
     if isinstance(boot, dict) and boot.get(str(season_year_int)) is True:
         return
@@ -83,7 +83,7 @@ def validate_repo_integrity_once_startup() -> None:
     """Validate DB integrity once at startup (per db_path)."""
     league = ensure_league_block()
     db_path = str(league.get("db_path") or "league.db")
-    migrations = GAME_STATE.setdefault("_migrations", {})
+    migrations = get_state_ref().setdefault("_migrations", {})
     if migrations.get("repo_integrity_validated") is True and migrations.get("repo_integrity_validated_db_path") == db_path:
         return
     from league_repo import LeagueRepo

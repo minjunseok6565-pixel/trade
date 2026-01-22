@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
 from team_utils import _init_players_and_teams_if_needed
-from state import GAME_STATE, get_current_date_as_date
+import state as state_facade
+from state_modules.state_core import get_current_date_as_date
 
 from .errors import (
     APPLY_FAILED,
@@ -122,10 +123,12 @@ def apply_deal(
     *,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
+    uses_state_facade = False
     if deal is None:
         if isinstance(game_state, Deal):
             deal = game_state
-            game_state = GAME_STATE
+            game_state = state_facade.export_state()
+            uses_state_facade = True
         else:
             raise TypeError("apply_deal requires a Deal")
 
@@ -178,6 +181,8 @@ def apply_deal(
                         season_bans.append(move.from_team)
                     bans[season_key] = season_bans
 
+        if uses_state_facade:
+            state_facade.import_state(game_state)
         return tx
     except TradeError:
         raise

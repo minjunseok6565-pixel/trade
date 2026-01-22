@@ -14,12 +14,9 @@ from matchengine_v2_adapter import (
     build_context_from_team_ids,
 )
 from matchengine_v3.sim_game import simulate_game
-from state import (
-    ensure_league_block,
-    ingest_game_result,
-    initialize_master_schedule_if_needed,
-    set_current_date,
-)
+import state as state_facade
+from state_modules.state_core import ensure_league_block, set_current_date
+from state_modules.state_results import ingest_game_result
 from trades_ai import _run_ai_gm_tick_if_needed
 from sim.roster_adapter import build_team_state_from_db
 
@@ -64,7 +61,7 @@ def advance_league_until(
     target_date_str: str,
     user_team_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    initialize_master_schedule_if_needed()
+    state_facade.initialize_master_schedule_if_needed()
     league = ensure_league_block()
     master_schedule = league["master_schedule"]
     by_date: Dict[str, List[str]] = master_schedule.get("by_date") or {}

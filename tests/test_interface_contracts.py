@@ -1,7 +1,8 @@
 import unittest
 
 
-from state import validate_v2_game_result, validate_master_schedule_entry
+from state_modules.state_results import validate_v2_game_result
+from state_modules.state_schedule import validate_master_schedule_entry
 
 
 def _minimal_valid_v2_game_result():

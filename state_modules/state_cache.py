@@ -2,44 +2,29 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from state_store import GAME_STATE
+import state as state_facade
+from state_modules.state_store import get_state_ref
+from state_modules.state_schema import default_cached_views_state
 
 
 def _ensure_cached_views_meta() -> Dict[str, Any]:
     """cached_views 메타 정보가 없으면 기본값으로 생성한다."""
-    cached = GAME_STATE.setdefault("cached_views", {})
-    meta = cached.setdefault("_meta", {})
-    meta.setdefault("scores", {"built_from_turn": -1, "season_id": None})
-    meta.setdefault("schedule", {"built_from_turn_by_team": {}, "season_id": None})
-    return meta
+    cached_views = get_state_ref().get("cached_views", {})
+    meta = cached_views.get("_meta")
+    return meta if isinstance(meta, dict) else {}
 
 
 def _mark_views_dirty() -> None:
     """캐시된 뷰를 다시 계산하도록 무효화한다."""
-    meta = _ensure_cached_views_meta()
-    meta["scores"]["built_from_turn"] = -1
-    meta["schedule"]["built_from_turn_by_team"] = {}
+    state_facade.mark_cache_dirty_scores()
+    cached_views = get_state_ref().get("cached_views", {})
+    schedule_meta = (
+        cached_views.get("_meta", {}).get("schedule", {}).get("built_from_turn_by_team")
+    )
+    team_ids = list(schedule_meta.keys()) if isinstance(schedule_meta, dict) else []
+    state_facade.mark_cache_dirty_schedule_for_teams(team_ids)
 
 
 def _reset_cached_views_for_new_season() -> None:
     """정규시즌 누적이 새로 시작될 때 cached_views도 함께 초기화한다."""
-    cached = GAME_STATE.setdefault("cached_views", {})
-    scores = cached.setdefault("scores", {})
-    scores["latest_date"] = None
-    scores["games"] = []
-    schedule = cached.setdefault("schedule", {})
-    schedule["teams"] = {}
-    meta = _ensure_cached_views_meta()
-    meta["scores"]["built_from_turn"] = -1
-    meta["scores"]["season_id"] = None
-    meta["schedule"]["built_from_turn_by_team"] = {}
-    meta["schedule"]["season_id"] = None
-    stats = cached.setdefault("stats", {})
-    stats["leaders"] = None
-    weekly = cached.setdefault("weekly_news", {})
-    weekly["last_generated_week_start"] = None
-    weekly["items"] = []
-    playoff_news = cached.setdefault("playoff_news", {})
-    playoff_news.setdefault("series_game_counts", {})
-    playoff_news["series_game_counts"] = {}
-    playoff_news["items"] = []
+    get_state_ref()["cached_views"] = default_cached_views_state()

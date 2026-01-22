@@ -15,21 +15,24 @@ from config import (
     SEASON_START_MONTH,
     TEAM_TO_CONF_DIV,
 )
-from state_bootstrap import ensure_contracts_bootstrapped_after_schedule_creation_once
-from state_cap import _apply_cap_model_for_season
-from state_core import (
+from state_modules.state_bootstrap import (
+    ensure_contracts_bootstrapped_after_schedule_creation_once,
+)
+from state_modules.state_cap import _apply_cap_model_for_season
+from state_modules.state_core import (
     _archive_and_reset_season_accumulators,
     _ensure_active_season_id,
     _season_id_from_year,
     ensure_league_block,
     set_current_date,
 )
-from state_store import GAME_STATE, _ALLOWED_SCHEDULE_STATUSES
+import state as state_facade
+from state_modules.state_store import _ALLOWED_SCHEDULE_STATUSES, get_state_ref
 
 
 def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
-    """GAME_STATE.cached_views.schedule에 팀 엔트리가 없으면 생성."""
-    schedule = GAME_STATE["cached_views"]["schedule"]
+    """cached_views.schedule에 팀 엔트리가 없으면 생성."""
+    schedule = get_state_ref()["cached_views"]["schedule"]
     teams = schedule.setdefault("teams", {})
     if team_id not in teams:
         teams[team_id] = {
@@ -100,11 +103,7 @@ def _ensure_master_schedule_indices() -> None:
     # Contract check: master_schedule entries must satisfy the minimal schema.
     for i, g in enumerate(games):
         validate_master_schedule_entry(g, path=f"master_schedule.games[{i}]")
-    by_id = master_schedule.get("by_id")
-    if not isinstance(by_id, dict) or len(by_id) != len(games):
-        master_schedule["by_id"] = {
-            g.get("game_id"): g for g in games if g.get("game_id")
-        }
+    state_facade.rebuild_master_schedule_by_id()
 
 
 def _build_master_schedule(season_year: int) -> None:
@@ -313,7 +312,7 @@ def _build_master_schedule(season_year: int) -> None:
     master_schedule["games"] = scheduled_games
     master_schedule["by_team"] = by_team
     master_schedule["by_date"] = by_date
-    master_schedule["by_id"] = {g["game_id"]: g for g in scheduled_games}
+    state_facade.rebuild_master_schedule_by_id()
 
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
@@ -335,7 +334,7 @@ def _build_master_schedule(season_year: int) -> None:
     if previous_season and next_season and previous_season != next_season:
         from contracts.offseason import process_offseason
 
-        process_offseason(GAME_STATE, previous_season, next_season)
+        process_offseason(get_state_ref(), previous_season, next_season)
         _archive_and_reset_season_accumulators(_season_id_from_year(previous_season), _season_id_from_year(next_season))
     else:
         _ensure_active_season_id(_season_id_from_year(int(next_season or season_year)))
@@ -368,12 +367,12 @@ def _mark_master_schedule_game_final(
 ) -> None:
     """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
     league = ensure_league_block()
-    master_schedule = league.setdefault("master_schedule", {})
+    master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
-    by_id = master_schedule.setdefault("by_id", {})
+    by_id = master_schedule.get("by_id")
     if not isinstance(by_id, dict):
-        by_id = {}
-        master_schedule["by_id"] = by_id
+        state_facade.rebuild_master_schedule_by_id()
+        by_id = master_schedule.get("by_id") or {}
     entry = by_id.get(game_id)
     if entry:
         entry["status"] = "final"

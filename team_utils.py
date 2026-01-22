@@ -5,12 +5,10 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
-from state import (
-    GAME_STATE,
-    ensure_league_block,
-    ensure_cap_model_populated_if_needed,
-    initialize_master_schedule_if_needed,
-)
+import state as state_facade
+from state_modules.state_bootstrap import ensure_cap_model_populated_if_needed
+from state_modules.state_core import ensure_league_block
+from state_modules.state_schedule import initialize_master_schedule_if_needed
 
 # Division/Conference mapping can stay in config (static).
 # We intentionally do NOT import ROSTER_DF anymore.
@@ -30,8 +28,7 @@ def _repo_ctx() -> "LeagueRepo":
     if LeagueRepo is None:
         raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
 
-    league = GAME_STATE.setdefault("league", {})
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH", "league.db")
+    db_path = state_facade.get_db_path() or os.environ.get("LEAGUE_DB_PATH", "league.db")
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -78,17 +75,18 @@ def _parse_potential(pot_raw: Any) -> float:
 
 
 def _init_players_and_teams_if_needed() -> None:
-    """Initialize GAME_STATE['players'] and GAME_STATE['teams'].
+    """Initialize state players and teams.
 
     Step 6 invariant:
-    - GAME_STATE['players'] is keyed by **player_id (string)**.
+    - players are keyed by **player_id (string)**.
     - Never depend on a pandas DataFrame index for IDs.
     """
     # If players already exist, backfill missing derived using DB row (if present).
-    if isinstance(GAME_STATE.get("players"), dict) and GAME_STATE["players"]:
+    state = state_facade.export_state()
+    if isinstance(state.get("players"), dict) and state["players"]:
         try:
             with _repo_ctx() as repo:
-                for pid, pdata in list(GAME_STATE["players"].items()):
+                for pid, pdata in list(state["players"].items()):
                     if not isinstance(pdata, dict):
                         continue
 
@@ -104,6 +102,7 @@ def _init_players_and_teams_if_needed() -> None:
                         pdata["derived"] = compute_derived(attrs)
                     except Exception:
                         pass
+                state_facade.import_state(state)
                 return
         except Exception:
             return
@@ -141,8 +140,6 @@ def _init_players_and_teams_if_needed() -> None:
                     "acquired_via_trade": False,
                 }
 
-    GAME_STATE["players"] = players
-
     teams_meta: Dict[str, Dict[str, Any]] = {}
     for tid in team_ids:
         info = TEAM_TO_CONF_DIV.get(tid, {})
@@ -155,7 +152,7 @@ def _init_players_and_teams_if_needed() -> None:
             "market": "mid",
             "patience": 0.5,
         }
-    GAME_STATE["teams"] = teams_meta
+    state_facade.set_rosters(teams_meta, players)
 
 
 def _compute_team_payroll(team_id: str) -> float:
@@ -293,7 +290,7 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
-        meta = GAME_STATE.get("teams", {}).get(tid, {})
+        meta = state_facade.export_state().get("teams", {}).get(tid, {})
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -328,7 +325,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = GAME_STATE.get("teams", {}).get(tid, {})
+    meta = state_facade.export_state().get("teams", {}).get(tid, {})
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -354,7 +351,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "cap_space": _compute_cap_space(tid),
     }
 
-    season_stats = GAME_STATE.get("player_stats", {}) or {}
+    season_stats = state_facade.export_state().get("player_stats", {}) or {}
     roster: List[Dict[str, Any]] = []
     with _repo_ctx() as repo:
         roster_rows = repo.get_team_roster(tid)

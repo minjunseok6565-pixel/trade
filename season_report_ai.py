@@ -6,7 +6,8 @@ from typing import Any, Dict
 
 import google.generativeai as genai
 
-from state import GAME_STATE, ensure_league_block
+import state as state_facade
+from state_modules.state_core import ensure_league_block
 from stats_util import compute_league_leaders
 from team_utils import get_conference_standings, get_team_detail
 from config import ALL_TEAM_IDS
@@ -307,7 +308,7 @@ def build_season_context(user_team_id: str) -> Dict[str, Any]:
         "team_detail": team_detail,
         "team_context": team_context,
         "league_leaders": leaders,
-        "all_games": GAME_STATE.get("games", []),
+        "all_games": state_facade.export_state().get("games", []),
     }
     return ctx
 

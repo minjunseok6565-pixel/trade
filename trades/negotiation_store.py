@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from state import GAME_STATE
+import state as state_facade
 
 from .errors import TradeError, NEGOTIATION_NOT_FOUND
 from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
@@ -84,12 +84,15 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
         "relationship": {"trust": 0, "fatigue": 0, "promises_broken": 0},
         "market_context": {},  # trade market context snapshot
     }
-    GAME_STATE.setdefault("negotiations", {})[session_id] = session
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    state.setdefault("negotiations", {})[session_id] = session
+    state_facade.import_state(state)
     return session
 
 
 def get_session(session_id: str) -> Dict[str, Any]:
-    session = (GAME_STATE.get("negotiations") or {}).get(session_id)
+    session = (state_facade.export_state().get("negotiations") or {}).get(session_id)
     if not session:
         raise TradeError(
             NEGOTIATION_NOT_FOUND,

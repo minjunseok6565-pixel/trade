@@ -44,22 +44,22 @@ def compare_symbols(state_module: Any, baseline: Dict[str, Any]) -> List[str]:
 
 def compare_game_state_schema(state_module: Any, baseline: Dict[str, Any]) -> List[str]:
     errors = []
-    current = build_game_state_schema(state_module.GAME_STATE)
+    current = build_game_state_schema(state_module.export_state())
     expected = baseline["game_state_schema"]
 
     if current["keys"] != expected["keys"]:
         errors.append(
-            "GAME_STATE keys/order mismatch: "
+            "state keys/order mismatch: "
             f"expected {expected['keys']}, got {current['keys']}"
         )
     if current["types"] != expected["types"]:
         errors.append(
-            "GAME_STATE types mismatch: "
+            "state types mismatch: "
             f"expected {expected['types']}, got {current['types']}"
         )
     if current["nested_keys"] != expected["nested_keys"]:
         errors.append(
-            "GAME_STATE nested keys mismatch: "
+            "state nested keys mismatch: "
             f"expected {expected['nested_keys']}, got {current['nested_keys']}"
         )
     return errors

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from state import GAME_STATE
+import state as state_facade
 
 
 TRACKED_STATS = ["PTS", "AST", "REB", "3PM"]
@@ -10,7 +10,8 @@ TRACKED_STATS = ["PTS", "AST", "REB", "3PM"]
 
 def compute_league_leaders() -> Dict[str, List[Dict[str, Any]]]:
     """player_stats 기반으로 per game 리그 리더 상위 5명을 계산한다."""
-    season_stats = GAME_STATE.get("player_stats") or {}
+    state = state_facade.export_state()
+    season_stats = state.get("player_stats") or {}
     leaders: Dict[str, List[Dict[str, Any]]] = {s: [] for s in TRACKED_STATS}
 
     for stat_name in TRACKED_STATS:
@@ -39,14 +40,17 @@ def compute_league_leaders() -> Dict[str, List[Dict[str, Any]]]:
         rows_sorted = sorted(rows, key=lambda r: r.get("per_game", 0), reverse=True)
         leaders[stat_name] = rows_sorted[:5]
 
-    GAME_STATE.setdefault("cached_views", {}).setdefault("stats", {})[
-        "leaders"
-    ] = leaders
+    cached_views = state.get("cached_views", {})
+    stats_cache = cached_views.get("stats")
+    if isinstance(stats_cache, dict):
+        stats_cache["leaders"] = leaders
+        state_facade.import_state(state)
     return leaders
 
 
 def compute_playoff_league_leaders() -> Dict[str, List[Dict[str, Any]]]:
-    postseason = GAME_STATE.get("postseason") or {}
+    state = state_facade.export_state()
+    postseason = state.get("postseason") or {}
     playoff_stats = postseason.get("playoff_player_stats") or {}
     leaders: Dict[str, List[Dict[str, Any]]] = {s: [] for s in TRACKED_STATS}
 
@@ -76,7 +80,9 @@ def compute_playoff_league_leaders() -> Dict[str, List[Dict[str, Any]]]:
         rows_sorted = sorted(rows, key=lambda r: r.get("per_game", 0), reverse=True)
         leaders[stat_name] = rows_sorted[:5]
 
-    GAME_STATE.setdefault("cached_views", {}).setdefault("stats", {})[
-        "playoff_leaders"
-    ] = leaders
+    cached_views = state.get("cached_views", {})
+    stats_cache = cached_views.get("stats")
+    if isinstance(stats_cache, dict):
+        stats_cache["playoff_leaders"] = leaders
+        state_facade.import_state(state)
     return leaders
