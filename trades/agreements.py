@@ -9,7 +9,8 @@ from uuid import uuid4
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, get_current_date_as_date
+import state as state_facade
+from state_modules.state_core import get_current_date_as_date
 
 from .errors import (
     TradeError,
@@ -45,12 +46,11 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    league = GAME_STATE.get("league", {})
-    db_path = league.get("db_path") if isinstance(league, dict) else None
+    db_path = state_facade.get_db_path() or None
     if not db_path:
         raise ValueError("db_path is required to compute trade agreement hash")
 
-    # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in GAME_STATE.
+    # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in state.
     # Use one DB transaction snapshot and ensure repo is closed to avoid connection leaks.
     with contextlib.closing(LeagueRepo(db_path)) as repo:
         repo.init_db()
@@ -130,20 +130,28 @@ def create_committed_deal(
         "status": "ACTIVE",
     }
 
-    GAME_STATE.setdefault("trade_agreements", {})[deal_id] = entry
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    state.setdefault("trade_agreements", {})[deal_id] = entry
+    state_facade.import_state(state)
     _lock_assets_for_deal(canonical, deal_id, entry["expires_at"])
     return entry
 
 
 def _lock_assets_for_deal(deal: Deal, deal_id: str, expires_at: str) -> None:
-    locks = GAME_STATE.setdefault("asset_locks", {})
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    locks = state.setdefault("asset_locks", {})
     for assets in deal.legs.values():
         for asset in assets:
             locks[asset_key(asset)] = {"deal_id": deal_id, "expires_at": expires_at}
+    state_facade.import_state(state)
 
 
 def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> Deal:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    agreements = state.setdefault("trade_agreements", {})
     entry = agreements.get(deal_id)
     if not entry:
         raise TradeError(DEAL_INVALIDATED, "Committed deal not found")
@@ -171,7 +179,7 @@ def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> 
         release_locks_for_deal(deal_id)
         raise TradeError(DEAL_INVALIDATED, "Deal assets have changed")
 
-    locks = GAME_STATE.get("asset_locks", {})
+    locks = state.get("asset_locks", {})
     for assets in deal.legs.values():
         for asset in assets:
             lock = locks.get(asset_key(asset))
@@ -180,27 +188,36 @@ def verify_committed_deal(deal_id: str, current_date: Optional[date] = None) -> 
                 release_locks_for_deal(deal_id)
                 raise TradeError(DEAL_INVALIDATED, "Asset lock missing")
 
+    state_facade.import_state(state)
     return deal
 
 
 def mark_executed(deal_id: str) -> None:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    agreements = state.setdefault("trade_agreements", {})
     entry = agreements.get(deal_id)
     if not entry:
         return
     entry["status"] = "EXECUTED"
     release_locks_for_deal(deal_id)
+    state_facade.import_state(state)
 
 
 def release_locks_for_deal(deal_id: str) -> None:
-    locks = GAME_STATE.setdefault("asset_locks", {})
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    locks = state.setdefault("asset_locks", {})
     to_remove = [key for key, lock in locks.items() if lock.get("deal_id") == deal_id]
     for key in to_remove:
         locks.pop(key, None)
+    state_facade.import_state(state)
 
 
 def gc_expired_agreements(current_date: Optional[date] = None) -> None:
-    agreements = GAME_STATE.setdefault("trade_agreements", {})
+    state_facade.ensure_trade_blocks()
+    state = state_facade.export_state()
+    agreements = state.setdefault("trade_agreements", {})
     today = current_date or get_current_date_as_date()
     for deal_id, entry in list(agreements.items()):
         if entry.get("status") != "ACTIVE":
@@ -209,3 +226,4 @@ def gc_expired_agreements(current_date: Optional[date] = None) -> None:
         if expires_at and today > date.fromisoformat(str(expires_at)):
             entry["status"] = "EXPIRED"
             release_locks_for_deal(deal_id)
+    state_facade.import_state(state)

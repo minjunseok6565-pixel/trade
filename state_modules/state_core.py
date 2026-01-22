@@ -5,9 +5,8 @@ from datetime import date
 from typing import Any, Dict, Optional
 
 from schema import season_id_from_year as _schema_season_id_from_year
-from state_cache import _reset_cached_views_for_new_season
-from state_store import DEFAULT_TRADE_RULES, GAME_STATE
-from state_trade import _ensure_trade_state
+import state as state_facade
+from state_modules.state_store import DEFAULT_TRADE_RULES, get_state_ref
 
 
 def ensure_league_block() -> Dict[str, Any]:
@@ -15,7 +14,8 @@ def ensure_league_block() -> Dict[str, Any]:
 
     This is intentionally *in-memory only*: no DB init, no roster seeding, no integrity checks.
     """
-    league = GAME_STATE.setdefault("league", {})
+    s = get_state_ref()
+    league = s.setdefault("league", {})
     master_schedule = league.setdefault("master_schedule", {})
     master_schedule.setdefault("games", [])
     master_schedule.setdefault("by_team", {})
@@ -41,12 +41,8 @@ def ensure_league_block() -> Dict[str, Any]:
 
 
 def get_current_date() -> Optional[str]:
-    """Return the league's current in-game date (SSOT: GAME_STATE['league']['current_date'])."""
-    league = ensure_league_block()
-    current = league.get("current_date")
-    if current:
-        return current
-    return None
+    """Return the league's current in-game date (SSOT: league.current_date)."""
+    return state_facade.get_current_date()
 
 
 def get_current_date_as_date() -> date:
@@ -70,9 +66,8 @@ def get_current_date_as_date() -> date:
 
 
 def set_current_date(date_str: Optional[str]) -> None:
-    """Update the league's current date (SSOT: GAME_STATE['league']['current_date'])."""
-    league = ensure_league_block()
-    league["current_date"] = date_str
+    """Update the league's current date (SSOT: league.current_date)."""
+    state_facade.set_current_date(date_str)
 
 
 def _season_id_from_year(season_year: int) -> str:
@@ -85,42 +80,19 @@ def _archive_and_reset_season_accumulators(
     next_season_id: Optional[str],
 ) -> None:
     """시즌이 바뀔 때 정규시즌 누적 데이터를 history로 옮기고 초기화한다."""
-    if previous_season_id:
-        history = GAME_STATE.setdefault("season_history", {})
-        history[str(previous_season_id)] = {
-            "games": GAME_STATE.get("games", []),
-            "player_stats": GAME_STATE.get("player_stats", {}),
-            "team_stats": GAME_STATE.get("team_stats", {}),
-            "game_results": GAME_STATE.get("game_results", {}),
-        }
-
-    GAME_STATE["games"] = []
-    GAME_STATE["player_stats"] = {}
-    GAME_STATE["team_stats"] = {}
-    GAME_STATE["game_results"] = {}
-    GAME_STATE["postseason"] = {}
-
-    GAME_STATE["active_season_id"] = next_season_id
-    _reset_cached_views_for_new_season()
-    _ensure_trade_state()
+    if next_season_id:
+        state_facade.rollover_season(str(next_season_id))
 
 
 def _ensure_active_season_id(season_id: str) -> None:
     """리그 시즌과 누적 시즌이 불일치하면 새 시즌 누적으로 전환한다."""
     if not season_id:
         return
-    active = GAME_STATE.get("active_season_id")
-    if active is None:
-        GAME_STATE["active_season_id"] = str(season_id)
-        _ensure_trade_state()
-        return
-    if str(active) != str(season_id):
-        _archive_and_reset_season_accumulators(str(active), str(season_id))
+    state_facade.ensure_active_season_id(str(season_id))
 
 
 def _get_phase_container(phase: str) -> Dict[str, Any]:
     """phase별 누적 컨테이너를 반환한다."""
     if phase == "regular":
-        return GAME_STATE
-    postseason = GAME_STATE.setdefault("postseason", {})
-    return postseason.setdefault(phase, {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}})
+        return get_state_ref()
+    return get_state_ref()["phase_containers"][phase]

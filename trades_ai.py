@@ -7,7 +7,8 @@ import random
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, ensure_league_block, get_current_date_as_date
+import state as state_facade
+from state_modules.state_core import ensure_league_block, get_current_date_as_date
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
 from trades.apply import apply_deal
 from trades.errors import TradeError
@@ -50,17 +51,16 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
 
 def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     _init_players_and_teams_if_needed()
-    from state import initialize_master_schedule_if_needed
-
-    initialize_master_schedule_if_needed()
+    state_facade.initialize_master_schedule_if_needed()
     league = ensure_league_block()
     db_path = league.get("db_path")
     if not db_path:
         raise ValueError("db_path is required for AI trade evaluation")
     repo = LeagueRepo(db_path)
     repo.init_db()
-    draft_picks = GAME_STATE.get("draft_picks", {})
-    asset_locks = GAME_STATE.get("asset_locks", {})
+    state_ref = state_facade.export_state()
+    draft_picks = state_ref.get("draft_picks", {})
+    asset_locks = state_ref.get("asset_locks", {})
 
     team_status = get_team_status_map()
     contenders = [tid for tid, status in team_status.items() if status == "contender"]

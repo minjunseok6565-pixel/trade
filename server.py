@@ -14,20 +14,16 @@ from pydantic import BaseModel, Field
 from config import BASE_DIR, ALL_TEAM_IDS
 from league_repo import LeagueRepo
 from schema import normalize_team_id
-from state import (
-    GAME_STATE,
-    ensure_league_block,
+import state as state_facade
+from state_modules.state_bootstrap import (
     ensure_db_initialized_and_seeded,
-    ensure_trade_state_keys,
     ensure_player_ids_normalized,
     ensure_cap_model_populated_if_needed,
     validate_repo_integrity_once_startup,
-    ensure_ingest_turn_backfilled_once_startup,
-    get_current_date,
-    get_current_date_as_date,
-    get_schedule_summary,
-    initialize_master_schedule_if_needed,
 )
+from state_modules.state_core import ensure_league_block, get_current_date_as_date
+from state_modules.state_schedule import get_schedule_summary
+from state_modules.state_trade import ensure_trade_state_keys
 from sim.league_sim import simulate_single_game, advance_league_until
 from playoffs import (
     auto_advance_current_round,
@@ -71,11 +67,10 @@ def _startup_init_state() -> None:
     ensure_trade_state_keys()
     _init_players_and_teams_if_needed()
     ensure_player_ids_normalized()
-    initialize_master_schedule_if_needed()
+    state_facade.initialize_master_schedule_if_needed()
     # In case season_year exists and cap fields are still unset/zero.
     ensure_cap_model_populated_if_needed()
     validate_repo_integrity_once_startup()
-    ensure_ingest_turn_backfilled_once_startup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -245,14 +240,14 @@ async def api_stats_leaders():
     # UI to break. Normalize here so the client always receives
     # `{ leaders: { PTS: [...], AST: [...], ... }, updated_at: <iso date> }`.
     leaders = compute_league_leaders()
-    current_date = get_current_date()
+    current_date = state_facade.get_current_date()
     return {"leaders": leaders, "updated_at": current_date}
 
 
 @app.get("/api/stats/playoffs/leaders")
 async def api_playoff_stats_leaders():
     leaders = compute_playoff_league_leaders()
-    current_date = get_current_date()
+    current_date = state_facade.get_current_date()
     return {"leaders": leaders, "updated_at": current_date}
 
 
@@ -286,7 +281,7 @@ async def api_postseason_field():
 
 @app.get("/api/postseason/state")
 async def api_postseason_state():
-    return GAME_STATE.get("postseason") or {}
+    return state_facade.export_state().get("postseason") or {}
 
 
 @app.post("/api/postseason/reset")
@@ -583,7 +578,7 @@ async def team_schedule(team_id: str):
         raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in league")
 
     # 마스터 스케줄이 없다면 생성
-    initialize_master_schedule_if_needed()
+    state_facade.initialize_master_schedule_if_needed()
     league = ensure_league_block()
     master_schedule = league["master_schedule"]
     games = master_schedule.get("games") or []
@@ -627,7 +622,7 @@ async def team_schedule(team_id: str):
 
 @app.get("/api/state/summary")
 async def state_summary():
-    workflow_state: Dict[str, Any] = dict(GAME_STATE)
+    workflow_state: Dict[str, Any] = dict(state_facade.export_state())
     for k in (
         # Trade assets ledger (DB SSOT)
         "draft_picks",

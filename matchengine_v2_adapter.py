@@ -705,7 +705,7 @@ def adapt_matchengine_result_to_v2(
         out["debug"] = debug
 
     # Include raw only if caller asks for it.
-    # Note: state.py stores the entire game_result dict into GAME_STATE['game_results'].
+    # Note: state.py stores the entire game_result dict into state['game_results'].
     # If you always include raw here, you'll duplicate the raw payload inside the stored v2.
     if include_raw:
         out["raw"] = raw

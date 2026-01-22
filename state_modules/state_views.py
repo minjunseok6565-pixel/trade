@@ -3,20 +3,19 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from state_cache import _ensure_cached_views_meta
-from state_core import ensure_league_block
-from state_migrations import _ensure_ingest_turn_backfilled
-from state_schedule import _ensure_master_schedule_indices, initialize_master_schedule_if_needed
-from state_store import GAME_STATE
+from state_modules.state_cache import _ensure_cached_views_meta
+from state_modules.state_core import ensure_league_block
+from state_modules.state_schedule import initialize_master_schedule_if_needed
+from state_modules.state_store import get_state_ref
 
 
 def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
     """Return cached or rebuilt scores view for the given season."""
-    _ensure_ingest_turn_backfilled()
-    cached = GAME_STATE.setdefault("cached_views", {})
-    scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
+    state = get_state_ref()
+    cached = state.get("cached_views", {})
+    scores_view = cached.get("scores", {"latest_date": None, "games": []})
     meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
         meta["scores"].get("built_from_turn") == current_turn
@@ -27,16 +26,15 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
         return {"latest_date": scores_view.get("latest_date"), "games": limited_games}
 
     games: List[Dict[str, Any]] = []
-    active_season_id = GAME_STATE.get("active_season_id")
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(active_season_id) == str(season_id):
-        games.extend(GAME_STATE.get("games") or [])
+        games.extend(state.get("games") or [])
     else:
-        history = GAME_STATE.get("season_history") or {}
+        history = state.get("season_history") or {}
         season_history = history.get(str(season_id)) or {}
         games.extend(season_history.get("games") or [])
 
-    postseason = GAME_STATE.get("postseason") or {}
-    for container in postseason.values():
+    for container in (state.get("phase_containers") or {}).values():
         if not isinstance(container, dict):
             continue
         for game_obj in container.get("games") or []:
@@ -52,10 +50,12 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
     games_sorted = sorted(games, key=_ingest_turn_key, reverse=True)
     latest_date = games_sorted[0].get("date") if games_sorted else None
 
-    scores_view["games"] = games_sorted
-    scores_view["latest_date"] = latest_date
-    meta["scores"]["built_from_turn"] = current_turn
-    meta["scores"]["season_id"] = season_id
+    if isinstance(scores_view, dict):
+        scores_view["games"] = games_sorted
+        scores_view["latest_date"] = latest_date
+    if meta.get("scores") is not None:
+        meta.setdefault("scores", {})["built_from_turn"] = current_turn
+        meta.setdefault("scores", {})["season_id"] = season_id
 
     limited_games = [] if limit <= 0 else games_sorted[:limit]
     return {"latest_date": latest_date, "games": limited_games}
@@ -67,22 +67,22 @@ def get_team_schedule_view(
     today: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return cached or rebuilt schedule view for a team."""
-    active_season_id = GAME_STATE.get("active_season_id")
+    state = get_state_ref()
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(season_id) != str(active_season_id):
         return {"past_games": [], "upcoming_games": []}
 
     initialize_master_schedule_if_needed()
-    _ensure_master_schedule_indices()
     league = ensure_league_block()
     master_schedule = league.get("master_schedule") or {}
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
 
-    cached = GAME_STATE.setdefault("cached_views", {})
-    schedule = cached.setdefault("schedule", {})
-    teams_cache = schedule.setdefault("teams", {})
+    cached = state.get("cached_views", {})
+    schedule = cached.get("schedule", {})
+    teams_cache = schedule.get("teams", {})
     meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
         meta["schedule"].get("season_id") == season_id
@@ -146,7 +146,10 @@ def get_team_schedule_view(
     past_games.sort(key=_schedule_date_sort_key, reverse=True)
     upcoming_games.sort(key=_schedule_date_sort_key)
 
-    teams_cache[team_id] = {"past_games": past_games, "upcoming_games": upcoming_games}
-    meta["schedule"]["built_from_turn_by_team"][team_id] = current_turn
-    meta["schedule"]["season_id"] = season_id
+    if isinstance(teams_cache, dict):
+        teams_cache[team_id] = {"past_games": past_games, "upcoming_games": upcoming_games}
+    schedule_meta = meta.get("schedule")
+    if schedule_meta is not None:
+        schedule_meta.setdefault("built_from_turn_by_team", {})[team_id] = current_turn
+        schedule_meta["season_id"] = season_id
     return teams_cache[team_id]

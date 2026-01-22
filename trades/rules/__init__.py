@@ -7,7 +7,7 @@ How to add a new rule:
 
 Developer checks:
 - Run smoke test: python scripts/trade_smoke_test.py
-- Force deadline to yesterday in GAME_STATE and confirm validate_deal fails.
+- Force deadline to yesterday in state and confirm validate_deal fails.
 """
 
 from .base import TradeContext, build_trade_context

@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Optional
 
-from state import GAME_STATE, ensure_league_block
+import state as state_facade
+from state_modules.state_core import ensure_league_block
 from .models import Deal
 from .rules import build_trade_context, validate_all
 
@@ -15,7 +16,7 @@ def validate_deal(
 ) -> None:
     ensure_league_block()
 
-    db_path = (GAME_STATE.get("league") or {}).get("db_path")
+    db_path = state_facade.get_db_path() or None
     ctx = build_trade_context(current_date=current_date, db_path=db_path)
     try:
         ctx.repo.validate_integrity()

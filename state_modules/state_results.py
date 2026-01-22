@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from state_cache import _mark_views_dirty
-from state_core import _ensure_active_season_id, _get_phase_container
-from state_schedule import _mark_master_schedule_game_final
-from state_store import GAME_STATE, _ALLOWED_PHASES, _META_PLAYER_KEYS
-from state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
+import state as state_facade
+from state_modules.state_core import _get_phase_container
+from state_modules.state_schedule import _mark_master_schedule_game_final
+from state_modules.state_store import _ALLOWED_PHASES, _META_PLAYER_KEYS
+from state_modules.state_utils import (
+    _is_number,
+    _merge_counter_dict_sum,
+    _require_dict,
+    _require_list,
+)
 
 
 def _validate_game_result_v2(game_result: Dict[str, Any]) -> None:
@@ -138,14 +143,14 @@ def ingest_game_result(
     game_date: Optional[str] = None,
     store_raw_result: bool = True,
 ) -> Dict[str, Any]:
-    """정식 GameResultV2 스키마 결과를 GAME_STATE에 반영한다."""
+    """정식 GameResultV2 스키마 결과를 state에 반영한다."""
     validate_v2_game_result(game_result)
 
     game = _require_dict(game_result["game"], "game")
     season_id = str(game["season_id"])
     phase = str(game["phase"])
 
-    _ensure_active_season_id(season_id)
+    state_facade.ensure_active_season_id(season_id)
     container = _get_phase_container(phase)
 
     home_id = str(game["home_team_id"])
@@ -172,10 +177,18 @@ def ingest_game_result(
         "schema_version": "2.0",
     }
 
-    GAME_STATE["turn"] = int(GAME_STATE.get("turn", 0) or 0) + 1
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
-    game_obj["ingest_turn"] = current_turn
-    container.setdefault("games", []).append(game_obj)
+    state_facade.ingest_game_result(
+        {
+            "id": game_id,
+            "home_team_id": home_id,
+            "away_team_id": away_id,
+            "date": game_date_str,
+            "home_score": home_score,
+            "away_score": away_score,
+        },
+        phase=phase,
+        store_raw_result=False,
+    )
 
     if store_raw_result:
         container.setdefault("game_results", {})[game_id] = game_result
@@ -198,6 +211,4 @@ def ingest_game_result(
         home_score=home_score,
         away_score=away_score,
     )
-    _mark_views_dirty()
-
     return game_obj
