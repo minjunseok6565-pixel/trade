@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple, TypedDict, Literal
 
-from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id
+from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id, season_id_from_year as _schema_season_id_from_year
 
 
 Phase = Literal["regular", "play_in", "playoffs", "preseason"]
@@ -64,8 +64,7 @@ def season_id_from_year(season_year: int) -> str:
 
     Example: 2025 -> "2025-26"
     """
-    yy = str(int(season_year) + 1)[-2:]
-    return f"{int(season_year)}-{yy}"
+    return str(_schema_season_id_from_year(int(season_year)))
 
 
 def build_context_from_master_schedule_entry(
