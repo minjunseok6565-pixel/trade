@@ -4,6 +4,7 @@ import os
 from datetime import date
 from typing import Any, Dict, Optional
 
+from schema import season_id_from_year as _schema_season_id_from_year
 from state_cache import _reset_cached_views_for_new_season
 from state_store import DEFAULT_TRADE_RULES, GAME_STATE
 from state_trade import _ensure_trade_state
@@ -76,8 +77,7 @@ def set_current_date(date_str: Optional[str]) -> None:
 
 def _season_id_from_year(season_year: int) -> str:
     """시즌 시작 연도(int) -> season_id 문자열로 변환. 예: 2025 -> '2025-26'"""
-    yy = str(int(season_year) + 1)[-2:]
-    return f"{int(season_year)}-{yy}"
+    return str(_schema_season_id_from_year(int(season_year)))
 
 
 def _archive_and_reset_season_accumulators(
