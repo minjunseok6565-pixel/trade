@@ -65,6 +65,114 @@ def _load_team_coach_preset_map() -> Dict[str, str]:
         return {}
 
 
+@lru_cache(maxsize=1)
+def _load_coach_presets_raw() -> Dict[str, Dict[str, Any]]:
+    """Load coach preset definitions from coach_presets.json (optional).
+
+    Expected format:
+      {
+        "version": "1.0",
+        "presets": {
+          "Balanced": { ... },
+          "Playoff Tight": { ... }
+        }
+      }
+
+    Also accepts a flat map {"Balanced": {...}, ...} for flexibility.
+    Missing file or parse errors -> empty dict (safe no-op).
+    """
+    path = _find_json_path("coach_presets.json")
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and isinstance(data.get("presets"), dict):
+            presets = data["presets"]
+        elif isinstance(data, dict):
+            presets = data
+        else:
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for k, v in presets.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                out[k] = v
+        return out
+    except Exception:
+        return {}
+
+
+def _apply_coach_preset_tactics(
+    team_id: str,
+    cfg: TacticsConfig,
+    raw_tactics: Optional[Dict[str, Any]],
+) -> None:
+    """Apply tactics values from coach_presets.json based on cfg.context['COACH_PRESET'].
+
+    Rules:
+      - If USER_COACH is enabled in context, do nothing (user controls tactics).
+      - Never override values explicitly provided by the caller in raw_tactics.
+      - Supports preset fields either at top-level or under a nested "tactics" dict.
+      - (A안) Reads scheme_weight_sharpness + scheme_outcome_strength.
+    """
+    if not isinstance(getattr(cfg, "context", None), dict):
+        return
+    if cfg.context.get("USER_COACH"):
+        return
+
+    preset_name = cfg.context.get("COACH_PRESET")
+    if not preset_name:
+        return
+
+    presets = _load_coach_presets_raw()
+    if not presets:
+        return
+
+    key = str(preset_name).strip()
+    preset = presets.get(key)
+    if preset is None:
+        # case-insensitive fallback
+        lower_map = {k.lower(): k for k in presets.keys() if isinstance(k, str)}
+        canon = lower_map.get(key.lower())
+        preset = presets.get(canon) if canon else None
+    if not isinstance(preset, dict):
+        return
+
+    src = preset.get("tactics") if isinstance(preset.get("tactics"), dict) else preset
+
+    raw = raw_tactics or {}
+
+    # Do not override explicit caller inputs.
+    if "offense_scheme" not in raw and "offense_scheme" in src:
+        cfg.offense_scheme = str(src.get("offense_scheme") or cfg.offense_scheme)
+    if "defense_scheme" not in raw and "defense_scheme" in src:
+        cfg.defense_scheme = str(src.get("defense_scheme") or cfg.defense_scheme)
+
+    # Strength knobs: treat offense+defense as a pair.
+    caller_set_sharp = ("scheme_weight_sharpness" in raw) or ("def_scheme_weight_sharpness" in raw)
+    if not caller_set_sharp:
+        if "scheme_weight_sharpness" in src:
+            v = float(src["scheme_weight_sharpness"])
+            cfg.scheme_weight_sharpness = v
+            # If preset doesn't specify defense separately, mirror offense value.
+            if "def_scheme_weight_sharpness" not in src:
+                cfg.def_scheme_weight_sharpness = v
+        if "def_scheme_weight_sharpness" in src:
+            cfg.def_scheme_weight_sharpness = float(src["def_scheme_weight_sharpness"])
+
+    caller_set_outcome = ("scheme_outcome_strength" in raw) or ("def_scheme_outcome_strength" in raw)
+    if not caller_set_outcome:
+        if "scheme_outcome_strength" in src:
+            v = float(src["scheme_outcome_strength"])
+            cfg.scheme_outcome_strength = v
+            if "def_scheme_outcome_strength" not in src:
+                cfg.def_scheme_outcome_strength = v
+        if "def_scheme_outcome_strength" in src:
+            cfg.def_scheme_outcome_strength = float(src["def_scheme_outcome_strength"])
+
+
 def _apply_default_coach_preset(team_id: str, cfg: TacticsConfig) -> None:
     """Inject COACH_PRESET into tactics.context if not explicitly provided."""
     if not isinstance(getattr(cfg, "context", None), dict):
@@ -238,6 +346,7 @@ def build_team_state_from_db(
     roles = _build_roles_from_lineup(lineup[:5])
     tactics_cfg = _build_tactics_config(tactics)
     _apply_default_coach_preset(team_id, tactics_cfg)
+    _apply_coach_preset_tactics(team_id, tactics_cfg, tactics)
 
     team_state = TeamState(name=str(team_id).upper(), lineup=lineup, tactics=tactics_cfg, roles=roles)
     minutes = (tactics or {}).get("minutes") or {}
