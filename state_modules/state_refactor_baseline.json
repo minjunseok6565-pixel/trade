@@ -1,0 +1,502 @@
+{
+  "game_state_schema": {
+    "keys": [
+      "schema_version",
+      "turn",
+      "games",
+      "player_stats",
+      "team_stats",
+      "game_results",
+      "active_season_id",
+      "season_history",
+      "_migrations",
+      "cached_views",
+      "postseason",
+      "league",
+      "teams",
+      "players",
+      "trade_agreements",
+      "negotiations",
+      "asset_locks",
+      "trade_market",
+      "trade_memory"
+    ],
+    "nested_keys": {
+      "_migrations": [],
+      "cached_views": [
+        "scores",
+        "schedule",
+        "_meta",
+        "stats",
+        "weekly_news",
+        "playoff_news"
+      ],
+      "league": [
+        "season_year",
+        "draft_year",
+        "season_start",
+        "current_date",
+        "master_schedule",
+        "trade_rules",
+        "last_gm_tick_date"
+      ],
+      "postseason": [],
+      "trade_market": [
+        "last_tick_date",
+        "listings",
+        "threads",
+        "cooldowns",
+        "events"
+      ],
+      "trade_memory": [
+        "relationships"
+      ]
+    },
+    "types": {
+      "_migrations": "dict",
+      "active_season_id": "NoneType",
+      "asset_locks": "dict",
+      "cached_views": "dict",
+      "game_results": "dict",
+      "games": "list",
+      "league": "dict",
+      "negotiations": "dict",
+      "player_stats": "dict",
+      "players": "dict",
+      "postseason": "dict",
+      "schema_version": "str",
+      "season_history": "dict",
+      "team_stats": "dict",
+      "teams": "dict",
+      "trade_agreements": "dict",
+      "trade_market": "dict",
+      "trade_memory": "dict",
+      "turn": "int"
+    }
+  },
+  "imports": [
+    {
+      "file": "news_ai.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_league_block": true
+      },
+      "line": 9,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block"
+      ]
+    },
+    {
+      "file": "playoffs.py",
+      "importable": {
+        "GAME_STATE": true,
+        "_accumulate_player_rows": true,
+        "ensure_league_block": true,
+        "ingest_game_result": true,
+        "set_current_date": true
+      },
+      "line": 15,
+      "symbols": [
+        "GAME_STATE",
+        "_accumulate_player_rows",
+        "ensure_league_block",
+        "ingest_game_result",
+        "set_current_date"
+      ]
+    },
+    {
+      "file": "trades_ai.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_league_block": true,
+        "get_current_date_as_date": true
+      },
+      "line": 10,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block",
+        "get_current_date_as_date"
+      ]
+    },
+    {
+      "file": "trades_ai.py",
+      "importable": {
+        "initialize_master_schedule_if_needed": true
+      },
+      "line": 53,
+      "symbols": [
+        "initialize_master_schedule_if_needed"
+      ]
+    },
+    {
+      "file": "draft_runner.py",
+      "importable": {
+        "GAME_STATE": true
+      },
+      "line": 124,
+      "symbols": [
+        "GAME_STATE"
+      ]
+    },
+    {
+      "file": "team_utils.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_cap_model_populated_if_needed": true,
+        "ensure_league_block": true,
+        "initialize_master_schedule_if_needed": true
+      },
+      "line": 8,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block",
+        "ensure_cap_model_populated_if_needed",
+        "initialize_master_schedule_if_needed"
+      ]
+    },
+    {
+      "file": "stats_util.py",
+      "importable": {
+        "GAME_STATE": true
+      },
+      "line": 5,
+      "symbols": [
+        "GAME_STATE"
+      ]
+    },
+    {
+      "file": "season_report_ai.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_league_block": true
+      },
+      "line": 9,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block"
+      ]
+    },
+    {
+      "file": "server.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_cap_model_populated_if_needed": true,
+        "ensure_db_initialized_and_seeded": true,
+        "ensure_ingest_turn_backfilled_once_startup": true,
+        "ensure_league_block": true,
+        "ensure_player_ids_normalized": true,
+        "ensure_trade_state_keys": true,
+        "get_current_date": true,
+        "get_current_date_as_date": true,
+        "get_schedule_summary": true,
+        "initialize_master_schedule_if_needed": true,
+        "validate_repo_integrity_once_startup": true
+      },
+      "line": 17,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block",
+        "ensure_db_initialized_and_seeded",
+        "ensure_trade_state_keys",
+        "ensure_player_ids_normalized",
+        "ensure_cap_model_populated_if_needed",
+        "validate_repo_integrity_once_startup",
+        "ensure_ingest_turn_backfilled_once_startup",
+        "get_current_date",
+        "get_current_date_as_date",
+        "get_schedule_summary",
+        "initialize_master_schedule_if_needed"
+      ]
+    },
+    {
+      "file": "trades/agreements.py",
+      "importable": {
+        "GAME_STATE": true,
+        "get_current_date_as_date": true
+      },
+      "line": 12,
+      "symbols": [
+        "GAME_STATE",
+        "get_current_date_as_date"
+      ]
+    },
+    {
+      "file": "trades/apply.py",
+      "importable": {
+        "GAME_STATE": true,
+        "get_current_date_as_date": true
+      },
+      "line": 10,
+      "symbols": [
+        "GAME_STATE",
+        "get_current_date_as_date"
+      ]
+    },
+    {
+      "file": "trades/validator.py",
+      "importable": {
+        "GAME_STATE": true,
+        "ensure_league_block": true
+      },
+      "line": 6,
+      "symbols": [
+        "GAME_STATE",
+        "ensure_league_block"
+      ]
+    },
+    {
+      "file": "trades/negotiation_store.py",
+      "importable": {
+        "GAME_STATE": true
+      },
+      "line": 7,
+      "symbols": [
+        "GAME_STATE"
+      ]
+    },
+    {
+      "file": "tests/test_interface_contracts.py",
+      "importable": {
+        "validate_master_schedule_entry": true,
+        "validate_v2_game_result": true
+      },
+      "line": 4,
+      "symbols": [
+        "validate_v2_game_result",
+        "validate_master_schedule_entry"
+      ]
+    },
+    {
+      "file": "tests/test_schedule.py",
+      "importable": {
+        "GAME_STATE": true,
+        "_build_master_schedule": true,
+        "_ensure_league_state": false
+      },
+      "line": 6,
+      "symbols": [
+        "GAME_STATE",
+        "_build_master_schedule",
+        "_ensure_league_state"
+      ]
+    },
+    {
+      "file": "sim/league_sim.py",
+      "importable": {
+        "_ensure_league_state": false,
+        "ingest_game_result": true,
+        "initialize_master_schedule_if_needed": true,
+        "set_current_date": true
+      },
+      "line": 17,
+      "symbols": [
+        "_ensure_league_state",
+        "ingest_game_result",
+        "initialize_master_schedule_if_needed",
+        "set_current_date"
+      ]
+    },
+    {
+      "file": "scripts/trade_smoke_test.py",
+      "importable": {
+        "GAME_STATE": true,
+        "get_current_date_as_date": true,
+        "initialize_master_schedule_if_needed": true
+      },
+      "line": 13,
+      "symbols": [
+        "GAME_STATE",
+        "initialize_master_schedule_if_needed",
+        "get_current_date_as_date"
+      ]
+    }
+  ],
+  "symbols": {
+    "DEFAULT_TRADE_RULES": {
+      "kind": "variable"
+    },
+    "GAME_STATE": {
+      "kind": "variable"
+    },
+    "_ALLOWED_PHASES": {
+      "kind": "variable"
+    },
+    "_ALLOWED_SCHEDULE_STATUSES": {
+      "kind": "variable"
+    },
+    "_DEFAULT_TRADE_MARKET": {
+      "kind": "variable"
+    },
+    "_DEFAULT_TRADE_MEMORY": {
+      "kind": "variable"
+    },
+    "_META_PLAYER_KEYS": {
+      "kind": "variable"
+    },
+    "_accumulate_player_rows": {
+      "kind": "function",
+      "signature": "(rows: 'List[Dict[str, Any]]', season_player_stats: 'Dict[str, Any]') -> 'None'"
+    },
+    "_accumulate_team_game_result": {
+      "kind": "function",
+      "signature": "(team_id: 'str', team_game: 'Dict[str, Any]', season_team_stats: 'Dict[str, Any]') -> 'None'"
+    },
+    "_apply_cap_model_for_season": {
+      "kind": "function",
+      "signature": "(league: 'Dict[str, Any]', season_year: 'int') -> 'None'"
+    },
+    "_archive_and_reset_season_accumulators": {
+      "kind": "function",
+      "signature": "(previous_season_id: 'Optional[str]', next_season_id: 'Optional[str]') -> 'None'"
+    },
+    "_backfill_ingest_turns_once": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_build_master_schedule": {
+      "kind": "function",
+      "signature": "(season_year: 'int') -> 'None'"
+    },
+    "_ensure_active_season_id": {
+      "kind": "function",
+      "signature": "(season_id: 'str') -> 'None'"
+    },
+    "_ensure_cached_views_meta": {
+      "kind": "function",
+      "signature": "() -> 'Dict[str, Any]'"
+    },
+    "_ensure_ingest_turn_backfilled": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_ensure_master_schedule_indices": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_ensure_schedule_team": {
+      "kind": "function",
+      "signature": "(team_id: 'str') -> 'Dict[str, Any]'"
+    },
+    "_ensure_trade_state": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_get_phase_container": {
+      "kind": "function",
+      "signature": "(phase: 'str') -> 'Dict[str, Any]'"
+    },
+    "_is_number": {
+      "kind": "function",
+      "signature": "(value: 'Any') -> 'bool'"
+    },
+    "_mark_master_schedule_game_final": {
+      "kind": "function",
+      "signature": "(game_id: 'str', game_date_str: 'str', home_id: 'str', away_id: 'str', home_score: 'int', away_score: 'int') -> 'None'"
+    },
+    "_mark_views_dirty": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_merge_counter_dict_sum": {
+      "kind": "function",
+      "signature": "(dst: 'Dict[str, Any]', src: 'Dict[str, Any]') -> 'None'"
+    },
+    "_require_dict": {
+      "kind": "function",
+      "signature": "(value: 'Any', path: 'str') -> 'Dict[str, Any]'"
+    },
+    "_require_list": {
+      "kind": "function",
+      "signature": "(value: 'Any', path: 'str') -> 'List[Any]'"
+    },
+    "_reset_cached_views_for_new_season": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "_season_id_from_year": {
+      "kind": "function",
+      "signature": "(season_year: 'int') -> 'str'"
+    },
+    "_validate_game_result_v2": {
+      "kind": "function",
+      "signature": "(game_result: 'Dict[str, Any]') -> 'None'"
+    },
+    "ensure_cap_model_populated_if_needed": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "ensure_contracts_bootstrapped_after_schedule_creation_once": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "ensure_db_initialized_and_seeded": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "ensure_ingest_turn_backfilled_once_startup": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "ensure_league_block": {
+      "kind": "function",
+      "signature": "() -> 'Dict[str, Any]'"
+    },
+    "ensure_player_ids_normalized": {
+      "kind": "function",
+      "signature": "(*, allow_legacy_numeric: 'bool' = True) -> 'dict'"
+    },
+    "ensure_trade_state_keys": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "get_current_date": {
+      "kind": "function",
+      "signature": "() -> 'Optional[str]'"
+    },
+    "get_current_date_as_date": {
+      "kind": "function",
+      "signature": "() -> 'date'"
+    },
+    "get_schedule_summary": {
+      "kind": "function",
+      "signature": "() -> 'Dict[str, Any]'"
+    },
+    "get_scores_view": {
+      "kind": "function",
+      "signature": "(season_id: 'str', limit: 'int' = 20) -> 'Dict[str, Any]'"
+    },
+    "get_team_schedule_view": {
+      "kind": "function",
+      "signature": "(team_id: 'str', season_id: 'str', today: 'Optional[str]' = None) -> 'Dict[str, Any]'"
+    },
+    "ingest_game_result": {
+      "kind": "function",
+      "signature": "(*, game_result: 'Dict[str, Any]', game_date: 'Optional[str]' = None, store_raw_result: 'bool' = True) -> 'Dict[str, Any]'"
+    },
+    "initialize_master_schedule_if_needed": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "normalize_player_ids": {
+      "kind": "function",
+      "signature": "(game_state: 'dict', *, allow_legacy_numeric: 'bool' = True) -> 'dict'"
+    },
+    "set_current_date": {
+      "kind": "function",
+      "signature": "(date_str: 'Optional[str]') -> 'None'"
+    },
+    "validate_master_schedule_entry": {
+      "kind": "function",
+      "signature": "(entry: 'Dict[str, Any]', *, path: 'str' = 'master_schedule.entry') -> 'None'"
+    },
+    "validate_repo_integrity_once_startup": {
+      "kind": "function",
+      "signature": "() -> 'None'"
+    },
+    "validate_v2_game_result": {
+      "kind": "function",
+      "signature": "(game_result: 'Dict[str, Any]') -> 'None'"
+    }
+  }
+}
