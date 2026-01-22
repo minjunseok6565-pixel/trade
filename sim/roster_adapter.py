@@ -1,12 +1,82 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import replace
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
 from league_repo import LeagueRepo
 from matchengine_v3.models import Player, TeamState
 from matchengine_v3.tactics import TacticsConfig
+
+
+_SIM_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SIM_DIR)
+
+
+def _find_json_path(filename: str) -> Optional[str]:
+    """Find a config json file in common locations.
+
+    Search order (first hit wins):
+      1) project root: <project>/<filename>
+      2) project data dir: <project>/data/<filename>
+      3) project config dir: <project>/config/<filename>
+      4) sim dir: <project>/sim/<filename>
+    """
+    candidates = [
+        os.path.join(_PROJECT_DIR, filename),
+        os.path.join(_PROJECT_DIR, "data", filename),
+        os.path.join(_PROJECT_DIR, "config", filename),
+        os.path.join(_SIM_DIR, filename),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@lru_cache(maxsize=1)
+def _load_team_coach_preset_map() -> Dict[str, str]:
+    """Load team->preset mapping from team_coach_presets.json (optional).
+
+    Expected format:
+      {
+        "version": "1.0",
+        "teams": { "LAL": "Playoff Tight", ... }
+      }
+    Also accepts a plain dict {"LAL": "..."} for flexibility.
+    Missing file or parse errors -> empty dict (safe no-op).
+    """
+    path = _find_json_path("team_coach_presets.json")
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("teams"), dict):
+            return {str(k).upper(): str(v) for k, v in data["teams"].items()}
+        if isinstance(data, dict):
+            # allow flat map
+            return {str(k).upper(): str(v) for k, v in data.items() if isinstance(v, (str, int, float))}
+        return {}
+    except Exception:
+        return {}
+
+
+def _apply_default_coach_preset(team_id: str, cfg: TacticsConfig) -> None:
+    """Inject COACH_PRESET into tactics.context if not explicitly provided."""
+    if not isinstance(getattr(cfg, "context", None), dict):
+        return
+    # Respect explicit preset from caller/tactics input.
+    if "COACH_PRESET" in cfg.context:
+        return
+
+    mapping = _load_team_coach_preset_map()
+    preset = mapping.get(str(team_id).upper())
+    if preset:
+        cfg.context["COACH_PRESET"] = str(preset)
 
 
 def _build_tactics_config(raw: Optional[Dict[str, Any]]) -> TacticsConfig:
@@ -35,6 +105,11 @@ def _build_tactics_config(raw: Optional[Dict[str, Any]]) -> TacticsConfig:
     cfg.opp_outcome_global_mult = dict(raw.get("opp_outcome_global_mult") or {})
     cfg.opp_outcome_by_action_mult = dict(raw.get("opp_outcome_by_action_mult") or {})
 
+    # Allow caller to pass arbitrary context (e.g., USER_COACH, ROTATION_POOL_PIDS, etc.)
+    raw_ctx = raw.get("context")
+    if isinstance(raw_ctx, dict) and raw_ctx:
+        cfg.context.update(raw_ctx)
+        
     pace = raw.get("pace")
     if pace is not None:
         cfg.context["PACE"] = pace
@@ -162,6 +237,7 @@ def build_team_state_from_db(
     lineup = _select_lineup(players, starters, bench, max_players=max_players)
     roles = _build_roles_from_lineup(lineup[:5])
     tactics_cfg = _build_tactics_config(tactics)
+    _apply_default_coach_preset(team_id, tactics_cfg)
 
     team_state = TeamState(name=str(team_id).upper(), lineup=lineup, tactics=tactics_cfg, roles=roles)
     minutes = (tactics or {}).get("minutes") or {}
