@@ -66,7 +66,7 @@ def process_offseason(
         released = int(expire_result.get("released") or 0)
         released_ids = [str(x) for x in (expire_result.get("released_player_ids") or [])]
 
-        # Maintain minimal workflow/UI cache in GAME_STATE for released players (best-effort)
+        # Maintain minimal workflow/UI cache for released players (best-effort)
         try:
             players_cache = game_state.get("players")
             if isinstance(players_cache, dict):

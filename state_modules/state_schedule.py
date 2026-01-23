@@ -8,35 +8,15 @@ from typing import Any, Dict, List, Optional
 from config import (
     ALL_TEAM_IDS,
     DIVISIONS,
-    INITIAL_SEASON_YEAR,
     MAX_GAMES_PER_DAY,
     SEASON_LENGTH_DAYS,
     SEASON_START_DAY,
     SEASON_START_MONTH,
     TEAM_TO_CONF_DIV,
 )
-from state_bootstrap import ensure_contracts_bootstrapped_after_schedule_creation_once
 from state_cap import _apply_cap_model_for_season
-from state_core import (
-    _archive_and_reset_season_accumulators,
-    _ensure_active_season_id,
-    _season_id_from_year,
-    ensure_league_block,
-    set_current_date,
-)
-from state_store import GAME_STATE, _ALLOWED_SCHEDULE_STATUSES
-
-
-def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
-    """GAME_STATE.cached_views.schedule에 팀 엔트리가 없으면 생성."""
-    schedule = GAME_STATE["cached_views"]["schedule"]
-    teams = schedule.setdefault("teams", {})
-    if team_id not in teams:
-        teams[team_id] = {
-            "past_games": [],
-            "upcoming_games": [],
-        }
-    return teams[team_id]
+from state_core import season_id_from_year
+from state_store import _ALLOWED_SCHEDULE_STATUSES
 
 
 def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master_schedule.entry") -> None:
@@ -93,8 +73,7 @@ def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master
             raise ValueError(f"MasterScheduleEntry invalid: {path}.{sk} must be int or None if present")
 
 
-def _ensure_master_schedule_indices() -> None:
-    league = ensure_league_block()
+def ensure_master_schedule_indices(league: Dict[str, Any]) -> None:
     master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
     # Contract check: master_schedule entries must satisfy the minimal schema.
@@ -107,7 +86,7 @@ def _ensure_master_schedule_indices() -> None:
         }
 
 
-def _build_master_schedule(season_year: int) -> None:
+def build_master_schedule(league: Dict[str, Any], season_year: int) -> None:
     """30개 팀 전체에 대한 마스터 스케줄(정규시즌)을 생성한다.
 
     - 실제 NBA 규칙을 근사하여 **항상 1230경기, 팀당 82경기**가 되도록
@@ -121,7 +100,6 @@ def _build_master_schedule(season_year: int) -> None:
       * 하루 최대 MAX_GAMES_PER_DAY 경기
       * 한 팀은 하루에 최대 1경기
     """
-    league = ensure_league_block()
     from league_repo import LeagueRepo
 
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
@@ -134,7 +112,10 @@ def _build_master_schedule(season_year: int) -> None:
 
     # Stepien 룰은 (year, year+1) 쌍을 검사하기 때문에,
     # lookahead=N이면 draft_year+N+1까지 "픽 데이터가 존재"해야 데이터 결측으로 인한 오판을 피할 수 있다.
-    trade_rules = league.get("trade_rules") or {}
+    trade_rules = league.get("trade_rules")
+    if not isinstance(trade_rules, dict):
+        trade_rules = {}
+        league["trade_rules"] = trade_rules
     try:
         max_pick_years_ahead = int(trade_rules.get("max_pick_years_ahead") or 7)
     except (TypeError, ValueError):
@@ -152,7 +133,7 @@ def _build_master_schedule(season_year: int) -> None:
 
     season_start = date(season_year, SEASON_START_MONTH, SEASON_START_DAY)
     teams = list(ALL_TEAM_IDS)
-    season_id = _season_id_from_year(season_year)
+    season_id = season_id_from_year(season_year)
     phase = "regular"
 
     # 팀별 컨퍼런스/디비전 정보 캐시
@@ -320,45 +301,11 @@ def _build_master_schedule(season_year: int) -> None:
     league["season_start"] = season_start.isoformat()
     trade_deadline_date = date(season_year + 1, 2, 5)
     league["trade_rules"]["trade_deadline"] = trade_deadline_date.isoformat()
-    set_current_date(None)
+    league["current_date"] = None
     league["last_gm_tick_date"] = None
-    try:
-        previous_season = int(previous_season_year or 0)
-    except (TypeError, ValueError):
-        previous_season = 0
-    try:
-        next_season = int(season_year or 0)
-    except (TypeError, ValueError):
-        next_season = 0
-    # 누적 스탯(정규시즌)은 시즌 단위로 끊는다.
-    # - 시즌이 바뀌면 기존 누적은 history로 보관하고, 새 시즌 누적을 새로 시작한다.
-    if previous_season and next_season and previous_season != next_season:
-        from contracts.offseason import process_offseason
 
-        process_offseason(GAME_STATE, previous_season, next_season)
-        _archive_and_reset_season_accumulators(_season_id_from_year(previous_season), _season_id_from_year(next_season))
-    else:
-        _ensure_active_season_id(_season_id_from_year(int(next_season or season_year)))
-
-
-def initialize_master_schedule_if_needed() -> None:
-    """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
-    if master_schedule.get("games"):
-        _ensure_master_schedule_indices()
-        return
-
-    # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
-    season_year = INITIAL_SEASON_YEAR
-    _build_master_schedule(season_year)
-    _ensure_master_schedule_indices()
-
-    # Schedule creation is the agreed contract-bootstrap checkpoint (once per season).
-    ensure_contracts_bootstrapped_after_schedule_creation_once()
-
-
-def _mark_master_schedule_game_final(
+def mark_master_schedule_game_final(
+    league: Dict[str, Any],
     game_id: str,
     game_date_str: str,
     home_id: str,
@@ -367,7 +314,6 @@ def _mark_master_schedule_game_final(
     away_score: int,
 ) -> None:
     """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
-    league = ensure_league_block()
     master_schedule = league.setdefault("master_schedule", {})
     games = master_schedule.get("games") or []
     by_id = master_schedule.setdefault("by_id", {})
@@ -392,14 +338,12 @@ def _mark_master_schedule_game_final(
             return
 
 
-def get_schedule_summary() -> Dict[str, Any]:
+def get_schedule_summary(league: Dict[str, Any]) -> Dict[str, Any]:
     """마스터 스케줄 통계 요약을 반환한다.
 
     - 총 경기 수, 상태별 경기 수
     - 팀별 총 경기 수(82 보장 여부)와 홈/원정 분배
     """
-    initialize_master_schedule_if_needed()
-    league = ensure_league_block()
     master = league.get("master_schedule") or {}
     games = master.get("games") or []
     by_team = master.get("by_team") or {}

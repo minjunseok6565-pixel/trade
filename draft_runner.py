@@ -121,9 +121,9 @@ def main() -> int:
         if args.state_in:
             game_state = load_game_state(args.state_in)
         else:
-            from state import GAME_STATE
+            from state import export_workflow_state
 
-            game_state = GAME_STATE
+            game_state = export_workflow_state()
 
         _ensure_state_containers(game_state)
 

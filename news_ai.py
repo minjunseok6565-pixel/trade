@@ -6,7 +6,15 @@ from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
 
-from state import GAME_STATE, ensure_league_block
+from state import (
+    get_cached_views_snapshot,
+    get_current_date,
+    get_games_snapshot,
+    get_postseason_snapshot,
+    get_transactions_snapshot,
+    set_cached_view_playoff_news,
+    set_cached_view_weekly_news,
+)
 from team_utils import get_conference_standings
 
 
@@ -31,12 +39,15 @@ def _extract_text_from_gemini_response(resp: Any) -> str:
 
 
 def _ensure_playoff_news_cache() -> Dict[str, Any]:
-    cached_views = GAME_STATE.setdefault("cached_views", {})
-    playoff_news = cached_views.setdefault(
-        "playoff_news", {"series_game_counts": {}, "items": []}
-    )
-    playoff_news.setdefault("series_game_counts", {})
-    playoff_news.setdefault("items", [])
+    cached_views = get_cached_views_snapshot()
+    playoff_news = cached_views.get("playoff_news")
+    if not isinstance(playoff_news, dict):
+        playoff_news = {"series_game_counts": {}, "items": []}
+    if "series_game_counts" not in playoff_news:
+        playoff_news["series_game_counts"] = {}
+    if "items" not in playoff_news:
+        playoff_news["items"] = []
+    set_cached_view_playoff_news(playoff_news)
     return playoff_news
 
 
@@ -53,8 +64,7 @@ def _playoff_round_label(round_name: Optional[str]) -> str:
 
 
 def _get_current_date() -> date:
-    league = ensure_league_block()
-    cur = league.get("current_date") or date.today().isoformat()
+    cur = get_current_date() or date.today().isoformat()
     try:
         return date.fromisoformat(cur)
     except ValueError:
@@ -120,7 +130,7 @@ def build_week_summary_context() -> str:
     lines.append(f"Coverage window: {week_start.isoformat()} ~ {current_date.isoformat()}")
 
     games = []
-    for g in GAME_STATE.get("games", []):
+    for g in get_games_snapshot():
         try:
             g_date = date.fromisoformat(g.get("date"))
         except Exception:
@@ -140,7 +150,7 @@ def build_week_summary_context() -> str:
             )
 
     transactions = []
-    for t in GAME_STATE.get("transactions", []):
+    for t in get_transactions_snapshot():
         t_date = t.get("date") or t.get("created_at")
         if not t_date:
             continue
@@ -228,14 +238,16 @@ def generate_weekly_news(api_key: str) -> List[Dict[str, Any]]:
 def refresh_weekly_news(api_key: str) -> Dict[str, Any]:
     current_date = _get_current_date()
     week_key = _week_start(current_date).isoformat()
-    cache = GAME_STATE.setdefault("cached_views", {}).setdefault("weekly_news", {})
+    cached_views = get_cached_views_snapshot()
+    cache = cached_views.get("weekly_news") if isinstance(cached_views, dict) else None
 
-    if cache.get("last_generated_week_start") == week_key and cache.get("items"):
+    if isinstance(cache, dict) and cache.get("last_generated_week_start") == week_key and cache.get("items"):
         return {"current_date": current_date.isoformat(), "items": cache.get("items", [])}
 
     items = generate_weekly_news(api_key)
-    cache["last_generated_week_start"] = week_key
-    cache["items"] = items
+    set_cached_view_weekly_news(
+        {"last_generated_week_start": week_key, "items": items}
+    )
 
     return {"current_date": current_date.isoformat(), "items": items}
 
@@ -283,7 +295,7 @@ def _build_playoff_game_article(series: Dict[str, Any], game_index: int) -> Opti
 
 
 def refresh_playoff_news() -> Dict[str, Any]:
-    postseason = GAME_STATE.get("postseason") or {}
+    postseason = get_postseason_snapshot() or {}
     playoffs = postseason.get("playoffs")
     if not playoffs:
         raise ValueError("플레이오프 진행 중이 아닙니다.")

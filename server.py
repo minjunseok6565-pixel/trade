@@ -15,18 +15,16 @@ from config import BASE_DIR, ALL_TEAM_IDS
 from league_repo import LeagueRepo
 from schema import normalize_team_id
 from state import (
-    GAME_STATE,
-    ensure_league_block,
-    ensure_db_initialized_and_seeded,
-    ensure_trade_state_keys,
-    ensure_player_ids_normalized,
-    ensure_cap_model_populated_if_needed,
-    validate_repo_integrity_once_startup,
-    ensure_ingest_turn_backfilled_once_startup,
+    export_workflow_state,
     get_current_date,
     get_current_date_as_date,
+    get_league_snapshot,
+    get_postseason_snapshot,
     get_schedule_summary,
+    get_db_path,
     initialize_master_schedule_if_needed,
+    set_db_path,
+    startup_init_state,
 )
 from sim.league_sim import simulate_single_game, advance_league_until
 from playoffs import (
@@ -40,7 +38,6 @@ from playoffs import (
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
 from team_utils import (
-    _init_players_and_teams_if_needed,
     get_conference_standings,
     get_team_cards,
     get_team_detail,
@@ -61,21 +58,7 @@ app = FastAPI(title="느바 시뮬 GM 서버")
 
 @app.on_event("startup")
 def _startup_init_state() -> None:
-    # Startup-only bootstraps (agreed policy):
-    # 1) DB init + seed once
-    # 2) players/teams cache init + player_id normalize once
-    # 3) repo integrity validate once
-    # 4) ingest_turn backfill once
-    ensure_league_block()
-    ensure_db_initialized_and_seeded()
-    ensure_trade_state_keys()
-    _init_players_and_teams_if_needed()
-    ensure_player_ids_normalized()
-    initialize_master_schedule_if_needed()
-    # In case season_year exists and cap fields are still unset/zero.
-    ensure_cap_model_populated_if_needed()
-    validate_repo_integrity_once_startup()
-    ensure_ingest_turn_backfilled_once_startup()
+    startup_init_state()
 
 app.add_middleware(
     CORSMiddleware,
@@ -286,7 +269,7 @@ async def api_postseason_field():
 
 @app.get("/api/postseason/state")
 async def api_postseason_state():
-    return GAME_STATE.get("postseason") or {}
+    return get_postseason_snapshot()
 
 
 @app.post("/api/postseason/reset")
@@ -440,11 +423,10 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     return JSONResponse(status_code=400, content=payload)
 
 def _require_db_path() -> str:
-    league = ensure_league_block()
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = get_db_path() or os.environ.get("LEAGUE_DB_PATH") or "league.db"
     if not db_path:
         raise HTTPException(status_code=500, detail="db_path is required for trade operations")
-    league["db_path"] = db_path
+    set_db_path(db_path)
     return db_path
 
 def _validate_repo_integrity(db_path: str) -> None:
@@ -584,7 +566,7 @@ async def team_schedule(team_id: str):
 
     # 마스터 스케줄이 없다면 생성
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
+    league = get_league_snapshot()
     master_schedule = league["master_schedule"]
     games = master_schedule.get("games") or []
 
@@ -627,23 +609,7 @@ async def team_schedule(team_id: str):
 
 @app.get("/api/state/summary")
 async def state_summary():
-    workflow_state: Dict[str, Any] = dict(GAME_STATE)
-    for k in (
-        # Trade assets ledger (DB SSOT)
-        "draft_picks",
-        "swap_rights",
-        "fixed_assets",
-        # Transactions ledger (DB SSOT)
-        "transactions",
-        # Contracts/FA ledger (DB SSOT)
-        "contracts",
-        "player_contracts",
-        "active_contract_id_by_player",
-        "free_agents",
-        # GM profiles (DB SSOT)
-        "gm_profiles",
-    ):
-        workflow_state.pop(k, None)
+    workflow_state: Dict[str, Any] = export_workflow_state()
 
     # 2) DB snapshot (SSOT). Fail loud on DB path/schema issues.
     db_path = _require_db_path()
