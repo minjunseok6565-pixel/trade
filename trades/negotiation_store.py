@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from state import GAME_STATE
+from state import negotiation_get, negotiation_put
 
 from .errors import TradeError, NEGOTIATION_NOT_FOUND
 from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
@@ -84,12 +84,12 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
         "relationship": {"trust": 0, "fatigue": 0, "promises_broken": 0},
         "market_context": {},  # trade market context snapshot
     }
-    GAME_STATE.setdefault("negotiations", {})[session_id] = session
+    negotiation_put(session_id, session)
     return session
 
 
 def get_session(session_id: str) -> Dict[str, Any]:
-    session = (GAME_STATE.get("negotiations") or {}).get(session_id)
+    session = negotiation_get(session_id)
     if not session:
         raise TradeError(
             NEGOTIATION_NOT_FOUND,
@@ -99,10 +99,17 @@ def get_session(session_id: str) -> Dict[str, Any]:
     return _ensure_session_schema(session)
 
 
+def _save_session(session: Dict[str, Any]) -> None:
+    session_id = session.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        negotiation_put(session_id, session)
+
+
 def append_message(session_id: str, speaker: str, text: str) -> None:
     session = get_session(session_id)
     session["messages"].append({"speaker": speaker, "text": text, "at": _now_iso()})
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
@@ -110,24 +117,28 @@ def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
     deal: Deal = canonicalize_deal(parse_deal(deal_serialized))
     session["draft_deal"] = serialize_deal(deal)
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_committed(session_id: str, deal_id: str) -> None:
     session = get_session(session_id)
     session["committed_deal_id"] = deal_id
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_phase(session_id: str, phase: str) -> None:
     session = get_session(session_id)
     session["phase"] = phase if isinstance(phase, str) else "INIT"
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_constraints(session_id: str, constraints: dict) -> None:
     session = get_session(session_id)
     session["constraints"] = constraints if isinstance(constraints, dict) else {}
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_valid_until(session_id: str, valid_until_iso: Optional[str]) -> None:
@@ -136,6 +147,7 @@ def set_valid_until(session_id: str, valid_until_iso: Optional[str]) -> None:
         valid_until_iso = None
     session["valid_until"] = valid_until_iso
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_summary(session_id: str, summary: dict) -> None:
@@ -146,6 +158,7 @@ def set_summary(session_id: str, summary: dict) -> None:
     summary.setdefault("updated_at", None)
     session["summary"] = summary
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def bump_fatigue(session_id: str, delta: int = 1) -> None:
@@ -160,6 +173,7 @@ def bump_fatigue(session_id: str, delta: int = 1) -> None:
         session["relationship"] = relationship
     relationship["fatigue"] = int(relationship.get("fatigue", 0)) + increment
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_relationship(session_id: str, patch: dict) -> None:
@@ -173,15 +187,18 @@ def set_relationship(session_id: str, patch: dict) -> None:
             if key in patch:
                 relationship[key] = patch[key]
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_last_offer(session_id: str, payload: Any) -> None:
     session = get_session(session_id)
     session["last_offer"] = payload
     session["updated_at"] = _now_iso()
+    _save_session(session)
 
 
 def set_last_counter(session_id: str, payload: Any) -> None:
     session = get_session(session_id)
     session["last_counter"] = payload
     session["updated_at"] = _now_iso()
+    _save_session(session)

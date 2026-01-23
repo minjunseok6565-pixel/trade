@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
 from team_utils import _init_players_and_teams_if_needed
-from state import GAME_STATE, get_current_date_as_date
+from state import (
+    export_state_snapshot,
+    get_current_date_as_date,
+    get_db_path,
+    update_players_after_trade,
+)
 
 from .errors import (
     APPLY_FAILED,
@@ -33,11 +38,13 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
     raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
 
 
-def _get_db_path(game_state: dict) -> str:
-    league_state = game_state.get("league") or {}
-    db_path = league_state.get("db_path")
+def _get_db_path(game_state: dict | None) -> str:
+    league_state = game_state.get("league") if isinstance(game_state, dict) else None
+    db_path = league_state.get("db_path") if isinstance(league_state, dict) else None
     if not db_path:
-        raise ValueError("game_state['league']['db_path'] is required to apply trades")
+        db_path = get_db_path()
+    if not db_path:
+        raise ValueError("db_path is required to apply trades")
     return db_path
 
 
@@ -125,7 +132,7 @@ def apply_deal(
     if deal is None:
         if isinstance(game_state, Deal):
             deal = game_state
-            game_state = GAME_STATE
+            game_state = export_state_snapshot()
         else:
             raise TypeError("apply_deal requires a Deal")
 
@@ -158,25 +165,11 @@ def apply_deal(
             tx = svc.execute_trade(deal, source=source, trade_date=trade_date, deal_id=deal_id)
 
         # Optional: update lightweight cached player fields in state (NOT assets ledger)
-        players_state = game_state.get("players", {})
-        if isinstance(players_state, dict):
-            for move in player_moves:
-                ps = players_state.get(move.player_id)
-                if not isinstance(ps, dict):
-                    continue
-                ps["team_id"] = move.to_team
-                ps.setdefault("signed_date", "1900-01-01")
-                ps.setdefault("signed_via_free_agency", False)
-                ps["acquired_date"] = acquired_date
-                ps["acquired_via_trade"] = True
-                if season_key:
-                    bans = ps.setdefault("trade_return_bans", {})
-                    season_bans = bans.get(season_key)
-                    if not isinstance(season_bans, list):
-                        season_bans = []
-                    if move.from_team not in season_bans:
-                        season_bans.append(move.from_team)
-                    bans[season_key] = season_bans
+        update_players_after_trade(
+            moves=[m.__dict__ for m in player_moves],
+            acquired_date=acquired_date,
+            season_key=season_key,
+        )
 
         return tx
     except TradeError:

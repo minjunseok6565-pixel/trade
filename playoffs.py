@@ -13,10 +13,16 @@ from matchengine_v2_adapter import adapt_matchengine_result_to_v2, build_context
 from matchengine_v3.sim_game import simulate_game
 from sim.roster_adapter import build_team_state_from_db
 from state import (
-    GAME_STATE,
-    _accumulate_player_rows,
-    ensure_league_block,
+    get_db_path,
+    get_league_snapshot,
+    get_postseason_snapshot,
     ingest_game_result,
+    postseason_reset,
+    postseason_set_champion,
+    postseason_set_field,
+    postseason_set_my_team_id,
+    postseason_set_play_in,
+    postseason_set_playoffs,
     set_current_date,
 )
 from team_utils import get_conference_standings
@@ -30,8 +36,7 @@ HomePattern = [True, True, False, False, True, False, True]
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    league = ensure_league_block()
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = get_db_path() or os.environ.get("LEAGUE_DB_PATH") or "league.db"
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -39,17 +44,6 @@ def _repo_ctx() -> LeagueRepo:
         except Exception:
             pass
         yield repo
-
-def _ensure_postseason_state() -> Dict[str, Any]:
-    postseason = GAME_STATE.setdefault("postseason", {})
-    postseason.setdefault("field", None)
-    postseason.setdefault("play_in", None)
-    postseason.setdefault("playoffs", None)
-    postseason.setdefault("champion", None)
-    postseason.setdefault("my_team_id", None)
-    postseason.setdefault("playoff_player_stats", {})
-    return postseason
-
 
 def _safe_date_fromisoformat(date_str: Optional[str]) -> Optional[date]:
     if not date_str:
@@ -61,7 +55,7 @@ def _safe_date_fromisoformat(date_str: Optional[str]) -> Optional[date]:
 
 
 def _regular_season_end_date() -> date:
-    league = ensure_league_block()
+    league = get_league_snapshot()
     master_schedule = league.get("master_schedule") or {}
     by_date = master_schedule.get("by_date") or {}
 
@@ -119,20 +113,8 @@ def _next_round_start(series_list: List[Dict[str, Any]], buffer_days: int = 2) -
 
 
 def reset_postseason_state() -> Dict[str, Any]:
-    GAME_STATE["postseason"] = {
-        "field": None,
-        "play_in": None,
-        "playoffs": None,
-        "champion": None,
-        "my_team_id": None,
-        "playoff_player_stats": {},
-    }
-    cached_views = GAME_STATE.setdefault("cached_views", {})
-    playoff_news = cached_views.setdefault("playoff_news", {})
-    playoff_news["series_game_counts"] = {}
-    playoff_news["items"] = []
-    cached_views.setdefault("stats", {}).pop("playoff_leaders", None)
-    return GAME_STATE["postseason"]
+    postseason_reset()
+    return get_postseason_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +218,7 @@ def _simulate_postseason_game(
 
     set_current_date(game_date)
 
-    league = ensure_league_block()
+    league = get_league_snapshot()
     game_id = f"playoffs_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
     context = build_context_from_team_ids(
         game_id=game_id,
@@ -259,13 +241,6 @@ def _simulate_postseason_game(
         engine_name="matchengine_v3",
     )
     ingest_game_result(game_result=v2_result, game_date=game_date)
-
-    postseason = _ensure_postseason_state()
-    playoff_stats = postseason.setdefault("playoff_player_stats", {})
-    for tid in (home_team_id, away_team_id):
-        rows = (v2_result.get("teams", {}).get(tid) or {}).get("players") or []
-        if isinstance(rows, list):
-            _accumulate_player_rows(rows, playoff_stats)
 
     final = v2_result.get("final") or {}
     home_score = int(final.get(home_team_id, 0))
@@ -324,8 +299,7 @@ def build_postseason_field() -> Dict[str, Any]:
             "eliminated": eliminated,
         }
 
-    ps = _ensure_postseason_state()
-    ps["field"] = field
+    postseason_set_field(field)
     return field
 
 
@@ -337,8 +311,7 @@ def build_random_postseason_field(my_team_id: str) -> Dict[str, Any]:
         attach_my_team = my_team_id if conf_key == my_conf else None
         field[conf_key] = _build_random_conf_field(conf_key, attach_my_team)
 
-    ps = _ensure_postseason_state()
-    ps["field"] = field
+    postseason_set_field(field)
     return field
 
 
@@ -471,7 +444,7 @@ def _auto_play_in_conf(conf_state: Dict[str, Any], my_team_id: Optional[str]) ->
 
 
 def play_my_team_play_in_game() -> Dict[str, Any]:
-    postseason = _ensure_postseason_state()
+    postseason = get_postseason_snapshot()
     my_team_id = postseason.get("my_team_id")
     play_in = postseason.get("play_in")
     if not my_team_id or not play_in:
@@ -501,7 +474,7 @@ def play_my_team_play_in_game() -> Dict[str, Any]:
             )
             _apply_play_in_results(conf_state)
             _auto_play_in_conf(conf_state, my_team_id)
-            postseason["play_in"] = play_in
+            postseason_set_play_in(play_in)
             _maybe_start_playoffs_from_play_in()
             return postseason
 
@@ -675,7 +648,6 @@ def _finals_from_conf(
 def _initialize_playoffs(
     seeds_by_conf: Dict[str, Dict[int, Dict[str, Any]]], start_date: date
 ) -> None:
-    postseason = _ensure_postseason_state()
     start_date_str = start_date.isoformat()
     bracket = {
         "east": {
@@ -695,16 +667,17 @@ def _initialize_playoffs(
         "finals": None,
     }
 
-    postseason["playoffs"] = {
+    playoffs_payload = {
         "seeds": seeds_by_conf,
         "bracket": bracket,
         "current_round": "Conference Quarterfinals",
         "start_date": start_date_str,
     }
+    postseason_set_playoffs(playoffs_payload)
 
 
 def _advance_round_if_ready() -> None:
-    postseason = _ensure_postseason_state()
+    postseason = get_postseason_snapshot()
     playoffs = postseason.get("playoffs")
     if not playoffs:
         return
@@ -723,7 +696,7 @@ def _advance_round_if_ready() -> None:
                 bracket["west"].get("quarterfinals", []), start_date
             )
             playoffs["current_round"] = "Conference Semifinals"
-            postseason["playoffs"] = playoffs
+            postseason_set_playoffs(playoffs)
             return
 
     if current_round == "Conference Semifinals":
@@ -737,7 +710,7 @@ def _advance_round_if_ready() -> None:
                 bracket["west"].get("semifinals", []), start_date
             )
             playoffs["current_round"] = "Conference Finals"
-            postseason["playoffs"] = playoffs
+            postseason_set_playoffs(playoffs)
             return
 
     if current_round == "Conference Finals":
@@ -750,7 +723,7 @@ def _advance_round_if_ready() -> None:
                 start_date,
             )
             playoffs["current_round"] = "NBA Finals"
-            postseason["playoffs"] = playoffs
+            postseason_set_playoffs(playoffs)
             return
 
     if current_round == "NBA Finals":
@@ -775,7 +748,7 @@ def _find_my_series(playoffs: Dict[str, Any], my_team_id: str) -> Optional[Dict[
 
 
 def advance_my_team_one_game() -> Dict[str, Any]:
-    postseason = _ensure_postseason_state()
+    postseason = get_postseason_snapshot()
     my_team_id = postseason.get("my_team_id")
     playoffs = postseason.get("playoffs")
     if not my_team_id or not playoffs:
@@ -799,11 +772,11 @@ def advance_my_team_one_game() -> Dict[str, Any]:
         _simulate_one_series_game(series)
 
     _advance_round_if_ready()
-    return postseason
+    return get_postseason_snapshot()
 
 
 def auto_advance_current_round() -> Dict[str, Any]:
-    postseason = _ensure_postseason_state()
+    postseason = get_postseason_snapshot()
     playoffs = postseason.get("playoffs")
     if not playoffs:
         raise ValueError("Playoffs are not initialized")
@@ -817,7 +790,7 @@ def auto_advance_current_round() -> Dict[str, Any]:
             _simulate_one_series_game(series)
 
     _advance_round_if_ready()
-    return postseason
+    return get_postseason_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -846,7 +819,7 @@ def _build_playoff_seeds(field: Dict[str, Any], play_in: Dict[str, Any]) -> Dict
 
 
 def _maybe_start_playoffs_from_play_in() -> None:
-    postseason = _ensure_postseason_state()
+    postseason = get_postseason_snapshot()
     field = postseason.get("field")
     play_in = postseason.get("play_in")
     if not field or not play_in:
@@ -857,11 +830,11 @@ def _maybe_start_playoffs_from_play_in() -> None:
             return
 
     seeds = _build_playoff_seeds(field, play_in)
+    play_in_meta = play_in.get("_meta") if isinstance(play_in, dict) else None
     play_in_end = _safe_date_fromisoformat(
-        postseason.get("play_in_end_date")
+        (play_in_meta or {}).get("end_date")
     ) or _play_in_end_date(play_in)
     playoff_start = (play_in_end + timedelta(days=3)) if play_in_end else date.today()
-    postseason["playoffs_start_date"] = playoff_start.isoformat()
     _initialize_playoffs(seeds, playoff_start)
 
 
@@ -881,10 +854,7 @@ def _prepare_play_in(field: Dict[str, Any], my_team_id: Optional[str]) -> Dict[s
             conf_matchups["final"]["date"] = final_date_str
         play_in_state[conf_key] = conf_state
 
-    postseason = _ensure_postseason_state()
-    postseason["play_in"] = play_in_state
-    postseason["play_in_start_date"] = start_date_str
-    postseason["play_in_end_date"] = final_date_str
+    play_in_state["_meta"] = {"start_date": start_date_str, "end_date": final_date_str}
 
     my_conf = None
     my_seed = None
@@ -906,7 +876,7 @@ def _prepare_play_in(field: Dict[str, Any], my_team_id: Optional[str]) -> Dict[s
     for conf_state in play_in_state.values():
         _apply_play_in_results(conf_state)
 
-    postseason["play_in"] = play_in_state
+    postseason_set_play_in(play_in_state)
     if my_seed and my_seed <= 6:
         _maybe_start_playoffs_from_play_in()
 
@@ -915,8 +885,7 @@ def _prepare_play_in(field: Dict[str, Any], my_team_id: Optional[str]) -> Dict[s
 
 def initialize_postseason(my_team_id: str, use_random_field: bool = False) -> Dict[str, Any]:
     reset_postseason_state()
-    postseason = _ensure_postseason_state()
-    postseason["my_team_id"] = my_team_id
+    postseason_set_my_team_id(my_team_id)
     if use_random_field:
         field = build_random_postseason_field(my_team_id)
     else:
@@ -925,10 +894,11 @@ def initialize_postseason(my_team_id: str, use_random_field: bool = False) -> Di
     play_in_state = _prepare_play_in(field, my_team_id)
 
     # 사용자가 플레이인을 건너뛴 경우 이미 플레이오프가 세팅됨
+    postseason = get_postseason_snapshot()
     if not postseason.get("playoffs"):
         _maybe_start_playoffs_from_play_in()
 
-    return postseason
+    return get_postseason_snapshot()
 
 
 __all__ = [

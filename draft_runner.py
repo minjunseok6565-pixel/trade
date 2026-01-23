@@ -121,9 +121,9 @@ def main() -> int:
         if args.state_in:
             game_state = load_game_state(args.state_in)
         else:
-            from state import GAME_STATE
+            from state import export_state_snapshot
 
-            game_state = GAME_STATE
+            game_state = export_state_snapshot()
 
         _ensure_state_containers(game_state)
 
@@ -158,6 +158,10 @@ def main() -> int:
             _write_json(args.state_out, game_state)
         elif args.state_in:
             _safe_overwrite(args.state_in, game_state)
+        else:
+            from state import replace_state_snapshot
+
+            replace_state_snapshot(game_state)
 
         return 0
     except TradeError as exc:

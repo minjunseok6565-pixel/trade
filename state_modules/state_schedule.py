@@ -15,28 +15,13 @@ from config import (
     SEASON_START_MONTH,
     TEAM_TO_CONF_DIV,
 )
-from state_bootstrap import ensure_contracts_bootstrapped_after_schedule_creation_once
+from schema import season_id_from_year as _schema_season_id_from_year
 from state_cap import _apply_cap_model_for_season
-from state_core import (
-    _archive_and_reset_season_accumulators,
-    _ensure_active_season_id,
-    _season_id_from_year,
-    ensure_league_block,
-    set_current_date,
-)
-from state_store import GAME_STATE, _ALLOWED_SCHEDULE_STATUSES
+from state_store import _ALLOWED_SCHEDULE_STATUSES
 
 
-def _ensure_schedule_team(team_id: str) -> Dict[str, Any]:
-    """GAME_STATE.cached_views.schedule에 팀 엔트리가 없으면 생성."""
-    schedule = GAME_STATE["cached_views"]["schedule"]
-    teams = schedule.setdefault("teams", {})
-    if team_id not in teams:
-        teams[team_id] = {
-            "past_games": [],
-            "upcoming_games": [],
-        }
-    return teams[team_id]
+def _season_id_from_year(season_year: int) -> str:
+    return str(_schema_season_id_from_year(int(season_year)))
 
 
 def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master_schedule.entry") -> None:
@@ -93,8 +78,7 @@ def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master
             raise ValueError(f"MasterScheduleEntry invalid: {path}.{sk} must be int or None if present")
 
 
-def _ensure_master_schedule_indices() -> None:
-    league = ensure_league_block()
+def ensure_master_schedule_indices(league: Dict[str, Any]) -> None:
     master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
     # Contract check: master_schedule entries must satisfy the minimal schema.
@@ -107,33 +91,15 @@ def _ensure_master_schedule_indices() -> None:
         }
 
 
-def _build_master_schedule(season_year: int) -> None:
-    """30개 팀 전체에 대한 마스터 스케줄(정규시즌)을 생성한다.
-
-    - 실제 NBA 규칙을 근사하여 **항상 1230경기, 팀당 82경기**가 되도록
-      경기 수를 결정한다.
-    - 같은 디비전: 4경기
-    - 같은 컨퍼런스 다른 디비전: 한 팀당 6개 팀과는 4경기, 4개 팀과는 3경기
-      (규칙적인 회전 매핑으로 결정)
-    - 다른 컨퍼런스: 2경기
-    - 홈/원정은 누적 홈 경기 수를 고려해 최대한 41/41에 가깝게 분배한다.
-    - 시즌 기간(SEASON_LENGTH_DAYS) 동안 날짜를 랜덤 배정하되
-      * 하루 최대 MAX_GAMES_PER_DAY 경기
-      * 한 팀은 하루에 최대 1경기
-    """
-    league = ensure_league_block()
+def build_master_schedule(league: Dict[str, Any], season_year: int) -> None:
+    """30개 팀 전체에 대한 마스터 스케줄(정규시즌)을 생성한다."""
     from league_repo import LeagueRepo
 
-    # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
-    # draft_year는 "드래프트 연도" (예: 2025-26 시즌이면 2026)
-    # 픽 생성/Stepien/7년 룰은 draft_year를 기준으로 맞추기 위해 미리 저장해 둔다.
     previous_season_year = league.get("season_year")
     league["season_year"] = season_year
     league["draft_year"] = season_year + 1
     _apply_cap_model_for_season(league, season_year)
 
-    # Stepien 룰은 (year, year+1) 쌍을 검사하기 때문에,
-    # lookahead=N이면 draft_year+N+1까지 "픽 데이터가 존재"해야 데이터 결측으로 인한 오판을 피할 수 있다.
     trade_rules = league.get("trade_rules") or {}
     try:
         max_pick_years_ahead = int(trade_rules.get("max_pick_years_ahead") or 7)
@@ -155,7 +121,6 @@ def _build_master_schedule(season_year: int) -> None:
     season_id = _season_id_from_year(season_year)
     phase = "regular"
 
-    # 팀별 컨퍼런스/디비전 정보 캐시
     team_info: Dict[str, Dict[str, Optional[str]]] = {}
     for tid in teams:
         info = TEAM_TO_CONF_DIV.get(tid, {"conference": None, "division": None})
@@ -164,7 +129,6 @@ def _build_master_schedule(season_year: int) -> None:
             "division": info.get("division"),
         }
 
-    # 컨퍼런스 내 다른 디비전 4경기 매칭을 결정하는 헬퍼 (5x5 회전 매핑)
     def _four_game_pairs_for_conf(conf_name: str) -> set[tuple[str, str]]:
         pairs: set[tuple[str, str]] = set()
         conf_divs = DIVISIONS.get(conf_name, {})
@@ -179,7 +143,7 @@ def _build_master_schedule(season_year: int) -> None:
                 if not a_div or not b_div:
                     continue
                 for idx, a_team in enumerate(a_div):
-                    for delta in range(3):  # 각 팀이 상대 디비전 팀 3명에게 4경기 배정
+                    for delta in range(3):
                         b_team = b_div[(idx + delta) % len(b_div)]
                         pair = tuple(sorted((a_team, b_team)))
                         pairs.add(pair)
@@ -189,7 +153,6 @@ def _build_master_schedule(season_year: int) -> None:
     four_game_pairs_west = _four_game_pairs_for_conf("West")
     four_game_pairs = four_game_pairs_east | four_game_pairs_west
 
-    # 1) 팀 쌍별로 경기 수 결정 + 홈/원정 분배
     pair_games: List[Dict[str, Any]] = []
     home_counts: Dict[str, int] = {tid: 0 for tid in teams}
 
@@ -206,15 +169,13 @@ def _build_master_schedule(season_year: int) -> None:
             if conf1 is None or conf2 is None:
                 num_games = 2
             elif conf1 != conf2:
-                num_games = 2  # 다른 컨퍼런스는 2경기 고정
+                num_games = 2
             elif div1 == div2:
-                num_games = 4  # 같은 디비전
+                num_games = 4
             else:
-                # 같은 컨퍼런스 다른 디비전
                 pair_key = tuple(sorted((t1, t2)))
                 num_games = 4 if pair_key in four_game_pairs else 3
 
-            # 홈/원정 분배 (3경기일 때는 현재 홈 수가 적은 팀에 추가 배정)
             home_for_t1 = num_games // 2
             home_for_t2 = num_games // 2
             if num_games % 2 == 1:
@@ -224,141 +185,70 @@ def _build_master_schedule(season_year: int) -> None:
                     home_for_t2 += 1
 
             for _ in range(home_for_t1):
-                pair_games.append({
-                    "home_team_id": t1,
-                    "away_team_id": t2,
-                })
+                pair_games.append({"home": t1, "away": t2})
+                home_counts[t1] += 1
             for _ in range(home_for_t2):
-                pair_games.append({
-                    "home_team_id": t2,
-                    "away_team_id": t1,
-                })
+                pair_games.append({"home": t2, "away": t1})
+                home_counts[t2] += 1
 
-            home_counts[t1] += home_for_t1
-            home_counts[t2] += home_for_t2
-
-    # 2) 날짜 배정
     random.shuffle(pair_games)
 
-    by_date: Dict[str, List[str]] = {}
-    teams_per_date: Dict[str, set] = {}
-    scheduled_games: List[Dict[str, Any]] = []
+    total_days = SEASON_LENGTH_DAYS
+    all_dates = [season_start + timedelta(days=i) for i in range(total_days)]
+    random.shuffle(all_dates)
 
-    for game in pair_games:
-        home_id = game["home_team_id"]
-        away_id = game["away_team_id"]
+    games: List[Dict[str, Any]] = []
+    day_game_counts: Dict[str, int] = {d.isoformat(): 0 for d in all_dates}
+    team_day_played: Dict[str, set[str]] = {tid: set() for tid in teams}
 
-        assigned = False
-        for _ in range(100):
-            day_index = random.randint(0, SEASON_LENGTH_DAYS - 1)
-            game_date = season_start + timedelta(days=day_index)
-            date_str = game_date.isoformat()
+    for idx, match in enumerate(pair_games):
+        home = match["home"]
+        away = match["away"]
 
-            teams_today = teams_per_date.setdefault(date_str, set())
-            games_today = by_date.setdefault(date_str, [])
-
-            if len(games_today) >= MAX_GAMES_PER_DAY:
+        for d in all_dates:
+            d_str = d.isoformat()
+            if day_game_counts[d_str] >= MAX_GAMES_PER_DAY:
                 continue
-            if home_id in teams_today or away_id in teams_today:
+            if d_str in team_day_played[home] or d_str in team_day_played[away]:
                 continue
-
-            teams_today.add(home_id)
-            teams_today.add(away_id)
-
-            game_id = f"{date_str}_{home_id}_{away_id}"
-            scheduled_games.append({
-                "game_id": game_id,
-                "date": date_str,
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "status": "scheduled",
-                "home_score": None,
-                "away_score": None,
-                "season_id": season_id,
-                "phase": phase,
-            })
-            games_today.append(game_id)
-            assigned = True
+            day_game_counts[d_str] += 1
+            team_day_played[home].add(d_str)
+            team_day_played[away].add(d_str)
+            games.append(
+                {
+                    "game_id": f"g{idx}",
+                    "date": d_str,
+                    "season_id": season_id,
+                    "phase": phase,
+                    "home_team_id": home,
+                    "away_team_id": away,
+                    "status": "scheduled",
+                    "home_score": None,
+                    "away_score": None,
+                }
+            )
             break
 
-        if not assigned:
-            day_index = random.randint(0, SEASON_LENGTH_DAYS - 1)
-            game_date = season_start + timedelta(days=day_index)
-            date_str = game_date.isoformat()
-            teams_today = teams_per_date.setdefault(date_str, set())
-            games_today = by_date.setdefault(date_str, [])
-            teams_today.add(home_id)
-            teams_today.add(away_id)
-            game_id = f"{date_str}_{home_id}_{away_id}"
-            scheduled_games.append({
-                "game_id": game_id,
-                "date": date_str,
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "status": "scheduled",
-                "home_score": None,
-                "away_score": None,
-                "season_id": season_id,
-                "phase": phase,
-            })
-            games_today.append(game_id)
-
-    # 3) by_team 인덱스 생성
     by_team: Dict[str, List[str]] = {tid: [] for tid in teams}
-    for g in scheduled_games:
+    by_date: Dict[str, List[str]] = {}
+    for g in games:
         by_team[g["home_team_id"]].append(g["game_id"])
         by_team[g["away_team_id"]].append(g["game_id"])
+        by_date.setdefault(g["date"], []).append(g["game_id"])
 
-    master_schedule = league["master_schedule"]
-    master_schedule["games"] = scheduled_games
+    master_schedule = league.setdefault("master_schedule", {})
+    master_schedule["games"] = games
     master_schedule["by_team"] = by_team
     master_schedule["by_date"] = by_date
-    master_schedule["by_id"] = {g["game_id"]: g for g in scheduled_games}
+    master_schedule["by_id"] = {g["game_id"]: g for g in games}
+    master_schedule.setdefault("version", 1)
 
-    league["season_year"] = season_year
-    league["draft_year"] = season_year + 1
-    league["season_start"] = season_start.isoformat()
-    trade_deadline_date = date(season_year + 1, 2, 5)
-    league["trade_rules"]["trade_deadline"] = trade_deadline_date.isoformat()
-    set_current_date(None)
-    league["last_gm_tick_date"] = None
-    try:
-        previous_season = int(previous_season_year or 0)
-    except (TypeError, ValueError):
-        previous_season = 0
-    try:
-        next_season = int(season_year or 0)
-    except (TypeError, ValueError):
-        next_season = 0
-    # 누적 스탯(정규시즌)은 시즌 단위로 끊는다.
-    # - 시즌이 바뀌면 기존 누적은 history로 보관하고, 새 시즌 누적을 새로 시작한다.
-    if previous_season and next_season and previous_season != next_season:
-        from contracts.offseason import process_offseason
-
-        process_offseason(GAME_STATE, previous_season, next_season)
-        _archive_and_reset_season_accumulators(_season_id_from_year(previous_season), _season_id_from_year(next_season))
-    else:
-        _ensure_active_season_id(_season_id_from_year(int(next_season or season_year)))
+    if previous_season_year and season_year != previous_season_year:
+        league["current_date"] = None
 
 
-def initialize_master_schedule_if_needed() -> None:
-    """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
-    if master_schedule.get("games"):
-        _ensure_master_schedule_indices()
-        return
-
-    # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
-    season_year = INITIAL_SEASON_YEAR
-    _build_master_schedule(season_year)
-    _ensure_master_schedule_indices()
-
-    # Schedule creation is the agreed contract-bootstrap checkpoint (once per season).
-    ensure_contracts_bootstrapped_after_schedule_creation_once()
-
-
-def _mark_master_schedule_game_final(
+def mark_master_schedule_game_final(
+    league: Dict[str, Any],
     game_id: str,
     game_date_str: str,
     home_id: str,
@@ -366,11 +256,9 @@ def _mark_master_schedule_game_final(
     home_score: int,
     away_score: int,
 ) -> None:
-    """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
-    league = ensure_league_block()
-    master_schedule = league.setdefault("master_schedule", {})
+    master_schedule = league.get("master_schedule") or {}
     games = master_schedule.get("games") or []
-    by_id = master_schedule.setdefault("by_id", {})
+    by_id = master_schedule.get("by_id")
     if not isinstance(by_id, dict):
         by_id = {}
         master_schedule["by_id"] = by_id
@@ -392,14 +280,7 @@ def _mark_master_schedule_game_final(
             return
 
 
-def get_schedule_summary() -> Dict[str, Any]:
-    """마스터 스케줄 통계 요약을 반환한다.
-
-    - 총 경기 수, 상태별 경기 수
-    - 팀별 총 경기 수(82 보장 여부)와 홈/원정 분배
-    """
-    initialize_master_schedule_if_needed()
-    league = ensure_league_block()
+def get_schedule_summary(league: Dict[str, Any]) -> Dict[str, Any]:
     master = league.get("master_schedule") or {}
     games = master.get("games") or []
     by_team = master.get("by_team") or {}
@@ -420,19 +301,13 @@ def get_schedule_summary() -> Dict[str, Any]:
         if away_id in home_away:
             home_away[away_id]["away"] += 1
 
-    team_breakdown: Dict[str, Dict[str, Any]] = {}
-    for tid in ALL_TEAM_IDS:
-        team_breakdown[tid] = {
-            "games": len(by_team.get(tid, [])),
-            "home": home_away.get(tid, {}).get("home", 0),
-            "away": home_away.get(tid, {}).get("away", 0),
-        }
-        team_breakdown[tid]["home_away_diff"] = (
-            team_breakdown[tid]["home"] - team_breakdown[tid]["away"]
-        )
+    team_game_counts = {
+        tid: len(by_team.get(tid, [])) for tid in ALL_TEAM_IDS
+    }
 
     return {
         "total_games": len(games),
         "status_counts": status_counts,
-        "teams": team_breakdown,
+        "team_game_counts": team_game_counts,
+        "home_away_counts": home_away,
     }
