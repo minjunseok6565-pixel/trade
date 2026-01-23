@@ -11,12 +11,14 @@ _STATE: Dict[str, Any] = create_default_game_state()
 validate_game_state(_STATE)
 
 
-def get_state() -> Dict[str, Any]:
+def _get_state() -> dict:
     return _STATE
 
 
-def reset_game_state() -> Dict[str, Any]:
-    _STATE.clear()
-    _STATE.update(create_default_game_state())
+def reset_state_for_dev() -> None:
+    global _STATE
+    _STATE = create_default_game_state()
     validate_game_state(_STATE)
-    return _STATE
+
+
+__all__ = ["reset_state_for_dev"]

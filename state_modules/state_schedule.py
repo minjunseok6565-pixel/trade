@@ -21,7 +21,6 @@ from .state_core import (
     _archive_and_reset_season_accumulators,
     _ensure_active_season_id,
     _season_id_from_year,
-    ensure_league_block,
     set_current_date,
 )
 from .state_constants import _ALLOWED_SCHEDULE_STATUSES
@@ -30,7 +29,11 @@ from .state_constants import _ALLOWED_SCHEDULE_STATUSES
 def _ensure_schedule_team(state: dict, team_id: str) -> Dict[str, Any]:
     """cached_views.schedule에 팀 엔트리가 없으면 생성."""
     schedule = state["cached_views"]["schedule"]
-    teams = schedule.setdefault("teams", {})
+    if not isinstance(schedule, dict):
+        raise ValueError("cached_views.schedule must be a dict")
+    teams = schedule["teams"]
+    if not isinstance(teams, dict):
+        raise ValueError("cached_views.schedule.teams must be a dict")
     if team_id not in teams:
         teams[team_id] = {
             "past_games": [],
@@ -94,8 +97,12 @@ def validate_master_schedule_entry(entry: Dict[str, Any], *, path: str = "master
 
 
 def _ensure_master_schedule_indices(state: dict) -> None:
-    league = ensure_league_block(state)
-    master_schedule = league.get("master_schedule") or {}
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
     games = master_schedule.get("games") or []
     # Contract check: master_schedule entries must satisfy the minimal schema.
     for i, g in enumerate(games):
@@ -121,7 +128,9 @@ def _build_master_schedule(state: dict, season_year: int) -> None:
       * 하루 최대 MAX_GAMES_PER_DAY 경기
       * 한 팀은 하루에 최대 1경기
     """
-    league = ensure_league_block(state)
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
     from league_repo import LeagueRepo
 
     # season_year는 "시즌 시작 연도" (예: 2025-26 시즌이면 2025)
@@ -254,8 +263,12 @@ def _build_master_schedule(state: dict, season_year: int) -> None:
             game_date = season_start + timedelta(days=day_index)
             date_str = game_date.isoformat()
 
-            teams_today = teams_per_date.setdefault(date_str, set())
-            games_today = by_date.setdefault(date_str, [])
+            if date_str not in teams_per_date:
+                teams_per_date[date_str] = set()
+            if date_str not in by_date:
+                by_date[date_str] = []
+            teams_today = teams_per_date[date_str]
+            games_today = by_date[date_str]
 
             if len(games_today) >= MAX_GAMES_PER_DAY:
                 continue
@@ -285,8 +298,12 @@ def _build_master_schedule(state: dict, season_year: int) -> None:
             day_index = random.randint(0, SEASON_LENGTH_DAYS - 1)
             game_date = season_start + timedelta(days=day_index)
             date_str = game_date.isoformat()
-            teams_today = teams_per_date.setdefault(date_str, set())
-            games_today = by_date.setdefault(date_str, [])
+            if date_str not in teams_per_date:
+                teams_per_date[date_str] = set()
+            if date_str not in by_date:
+                by_date[date_str] = []
+            teams_today = teams_per_date[date_str]
+            games_today = by_date[date_str]
             teams_today.add(home_id)
             teams_today.add(away_id)
             game_id = f"{date_str}_{home_id}_{away_id}"
@@ -349,8 +366,12 @@ def _build_master_schedule(state: dict, season_year: int) -> None:
 
 def initialize_master_schedule_if_needed(state: dict) -> None:
     """master_schedule이 비어 있으면 현재 연도를 기준으로 한 번 생성한다."""
-    league = ensure_league_block(state)
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
     master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
     if master_schedule.get("games"):
         _ensure_master_schedule_indices(state)
         from state_schema import validate_game_state
@@ -380,13 +401,16 @@ def _mark_master_schedule_game_final(
     away_score: int,
 ) -> None:
     """마스터 스케줄에 동일한 game_id가 있으면 결과를 반영한다."""
-    league = ensure_league_block(state)
-    master_schedule = league.setdefault("master_schedule", {})
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
     games = master_schedule.get("games") or []
-    by_id = master_schedule.setdefault("by_id", {})
+    by_id = master_schedule["by_id"]
     if not isinstance(by_id, dict):
-        by_id = {}
-        master_schedule["by_id"] = by_id
+        raise ValueError("master_schedule.by_id must be a dict")
     entry = by_id.get(game_id)
     if entry:
         entry["status"] = "final"
@@ -412,8 +436,12 @@ def get_schedule_summary(state: dict) -> Dict[str, Any]:
     - 팀별 총 경기 수(82 보장 여부)와 홈/원정 분배
     """
     initialize_master_schedule_if_needed(state)
-    league = ensure_league_block(state)
-    master = league.get("master_schedule") or {}
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    master = league["master_schedule"]
+    if not isinstance(master, dict):
+        raise ValueError("master_schedule must be a dict")
     games = master.get("games") or []
     by_team = master.get("by_team") or {}
 

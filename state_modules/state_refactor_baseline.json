@@ -78,19 +78,19 @@
     {
       "file": "news_ai.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_league_block": true
       },
       "line": 9,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block"
       ]
     },
     {
       "file": "playoffs.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "_accumulate_player_rows": true,
         "ensure_league_block": true,
         "ingest_game_result": true,
@@ -98,7 +98,7 @@
       },
       "line": 15,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "_accumulate_player_rows",
         "ensure_league_block",
         "ingest_game_result",
@@ -108,13 +108,13 @@
     {
       "file": "trades_ai.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_league_block": true,
         "get_current_date_as_date": true
       },
       "line": 10,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block",
         "get_current_date_as_date"
       ]
@@ -132,24 +132,24 @@
     {
       "file": "draft_runner.py",
       "importable": {
-        "GAME_STATE": true
+        "STATE": true
       },
       "line": 124,
       "symbols": [
-        "GAME_STATE"
+        "STATE"
       ]
     },
     {
       "file": "team_utils.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_cap_model_populated_if_needed": true,
         "ensure_league_block": true,
         "initialize_master_schedule_if_needed": true
       },
       "line": 8,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block",
         "ensure_cap_model_populated_if_needed",
         "initialize_master_schedule_if_needed"
@@ -158,29 +158,29 @@
     {
       "file": "stats_util.py",
       "importable": {
-        "GAME_STATE": true
+        "STATE": true
       },
       "line": 5,
       "symbols": [
-        "GAME_STATE"
+        "STATE"
       ]
     },
     {
       "file": "season_report_ai.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_league_block": true
       },
       "line": 9,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block"
       ]
     },
     {
       "file": "server.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_cap_model_populated_if_needed": true,
         "ensure_db_initialized_and_seeded": true,
         "ensure_ingest_turn_backfilled_once_startup": true,
@@ -195,7 +195,7 @@
       },
       "line": 17,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block",
         "ensure_db_initialized_and_seeded",
         "ensure_trade_state_keys",
@@ -212,47 +212,47 @@
     {
       "file": "trades/agreements.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "get_current_date_as_date": true
       },
       "line": 12,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "get_current_date_as_date"
       ]
     },
     {
       "file": "trades/apply.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "get_current_date_as_date": true
       },
       "line": 10,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "get_current_date_as_date"
       ]
     },
     {
       "file": "trades/validator.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "ensure_league_block": true
       },
       "line": 6,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "ensure_league_block"
       ]
     },
     {
       "file": "trades/negotiation_store.py",
       "importable": {
-        "GAME_STATE": true
+        "STATE": true
       },
       "line": 7,
       "symbols": [
-        "GAME_STATE"
+        "STATE"
       ]
     },
     {
@@ -270,13 +270,13 @@
     {
       "file": "tests/test_schedule.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "_build_master_schedule": true,
         "_ensure_league_state": false
       },
       "line": 6,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "_build_master_schedule",
         "_ensure_league_state"
       ]
@@ -300,13 +300,13 @@
     {
       "file": "scripts/trade_smoke_test.py",
       "importable": {
-        "GAME_STATE": true,
+        "STATE": true,
         "get_current_date_as_date": true,
         "initialize_master_schedule_if_needed": true
       },
       "line": 13,
       "symbols": [
-        "GAME_STATE",
+        "STATE",
         "initialize_master_schedule_if_needed",
         "get_current_date_as_date"
       ]
@@ -316,7 +316,7 @@
     "DEFAULT_TRADE_RULES": {
       "kind": "variable"
     },
-    "GAME_STATE": {
+    "STATE": {
       "kind": "variable"
     },
     "_ALLOWED_PHASES": {

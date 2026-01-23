@@ -4,20 +4,83 @@ from typing import Any, Dict
 
 from state_modules.state_constants import DEFAULT_TRADE_RULES, _DEFAULT_TRADE_MARKET, _DEFAULT_TRADE_MEMORY
 
-SCHEMA_VERSION = "3.0"
+STATE_SCHEMA_VERSION = "3.0"
+ALLOWED_PHASES = {"regular", "preseason", "play_in", "playoffs"}
+NON_REGULAR_PHASES = {"preseason", "play_in", "playoffs"}
+ALLOWED_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "turn",
+    "active_season_id",
+    "season_history",
+    "games",
+    "player_stats",
+    "team_stats",
+    "game_results",
+    "phase_results",
+    "cached_views",
+    "league",
+    "teams",
+    "players",
+    "trade_agreements",
+    "negotiations",
+    "asset_locks",
+    "trade_market",
+    "trade_memory",
+    "postseason",
+    "_migrations",
+}
+ALLOWED_PHASE_RESULTS_KEYS = {"games", "player_stats", "team_stats", "game_results"}
+ALLOWED_POSTSEASON_KEYS = {
+    "field",
+    "play_in",
+    "playoffs",
+    "champion",
+    "my_team_id",
+    "play_in_start_date",
+    "play_in_end_date",
+    "playoffs_start_date",
+}
+ALLOWED_LEAGUE_KEYS = {
+    "season_year",
+    "draft_year",
+    "season_start",
+    "current_date",
+    "db_path",
+    "master_schedule",
+    "trade_rules",
+    "last_gm_tick_date",
+}
+ALLOWED_MASTER_SCHEDULE_KEYS = {"games", "by_team", "by_date", "by_id"}
+ALLOWED_CACHED_VIEWS_KEYS = {"scores", "schedule", "stats", "weekly_news", "playoff_news", "_meta"}
+ALLOWED_CACHED_META_KEYS = {"scores", "schedule"}
+ALLOWED_META_SCORES_KEYS = {"built_from_turn", "season_id"}
+ALLOWED_META_SCHEDULE_KEYS = {"built_from_turn_by_team", "season_id"}
+ALLOWED_SCORES_VIEW_KEYS = {"latest_date", "games"}
+ALLOWED_SCHEDULE_VIEW_KEYS = {"teams"}
+ALLOWED_STATS_VIEW_KEYS = {"leaders"}
+ALLOWED_WEEKLY_NEWS_KEYS = {"last_generated_week_start", "items"}
+ALLOWED_PLAYOFF_NEWS_KEYS = {"series_game_counts", "items"}
+ALLOWED_SEASON_HISTORY_RECORD_KEYS = {"regular", "phase_results", "postseason", "archived_at_turn", "archived_at_date"}
+ALLOWED_MIGRATIONS_KEYS = {
+    "db_initialized",
+    "db_initialized_db_path",
+    "contracts_bootstrapped_seasons",
+    "repo_integrity_validated",
+    "repo_integrity_validated_db_path",
+    "ingest_turn_backfilled",
+}
 
 
 def create_default_game_state() -> Dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": STATE_SCHEMA_VERSION,
         "turn": 0,
+        "active_season_id": None,
+        "season_history": {},
         "games": [],  # 각 경기의 메타 데이터
         "player_stats": {},  # player_id -> 시즌 누적 스탯
         "team_stats": {},  # team_id -> 시즌 누적 팀 스탯(가공 팀 박스)
         "game_results": {},  # game_id -> 매치엔진 원본 결과(신규 엔진 기준)
-        "active_season_id": None,  # 현재 누적이 쌓이는 season_id (예: "2025-26")
-        "season_history": {},  # season_id -> {games, player_stats, team_stats, game_results}
-        "_migrations": {},
         "phase_results": {
             "preseason": {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}},
             "play_in": {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}},
@@ -53,7 +116,9 @@ def create_default_game_state() -> Dict[str, Any]:
             "playoffs": None,
             "champion": None,
             "my_team_id": None,
-            "playoff_player_stats": {},
+            "play_in_start_date": None,
+            "play_in_end_date": None,
+            "playoffs_start_date": None,
         },  # 플레이-인/플레이오프 시뮬레이션 결과 캐시
         "league": {
             "season_year": None,
@@ -77,6 +142,14 @@ def create_default_game_state() -> Dict[str, Any]:
         "asset_locks": {},  # asset_key -> {deal_id, expires_at}
         "trade_market": dict(_DEFAULT_TRADE_MARKET),
         "trade_memory": dict(_DEFAULT_TRADE_MEMORY),
+        "_migrations": {
+            "db_initialized": False,
+            "db_initialized_db_path": None,
+            "contracts_bootstrapped_seasons": {},
+            "repo_integrity_validated": False,
+            "repo_integrity_validated_db_path": None,
+            "ingest_turn_backfilled": False,
+        },
     }
 
 
@@ -94,16 +167,44 @@ def _require_nested_container(container: dict, path: str, expected_type: type, t
     return value
 
 
+def _require_exact_keys(container: dict, allowed_keys: set[str], label: str) -> None:
+    if set(container.keys()) != allowed_keys:
+        raise ValueError(f"GameState invalid: {label} keys must be {sorted(allowed_keys)}")
+
+
+def _validate_phase_results(container: dict, label: str) -> None:
+    _require_exact_keys(container, ALLOWED_PHASE_RESULTS_KEYS, label)
+    if not isinstance(container.get("games"), list):
+        raise ValueError(f"GameState invalid: {label}.games must be list")
+    if not isinstance(container.get("player_stats"), dict):
+        raise ValueError(f"GameState invalid: {label}.player_stats must be dict")
+    if not isinstance(container.get("team_stats"), dict):
+        raise ValueError(f"GameState invalid: {label}.team_stats must be dict")
+    if not isinstance(container.get("game_results"), dict):
+        raise ValueError(f"GameState invalid: {label}.game_results must be dict")
+
+
+def _validate_postseason_container(container: dict, label: str) -> None:
+    _require_exact_keys(container, ALLOWED_POSTSEASON_KEYS, label)
+    forbidden_keys = {"games", "player_stats", "team_stats", "game_results"}
+    for value in container.values():
+        if isinstance(value, dict) and any(key in value for key in forbidden_keys):
+            raise ValueError(f"GameState invalid: {label} must not contain results containers")
+
+
 def validate_game_state(state: dict) -> None:
     if not isinstance(state, dict):
         raise ValueError("GameState invalid: state must be a dict")
 
-    schema_version = state.get("schema_version")
-    if schema_version != SCHEMA_VERSION:
-        raise ValueError(f"GameState invalid: schema_version must be '{SCHEMA_VERSION}'")
+    _require_exact_keys(state, ALLOWED_TOP_LEVEL_KEYS, "top-level")
 
-    if not isinstance(state.get("turn"), int):
-        raise ValueError("GameState invalid: turn must be int")
+    schema_version = state.get("schema_version")
+    if schema_version != STATE_SCHEMA_VERSION:
+        raise ValueError(f"GameState invalid: schema_version must be '{STATE_SCHEMA_VERSION}'")
+
+    turn = state.get("turn")
+    if not isinstance(turn, int) or turn < 0:
+        raise ValueError("GameState invalid: turn must be int >= 0")
 
     _require_container(state, "games", list, "list")
     _require_container(state, "player_stats", dict, "dict")
@@ -114,7 +215,7 @@ def validate_game_state(state: dict) -> None:
     if active_season_id is not None and not isinstance(active_season_id, str):
         raise ValueError("GameState invalid: active_season_id must be str or None")
 
-    _require_container(state, "season_history", dict, "dict")
+    season_history = _require_container(state, "season_history", dict, "dict")
     phase_results = _require_container(state, "phase_results", dict, "dict")
     cached_views = _require_container(state, "cached_views", dict, "dict")
     postseason = _require_container(state, "postseason", dict, "dict")
@@ -126,54 +227,62 @@ def validate_game_state(state: dict) -> None:
     _require_container(state, "asset_locks", dict, "dict")
     _require_container(state, "trade_market", dict, "dict")
     _require_container(state, "trade_memory", dict, "dict")
+    migrations = _require_container(state, "_migrations", dict, "dict")
 
-    phase_keys = {"preseason", "play_in", "playoffs"}
-    if set(phase_results.keys()) != phase_keys:
-        raise ValueError("GameState invalid: phase_results must contain preseason, play_in, playoffs only")
-    required_result_keys = {"games", "player_stats", "team_stats", "game_results"}
-    for phase_key in phase_keys:
-        phase_container = phase_results.get(phase_key)
-        if not isinstance(phase_container, dict):
-            raise ValueError(f"GameState invalid: phase_results.{phase_key} must be dict")
-        if set(phase_container.keys()) != required_result_keys:
-            raise ValueError(
-                "GameState invalid: phase_results containers must contain games, player_stats, team_stats, game_results"
-            )
-        if not isinstance(phase_container.get("games"), list):
-            raise ValueError(f"GameState invalid: phase_results.{phase_key}.games must be list")
-        if not isinstance(phase_container.get("player_stats"), dict):
-            raise ValueError(f"GameState invalid: phase_results.{phase_key}.player_stats must be dict")
-        if not isinstance(phase_container.get("team_stats"), dict):
-            raise ValueError(f"GameState invalid: phase_results.{phase_key}.team_stats must be dict")
-        if not isinstance(phase_container.get("game_results"), dict):
-            raise ValueError(f"GameState invalid: phase_results.{phase_key}.game_results must be dict")
+    _require_exact_keys(phase_results, NON_REGULAR_PHASES, "phase_results")
+    for phase_key in NON_REGULAR_PHASES:
+        phase_container = _require_nested_container(phase_results, phase_key, dict, "dict")
+        _validate_phase_results(phase_container, f"phase_results.{phase_key}")
 
-    forbidden_postseason_keys = {"games", "player_stats", "team_stats", "game_results"}
-    if any(key in postseason for key in forbidden_postseason_keys):
-        raise ValueError("GameState invalid: postseason must not contain results containers")
+    _validate_postseason_container(postseason, "postseason")
 
+    _require_exact_keys(cached_views, ALLOWED_CACHED_VIEWS_KEYS, "cached_views")
     scores = _require_nested_container(cached_views, "scores", dict, "dict")
-    if "latest_date" not in scores:
-        raise ValueError("GameState invalid: cached_views.scores.latest_date is required")
-    scores_games = scores.get("games")
-    if not isinstance(scores_games, list):
+    _require_exact_keys(scores, ALLOWED_SCORES_VIEW_KEYS, "cached_views.scores")
+    if not isinstance(scores.get("games"), list):
         raise ValueError("GameState invalid: cached_views.scores.games must be list")
 
     schedule = _require_nested_container(cached_views, "schedule", dict, "dict")
-    schedule_teams = schedule.get("teams")
-    if not isinstance(schedule_teams, dict):
+    _require_exact_keys(schedule, ALLOWED_SCHEDULE_VIEW_KEYS, "cached_views.schedule")
+    if not isinstance(schedule.get("teams"), dict):
         raise ValueError("GameState invalid: cached_views.schedule.teams must be dict")
 
+    stats_view = _require_nested_container(cached_views, "stats", dict, "dict")
+    _require_exact_keys(stats_view, ALLOWED_STATS_VIEW_KEYS, "cached_views.stats")
+
+    weekly_news = _require_nested_container(cached_views, "weekly_news", dict, "dict")
+    _require_exact_keys(weekly_news, ALLOWED_WEEKLY_NEWS_KEYS, "cached_views.weekly_news")
+    if not isinstance(weekly_news.get("items"), list):
+        raise ValueError("GameState invalid: cached_views.weekly_news.items must be list")
+
+    playoff_news = _require_nested_container(cached_views, "playoff_news", dict, "dict")
+    _require_exact_keys(playoff_news, ALLOWED_PLAYOFF_NEWS_KEYS, "cached_views.playoff_news")
+    if not isinstance(playoff_news.get("series_game_counts"), dict):
+        raise ValueError("GameState invalid: cached_views.playoff_news.series_game_counts must be dict")
+    if not isinstance(playoff_news.get("items"), list):
+        raise ValueError("GameState invalid: cached_views.playoff_news.items must be list")
+
     meta = _require_nested_container(cached_views, "_meta", dict, "dict")
+    _require_exact_keys(meta, ALLOWED_CACHED_META_KEYS, "cached_views._meta")
     meta_scores = _require_nested_container(meta, "scores", dict, "dict")
+    _require_exact_keys(meta_scores, ALLOWED_META_SCORES_KEYS, "cached_views._meta.scores")
     if not isinstance(meta_scores.get("built_from_turn"), int):
         raise ValueError("GameState invalid: cached_views._meta.scores.built_from_turn must be int")
+    season_id = meta_scores.get("season_id")
+    if season_id is not None and not isinstance(season_id, str):
+        raise ValueError("GameState invalid: cached_views._meta.scores.season_id must be str or None")
     meta_schedule = _require_nested_container(meta, "schedule", dict, "dict")
+    _require_exact_keys(meta_schedule, ALLOWED_META_SCHEDULE_KEYS, "cached_views._meta.schedule")
     built_from_turn_by_team = meta_schedule.get("built_from_turn_by_team")
     if not isinstance(built_from_turn_by_team, dict):
         raise ValueError("GameState invalid: cached_views._meta.schedule.built_from_turn_by_team must be dict")
+    schedule_season_id = meta_schedule.get("season_id")
+    if schedule_season_id is not None and not isinstance(schedule_season_id, str):
+        raise ValueError("GameState invalid: cached_views._meta.schedule.season_id must be str or None")
 
+    _require_exact_keys(league, ALLOWED_LEAGUE_KEYS, "league")
     master_schedule = _require_nested_container(league, "master_schedule", dict, "dict")
+    _require_exact_keys(master_schedule, ALLOWED_MASTER_SCHEDULE_KEYS, "league.master_schedule")
     if not isinstance(master_schedule.get("games"), list):
         raise ValueError("GameState invalid: league.master_schedule.games must be list")
     if not isinstance(master_schedule.get("by_team"), dict):
@@ -182,3 +291,33 @@ def validate_game_state(state: dict) -> None:
         raise ValueError("GameState invalid: league.master_schedule.by_date must be dict")
     if not isinstance(master_schedule.get("by_id"), dict):
         raise ValueError("GameState invalid: league.master_schedule.by_id must be dict")
+
+    for season_id, record in season_history.items():
+        if not isinstance(season_id, str):
+            raise ValueError("GameState invalid: season_history keys must be str")
+        if not isinstance(record, dict):
+            raise ValueError("GameState invalid: season_history records must be dict")
+        _require_exact_keys(record, ALLOWED_SEASON_HISTORY_RECORD_KEYS, f"season_history.{season_id}")
+        regular = _require_nested_container(record, "regular", dict, "dict")
+        _validate_phase_results(regular, f"season_history.{season_id}.regular")
+        record_phase_results = _require_nested_container(record, "phase_results", dict, "dict")
+        _require_exact_keys(record_phase_results, NON_REGULAR_PHASES, f"season_history.{season_id}.phase_results")
+        for phase_key in NON_REGULAR_PHASES:
+            phase_container = _require_nested_container(record_phase_results, phase_key, dict, "dict")
+            _validate_phase_results(phase_container, f"season_history.{season_id}.phase_results.{phase_key}")
+        record_postseason = _require_nested_container(record, "postseason", dict, "dict")
+        _validate_postseason_container(record_postseason, f"season_history.{season_id}.postseason")
+        archived_at_turn = record.get("archived_at_turn")
+        if not isinstance(archived_at_turn, int):
+            raise ValueError("GameState invalid: season_history.archived_at_turn must be int")
+        archived_at_date = record.get("archived_at_date")
+        if archived_at_date is not None and not isinstance(archived_at_date, str):
+            raise ValueError("GameState invalid: season_history.archived_at_date must be str or None")
+
+    _require_exact_keys(migrations, ALLOWED_MIGRATIONS_KEYS, "_migrations")
+
+
+if __name__ == "__main__":
+    s = create_default_game_state()
+    validate_game_state(s)
+    print("OK")
