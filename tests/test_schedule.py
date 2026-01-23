@@ -3,27 +3,22 @@ import pytest
 pytest.importorskip("pandas")
 
 from config import ALL_TEAM_IDS
-from state import GAME_STATE, _build_master_schedule, _ensure_league_state
+from state import get_league_snapshot, initialize_master_schedule_if_needed, replace_state_snapshot
+from state_schema import create_default_state
 
 
-def _reset_schedule_state():
-    GAME_STATE["games"] = []
-    GAME_STATE["player_stats"] = {}
-    GAME_STATE["league"] = {
-        "master_schedule": {"games": [], "by_team": {}, "by_date": {}},
-        "trade_rules": {"trade_deadline": None},
-        "season_year": None,
-        "draft_year": None,
-        "season_start": None,
-        "current_date": None,
-        "last_gm_tick_date": None,
-    }
+def _reset_schedule_state(season_year: int) -> None:
+    state = create_default_state()
+    state["league"]["master_schedule"] = {"games": [], "by_team": {}, "by_date": {}, "by_id": {}, "version": 1}
+    state["league"]["trade_rules"] = {"trade_deadline": None}
+    state["league"]["season_year"] = season_year
+    replace_state_snapshot(state)
 
 
 def test_master_schedule_has_expected_game_counts():
-    _reset_schedule_state()
-    _build_master_schedule(2024)
-    league = _ensure_league_state()
+    _reset_schedule_state(2024)
+    initialize_master_schedule_if_needed()
+    league = get_league_snapshot()
     master = league["master_schedule"]
 
     assert len(master["games"]) == 1230
@@ -31,9 +26,9 @@ def test_master_schedule_has_expected_game_counts():
 
 
 def test_home_away_balance_is_evenly_split():
-    _reset_schedule_state()
-    _build_master_schedule(2024)
-    league = _ensure_league_state()
+    _reset_schedule_state(2024)
+    initialize_master_schedule_if_needed()
+    league = get_league_snapshot()
     games = league["master_schedule"]["games"]
 
     home_counts = {tid: 0 for tid in ALL_TEAM_IDS}

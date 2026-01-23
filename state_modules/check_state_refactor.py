@@ -14,12 +14,12 @@ def get_symbol_signature(symbol: Any) -> str:
     return str(inspect.signature(symbol))
 
 
-def build_game_state_schema(game_state: Dict[str, Any]) -> Dict[str, Any]:
-    keys = list(game_state.keys())
-    types = {key: type(game_state[key]).__name__ for key in keys}
+def build_game_state_schema(state_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    keys = list(state_snapshot.keys())
+    types = {key: type(state_snapshot[key]).__name__ for key in keys}
     nested_keys = {}
-    for key in ["league", "cached_views", "trade_market", "trade_memory", "_migrations", "postseason"]:
-        value = game_state.get(key)
+    for key in ["league", "cached_views", "trade_market", "trade_memory", "postseason"]:
+        value = state_snapshot.get(key)
         if isinstance(value, dict):
             nested_keys[key] = list(value.keys())
         else:
@@ -44,22 +44,22 @@ def compare_symbols(state_module: Any, baseline: Dict[str, Any]) -> List[str]:
 
 def compare_game_state_schema(state_module: Any, baseline: Dict[str, Any]) -> List[str]:
     errors = []
-    current = build_game_state_schema(state_module.GAME_STATE)
+    current = build_game_state_schema(state_module.export_state_snapshot())
     expected = baseline["game_state_schema"]
 
     if current["keys"] != expected["keys"]:
         errors.append(
-            "GAME_STATE keys/order mismatch: "
+            "state keys/order mismatch: "
             f"expected {expected['keys']}, got {current['keys']}"
         )
     if current["types"] != expected["types"]:
         errors.append(
-            "GAME_STATE types mismatch: "
+            "state types mismatch: "
             f"expected {expected['types']}, got {current['types']}"
         )
     if current["nested_keys"] != expected["nested_keys"]:
         errors.append(
-            "GAME_STATE nested keys mismatch: "
+            "state nested keys mismatch: "
             f"expected {expected['nested_keys']}, got {current['nested_keys']}"
         )
     return errors

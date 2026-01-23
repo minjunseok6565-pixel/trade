@@ -3,20 +3,15 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from state_cache import _ensure_cached_views_meta
-from state_core import ensure_league_block
-from state_migrations import _ensure_ingest_turn_backfilled
-from state_schedule import _ensure_master_schedule_indices, initialize_master_schedule_if_needed
-from state_store import GAME_STATE
+from state_cache import ensure_cached_views_meta
 
 
-def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
+def get_scores_view(state: dict, season_id: str, limit: int = 20) -> Dict[str, Any]:
     """Return cached or rebuilt scores view for the given season."""
-    _ensure_ingest_turn_backfilled()
-    cached = GAME_STATE.setdefault("cached_views", {})
+    cached = state.setdefault("cached_views", {})
     scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
-    meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    meta = ensure_cached_views_meta(state)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
         meta["scores"].get("built_from_turn") == current_turn
@@ -27,16 +22,17 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
         return {"latest_date": scores_view.get("latest_date"), "games": limited_games}
 
     games: List[Dict[str, Any]] = []
-    active_season_id = GAME_STATE.get("active_season_id")
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(active_season_id) == str(season_id):
-        games.extend(GAME_STATE.get("games") or [])
+        games.extend(state.get("games") or [])
     else:
-        history = GAME_STATE.get("season_history") or {}
+        history = state.get("season_history") or {}
         season_history = history.get(str(season_id)) or {}
-        games.extend(season_history.get("games") or [])
+        regular = season_history.get("regular") or {}
+        games.extend(regular.get("games") or [])
 
-    postseason = GAME_STATE.get("postseason") or {}
-    for container in postseason.values():
+    phase_results = state.get("phase_results") or {}
+    for container in phase_results.values():
         if not isinstance(container, dict):
             continue
         for game_obj in container.get("games") or []:
@@ -62,31 +58,29 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
 
 
 def get_team_schedule_view(
+    state: dict,
+    league: dict,
     team_id: str,
     season_id: str,
     today: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return cached or rebuilt schedule view for a team."""
-    active_season_id = GAME_STATE.get("active_season_id")
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(season_id) != str(active_season_id):
         return {"past_games": [], "upcoming_games": []}
 
-    initialize_master_schedule_if_needed()
-    _ensure_master_schedule_indices()
-    league = ensure_league_block()
     master_schedule = league.get("master_schedule") or {}
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
 
-    cached = GAME_STATE.setdefault("cached_views", {})
+    cached = state.setdefault("cached_views", {})
     schedule = cached.setdefault("schedule", {})
     teams_cache = schedule.setdefault("teams", {})
-    meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    meta = ensure_cached_views_meta(state)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
-        meta["schedule"].get("season_id") == season_id
-        and meta["schedule"].get("built_from_turn_by_team", {}).get(team_id) == current_turn
+        meta["schedule"].get("built_from_turn_by_team", {}).get(team_id) == current_turn
         and team_id in teams_cache
     ):
         return teams_cache[team_id]
@@ -148,5 +142,4 @@ def get_team_schedule_view(
 
     teams_cache[team_id] = {"past_games": past_games, "upcoming_games": upcoming_games}
     meta["schedule"]["built_from_turn_by_team"][team_id] = current_turn
-    meta["schedule"]["season_id"] = season_id
     return teams_cache[team_id]
