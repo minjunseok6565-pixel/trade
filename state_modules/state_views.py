@@ -4,16 +4,13 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from .state_cache import _ensure_cached_views_meta
-from .state_core import ensure_league_block
-from .state_migrations import _ensure_ingest_turn_backfilled
 from .state_schedule import _ensure_master_schedule_indices, initialize_master_schedule_if_needed
 
 
 def get_scores_view(state: dict, season_id: str, limit: int = 20) -> Dict[str, Any]:
     """Return cached or rebuilt scores view for the given season."""
-    _ensure_ingest_turn_backfilled(state)
-    cached = state.setdefault("cached_views", {})
-    scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
+    cached = state["cached_views"]
+    scores_view = cached["scores"]
     meta = _ensure_cached_views_meta(state)
     current_turn = int(state.get("turn", 0) or 0)
 
@@ -28,11 +25,11 @@ def get_scores_view(state: dict, season_id: str, limit: int = 20) -> Dict[str, A
     games: List[Dict[str, Any]] = []
     active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(active_season_id) == str(season_id):
-        games.extend(state.get("games") or [])
-        phase_results = state.get("phase_results") or {}
+        games.extend(state["games"])
+        phase_results = state["phase_results"]
         for phase in ("preseason", "play_in", "playoffs"):
-            phase_container = phase_results.get(phase) or {}
-            games.extend(phase_container.get("games") or [])
+            phase_container = phase_results[phase]
+            games.extend(phase_container["games"])
     else:
         history = state.get("season_history") or {}
         season_history = history.get(str(season_id)) or {}
@@ -74,14 +71,18 @@ def get_team_schedule_view(
 
     initialize_master_schedule_if_needed(state)
     _ensure_master_schedule_indices(state)
-    league = ensure_league_block(state)
-    master_schedule = league.get("master_schedule") or {}
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
 
-    cached = state.setdefault("cached_views", {})
-    schedule = cached.setdefault("schedule", {})
-    teams_cache = schedule.setdefault("teams", {})
+    cached = state["cached_views"]
+    schedule = cached["schedule"]
+    teams_cache = schedule["teams"]
     meta = _ensure_cached_views_meta(state)
     current_turn = int(state.get("turn", 0) or 0)
 

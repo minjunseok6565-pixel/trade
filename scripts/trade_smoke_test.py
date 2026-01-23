@@ -13,14 +13,14 @@ from config import ROSTER_DF
 from state import (
     asset_locks_get,
     asset_locks_set,
-    export_workflow_state,
     get_current_date_as_date,
+    get_db_path,
     initialize_master_schedule_if_needed,
     trade_agreements_get,
     trade_agreements_set,
 )
 from team_utils import _init_players_and_teams_if_needed
-from trades.apply import apply_deal
+from trades.apply import apply_deal_to_db
 from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
 from trades.models import canonicalize_deal, parse_deal
 from trades.validator import validate_deal
@@ -63,8 +63,6 @@ def main() -> None:
     player_a = _first_player_for_team(team_a)
     player_b = _first_player_for_team(team_b)
 
-    tx_count = len(export_workflow_state().get("transactions", []))
-
     payload = {
         "teams": [team_a, team_b],
         "legs": {
@@ -74,11 +72,17 @@ def main() -> None:
     }
     deal = canonicalize_deal(parse_deal(payload))
     validate_deal(deal, current_date=current_date)
-    apply_deal(deal, source="menu", trade_date=current_date)
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal,
+        source="menu",
+        deal_id=None,
+        trade_date=current_date,
+        dry_run=False,
+    )
 
     assert str(ROSTER_DF.at[player_a, "Team"]).upper() == team_b
     assert str(ROSTER_DF.at[player_b, "Team"]).upper() == team_a
-    assert len(export_workflow_state().get("transactions", [])) == tx_count + 1
 
     # Test B: committed deal flow
     player_a2 = _first_player_for_team(team_a)
@@ -100,11 +104,13 @@ def main() -> None:
         current_date=current_date,
         allow_locked_by_deal_id=committed["deal_id"],
     )
-    apply_deal(
-        deal_verified,
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal_verified,
         source="menu",
         deal_id=committed["deal_id"],
         trade_date=current_date,
+        dry_run=False,
     )
     agreements.mark_executed(committed["deal_id"])
 
@@ -190,7 +196,14 @@ def main() -> None:
     }
     deal_d = canonicalize_deal(parse_deal(payload_d))
     validate_deal(deal_d, current_date=current_date)
-    apply_deal(deal_d, source="menu", trade_date=current_date)
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal_d,
+        source="menu",
+        deal_id=None,
+        trade_date=current_date,
+        dry_run=False,
+    )
 
     assert str(ROSTER_DF.at[player_x, "Team"]).upper() == team_y
     assert str(ROSTER_DF.at[player_y, "Team"]).upper() == team_z

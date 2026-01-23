@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 from datetime import date
 from typing import Any, Dict, Optional
 
 from schema import season_id_from_year as _schema_season_id_from_year
 from .state_cache import _reset_cached_views_for_new_season
-from .state_constants import DEFAULT_TRADE_RULES
 from .state_trade import _ensure_trade_state
 
 
@@ -15,34 +13,20 @@ def ensure_league_block(state: dict) -> Dict[str, Any]:
 
     This is intentionally *in-memory only*: no DB init, no roster seeding, no integrity checks.
     """
-    league = state.setdefault("league", {})
-    master_schedule = league.setdefault("master_schedule", {})
-    master_schedule.setdefault("games", [])
-    master_schedule.setdefault("by_team", {})
-    master_schedule.setdefault("by_date", {})
-    master_schedule.setdefault("by_id", {})
-
-    trade_rules = league.setdefault("trade_rules", {})
-    if not isinstance(trade_rules, dict):
-        trade_rules = {}
-        league["trade_rules"] = trade_rules
-    for key, value in DEFAULT_TRADE_RULES.items():
-        trade_rules.setdefault(key, value)
-
-    league.setdefault("season_year", None)
-    league.setdefault("draft_year", None)
-    league.setdefault("season_start", None)
-    league.setdefault("current_date", None)
-    league.setdefault("last_gm_tick_date", None)
-
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
-    league["db_path"] = db_path
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("League block must be a dict")
+    master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("League master_schedule must be a dict")
     return league
 
 
 def get_current_date(state: dict) -> Optional[str]:
     """Return the league's current in-game date (SSOT: state['league']['current_date'])."""
-    league = ensure_league_block(state)
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("League block must be a dict")
     current = league.get("current_date")
     if current:
         return current
@@ -58,7 +42,9 @@ def get_current_date_as_date(state: dict) -> date:
         except ValueError:
             pass
 
-    league = ensure_league_block(state)
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("League block must be a dict")
     season_start = league.get("season_start")
     if season_start:
         try:
@@ -71,7 +57,9 @@ def get_current_date_as_date(state: dict) -> date:
 
 def set_current_date(state: dict, date_str: Optional[str]) -> None:
     """Update the league's current date (SSOT: state['league']['current_date'])."""
-    league = ensure_league_block(state)
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("League block must be a dict")
     league["current_date"] = date_str
 
 
@@ -87,7 +75,9 @@ def _archive_and_reset_season_accumulators(
 ) -> None:
     """시즌이 바뀔 때 정규시즌 누적 데이터를 history로 옮기고 초기화한다."""
     if previous_season_id:
-        history = state.setdefault("season_history", {})
+        history = state["season_history"]
+        if not isinstance(history, dict):
+            raise ValueError("season_history must be a dict")
         history[str(previous_season_id)] = {
             "regular": {
                 "games": list(state.get("games", [])),
@@ -151,5 +141,12 @@ def _get_phase_container(state: dict, phase: str) -> Dict[str, Any]:
     """phase별 누적 컨테이너를 반환한다."""
     if phase == "regular":
         return state
-    phase_results = state.setdefault("phase_results", {})
-    return phase_results.setdefault(phase, {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}})
+    phase_results = state["phase_results"]
+    if not isinstance(phase_results, dict):
+        raise ValueError("phase_results must be a dict")
+    if phase not in phase_results:
+        raise ValueError(f"phase_results missing phase '{phase}'")
+    phase_container = phase_results[phase]
+    if not isinstance(phase_container, dict):
+        raise ValueError(f"phase_results.{phase} must be a dict")
+    return phase_container

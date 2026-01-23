@@ -3,11 +3,11 @@ import pytest
 pytest.importorskip("pandas")
 
 from config import ALL_TEAM_IDS
-from state import export_workflow_state, initialize_master_schedule_if_needed, reset_game_state
+from state import export_workflow_state, initialize_master_schedule_if_needed, reset_state_for_dev
 
 
 def _reset_schedule_state():
-    reset_game_state()
+    reset_state_for_dev()
 
 
 def test_master_schedule_has_expected_game_counts():

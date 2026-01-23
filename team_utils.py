@@ -6,9 +6,10 @@ from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
 from state import (
-    ensure_league_block,
     ensure_cap_model_populated_if_needed,
-    export_workflow_state,
+    export_full_state_snapshot,
+    get_db_path,
+    get_league_context_snapshot,
     initialize_master_schedule_if_needed,
     players_get,
     players_set,
@@ -34,8 +35,7 @@ def _repo_ctx() -> "LeagueRepo":
     if LeagueRepo is None:
         raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
 
-    league = export_workflow_state().get("league", {})
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH", "league.db")
+    db_path = os.environ.get("LEAGUE_DB_PATH", get_db_path())
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -182,8 +182,8 @@ def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
     # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
     ensure_cap_model_populated_if_needed()
-    league = ensure_league_block()
-    trade_rules = league.get("trade_rules", {})
+    league_context = get_league_context_snapshot()
+    trade_rules = league_context.get("trade_rules", {})
     try:
         salary_cap = float(trade_rules.get("salary_cap") or 0.0)
     except Exception:
@@ -194,8 +194,8 @@ def _compute_cap_space(team_id: str) -> float:
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
+    league = export_full_state_snapshot().get("league", {})
+    master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
     team_ids = _list_active_team_ids()

@@ -9,14 +9,8 @@ from uuid import uuid4
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import (
-    asset_locks_get,
-    asset_locks_set,
-    export_workflow_state,
-    get_current_date_as_date,
-    trade_agreements_get,
-    trade_agreements_set,
-)
+import state
+from state import asset_locks_get, asset_locks_set, get_current_date_as_date, trade_agreements_get, trade_agreements_set
 
 from .errors import (
     TradeError,
@@ -52,8 +46,7 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
 def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    league = export_workflow_state().get("league", {})
-    db_path = league.get("db_path") if isinstance(league, dict) else None
+    db_path = state.get_db_path()
     if not db_path:
         raise ValueError("db_path is required to compute trade agreement hash")
 
