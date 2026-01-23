@@ -10,7 +10,15 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 from config import ROSTER_DF
-from state import GAME_STATE, initialize_master_schedule_if_needed, get_current_date_as_date
+from state import (
+    get_current_date_as_date,
+    get_db_path,
+    initialize_master_schedule_if_needed,
+    set_db_path,
+    trade_get_agreement,
+    trade_get_asset_locks,
+    trade_update_agreement_status,
+)
 from team_utils import _init_players_and_teams_if_needed
 from trades.apply import apply_deal
 from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
@@ -55,7 +63,13 @@ def main() -> None:
     player_a = _first_player_for_team(team_a)
     player_b = _first_player_for_team(team_b)
 
-    tx_count = len(GAME_STATE.get("transactions", []))
+    db_path = get_db_path() or os.environ.get("LEAGUE_DB_PATH", "league.db")
+    if not get_db_path():
+        set_db_path(db_path)
+    from league_repo import LeagueRepo
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        tx_count = len(repo.list_transactions(limit=500))
 
     payload = {
         "teams": [team_a, team_b],
@@ -70,7 +84,9 @@ def main() -> None:
 
     assert str(ROSTER_DF.at[player_a, "Team"]).upper() == team_b
     assert str(ROSTER_DF.at[player_b, "Team"]).upper() == team_a
-    assert len(GAME_STATE.get("transactions", [])) == tx_count + 1
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        assert len(repo.list_transactions(limit=500)) == tx_count + 1
 
     # Test B: committed deal flow
     player_a2 = _first_player_for_team(team_a)
@@ -103,7 +119,7 @@ def main() -> None:
     for assets in deal_verified.legs.values():
         for asset in assets:
             lock_key = f"{asset.kind}:{getattr(asset, 'player_id', getattr(asset, 'pick_id', ''))}"
-            assert lock_key not in GAME_STATE.get("asset_locks", {})
+            assert lock_key not in trade_get_asset_locks()
 
     # Test C: lock conflict
     player_c = _first_player_for_team(team_a)
@@ -124,9 +140,9 @@ def main() -> None:
         assert exc.code == ASSET_LOCKED
 
     agreements.release_locks_for_deal(committed_c["deal_id"])
-    entry = GAME_STATE.get("trade_agreements", {}).get(committed_c["deal_id"])
+    entry = trade_get_agreement(committed_c["deal_id"])
     if entry:
-        entry["status"] = "INVALIDATED"
+        trade_update_agreement_status(committed_c["deal_id"], "INVALIDATED")
 
     # Test C2: duplicate asset validation
     payload_dup = {
@@ -151,9 +167,11 @@ def main() -> None:
         deal_c, current_date=current_date
     )
     asset_lock_key = f"player:{player_c}"
-    lock = GAME_STATE.get("asset_locks", {}).get(asset_lock_key)
+    lock = trade_get_asset_locks().get(asset_lock_key)
     if lock:
         lock["expires_at"] = (get_current_date_as_date() - timedelta(days=1)).isoformat()
+        from state import trade_set_asset_lock
+        trade_set_asset_lock(asset_lock_key, lock)
     try:
         validate_deal(deal_c, current_date=current_date)
     except TradeError as exc:
@@ -183,10 +201,11 @@ def main() -> None:
     assert str(ROSTER_DF.at[player_z, "Team"]).upper() == team_x
 
     # Test E: pick ownership in committed deal hash
-    picks = GAME_STATE.get("draft_picks", {})
-    pick_candidates = [
-        pick for pick in picks.values() if pick.get("owner_team") == team_a
-    ]
+    with LeagueRepo(db_path) as repo:
+        repo.init_db()
+        trade_assets_snapshot = repo.get_trade_assets_snapshot() or {}
+    picks = trade_assets_snapshot.get("draft_picks") or {}
+    pick_candidates = [pick for pick in picks.values() if pick.get("owner_team") == team_a]
     if pick_candidates:
         pick_id = pick_candidates[0]["pick_id"]
         payload_pick = {

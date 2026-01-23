@@ -15,10 +15,12 @@ from matchengine_v2_adapter import (
 )
 from matchengine_v3.sim_game import simulate_game
 from state import (
-    ensure_league_block,
+    get_db_path,
+    get_league_snapshot,
     ingest_game_result,
     initialize_master_schedule_if_needed,
     set_current_date,
+    set_db_path,
 )
 from trades_ai import _run_ai_gm_tick_if_needed
 from sim.roster_adapter import build_team_state_from_db
@@ -26,8 +28,9 @@ from sim.roster_adapter import build_team_state_from_db
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    league = ensure_league_block()
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = get_db_path() or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    if not get_db_path():
+        set_db_path(db_path)
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -65,7 +68,7 @@ def advance_league_until(
     user_team_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
+    league = get_league_snapshot()
     master_schedule = league["master_schedule"]
     by_date: Dict[str, List[str]] = master_schedule.get("by_date") or {}
     games: List[Dict[str, Any]] = master_schedule.get("games") or []
@@ -144,7 +147,7 @@ def simulate_single_game(
     home_tactics: Optional[Dict[str, Any]] = None,
     away_tactics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    league = ensure_league_block()
+    league = get_league_snapshot()
     game_date_str = game_date or date.today().isoformat()
     game_id = f"single_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
 
