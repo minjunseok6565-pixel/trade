@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from state_cache import _mark_views_dirty
-from state_core import _ensure_active_season_id, _get_phase_container
-from state_schedule import _mark_master_schedule_game_final
-from state_store import GAME_STATE, _ALLOWED_PHASES, _META_PLAYER_KEYS
-from state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
+from .state_cache import _mark_views_dirty
+from .state_core import _ensure_active_season_id
+from .state_schedule import _mark_master_schedule_game_final
+from .state_constants import _ALLOWED_PHASES, _META_PLAYER_KEYS
+from .state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
+from state_schema import validate_game_state
 
 
 def _validate_game_result_v2(game_result: Dict[str, Any]) -> None:
@@ -133,20 +134,21 @@ def _accumulate_team_game_result(
 
 
 def ingest_game_result(
+    state: dict,
     *,
     game_result: Dict[str, Any],
     game_date: Optional[str] = None,
     store_raw_result: bool = True,
 ) -> Dict[str, Any]:
-    """정식 GameResultV2 스키마 결과를 GAME_STATE에 반영한다."""
+    """정식 GameResultV2 스키마 결과를 상태에 반영한다."""
     validate_v2_game_result(game_result)
 
     game = _require_dict(game_result["game"], "game")
     season_id = str(game["season_id"])
     phase = str(game["phase"])
 
-    _ensure_active_season_id(season_id)
-    container = _get_phase_container(phase)
+    _ensure_active_season_id(state, season_id)
+    container = _get_results_container_for_phase(state, phase)
 
     home_id = str(game["home_team_id"])
     away_id = str(game["away_team_id"])
@@ -172,8 +174,8 @@ def ingest_game_result(
         "schema_version": "2.0",
     }
 
-    GAME_STATE["turn"] = int(GAME_STATE.get("turn", 0) or 0) + 1
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    state["turn"] = int(state.get("turn", 0) or 0) + 1
+    current_turn = int(state.get("turn", 0) or 0)
     game_obj["ingest_turn"] = current_turn
     container.setdefault("games", []).append(game_obj)
 
@@ -191,6 +193,7 @@ def ingest_game_result(
         _accumulate_player_rows(rows, season_player_stats)
 
     _mark_master_schedule_game_final(
+        state,
         game_id=game_id,
         game_date_str=game_date_str,
         home_id=home_id,
@@ -198,6 +201,15 @@ def ingest_game_result(
         home_score=home_score,
         away_score=away_score,
     )
-    _mark_views_dirty()
+    _mark_views_dirty(state)
+    validate_game_state(state)
 
     return game_obj
+
+
+def _get_results_container_for_phase(state: dict, phase: str) -> dict:
+    if not phase or phase == "regular":
+        return state
+    if phase in ("preseason", "play_in", "playoffs"):
+        return state["phase_results"][phase]
+    raise ValueError(f"invalid phase: {phase}")

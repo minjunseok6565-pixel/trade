@@ -135,13 +135,14 @@ def build_trade_context(
         "acquired_date": "1900-01-01",
         "acquired_via_trade": False,
     }
-    players = state_module.GAME_STATE.get("players")
+    players = state_module.players_get()
     if isinstance(players, dict):
         for player in players.values():
             if not isinstance(player, dict):
                 continue
             for key, value in player_meta_defaults.items():
                 player.setdefault(key, value)
+        state_module.players_set(players)
 
     if current_date is None:
         get_current_date_as_date = getattr(state_module, "get_current_date_as_date", None)
@@ -170,7 +171,7 @@ def build_trade_context(
 
     resolved_db_path = db_path
     if resolved_db_path is None:
-        league = state_module.GAME_STATE.get("league", {})
+        league = state_module.export_workflow_state().get("league", {})
         if isinstance(league, dict):
             resolved_db_path = league.get("db_path")
     if not resolved_db_path:
@@ -180,7 +181,7 @@ def build_trade_context(
     repo.init_db()
 
     return TradeContext(
-        game_state=state_module.GAME_STATE,
+        game_state=state_module.export_workflow_state(),
         repo=repo,
         db_path=resolved_db_path,
         current_date=current_date,

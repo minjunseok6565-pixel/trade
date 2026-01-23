@@ -5,17 +5,17 @@ from datetime import date
 from typing import Any, Dict, Optional
 
 from schema import season_id_from_year as _schema_season_id_from_year
-from state_cache import _reset_cached_views_for_new_season
-from state_store import DEFAULT_TRADE_RULES, GAME_STATE
-from state_trade import _ensure_trade_state
+from .state_cache import _reset_cached_views_for_new_season
+from .state_constants import DEFAULT_TRADE_RULES
+from .state_trade import _ensure_trade_state
 
 
-def ensure_league_block() -> Dict[str, Any]:
+def ensure_league_block(state: dict) -> Dict[str, Any]:
     """Ensure the minimal in-memory league scaffold exists.
 
     This is intentionally *in-memory only*: no DB init, no roster seeding, no integrity checks.
     """
-    league = GAME_STATE.setdefault("league", {})
+    league = state.setdefault("league", {})
     master_schedule = league.setdefault("master_schedule", {})
     master_schedule.setdefault("games", [])
     master_schedule.setdefault("by_team", {})
@@ -40,25 +40,25 @@ def ensure_league_block() -> Dict[str, Any]:
     return league
 
 
-def get_current_date() -> Optional[str]:
-    """Return the league's current in-game date (SSOT: GAME_STATE['league']['current_date'])."""
-    league = ensure_league_block()
+def get_current_date(state: dict) -> Optional[str]:
+    """Return the league's current in-game date (SSOT: state['league']['current_date'])."""
+    league = ensure_league_block(state)
     current = league.get("current_date")
     if current:
         return current
     return None
 
 
-def get_current_date_as_date() -> date:
+def get_current_date_as_date(state: dict) -> date:
     """Return the league's current in-game date as a date object."""
-    current = get_current_date()
+    current = get_current_date(state)
     if current:
         try:
             return date.fromisoformat(str(current))
         except ValueError:
             pass
 
-    league = ensure_league_block()
+    league = ensure_league_block(state)
     season_start = league.get("season_start")
     if season_start:
         try:
@@ -69,9 +69,9 @@ def get_current_date_as_date() -> date:
     return date.today()
 
 
-def set_current_date(date_str: Optional[str]) -> None:
-    """Update the league's current date (SSOT: GAME_STATE['league']['current_date'])."""
-    league = ensure_league_block()
+def set_current_date(state: dict, date_str: Optional[str]) -> None:
+    """Update the league's current date (SSOT: state['league']['current_date'])."""
+    league = ensure_league_block(state)
     league["current_date"] = date_str
 
 
@@ -81,46 +81,75 @@ def _season_id_from_year(season_year: int) -> str:
 
 
 def _archive_and_reset_season_accumulators(
+    state: dict,
     previous_season_id: Optional[str],
     next_season_id: Optional[str],
 ) -> None:
     """시즌이 바뀔 때 정규시즌 누적 데이터를 history로 옮기고 초기화한다."""
     if previous_season_id:
-        history = GAME_STATE.setdefault("season_history", {})
+        history = state.setdefault("season_history", {})
         history[str(previous_season_id)] = {
-            "games": GAME_STATE.get("games", []),
-            "player_stats": GAME_STATE.get("player_stats", {}),
-            "team_stats": GAME_STATE.get("team_stats", {}),
-            "game_results": GAME_STATE.get("game_results", {}),
+            "regular": {
+                "games": list(state.get("games", [])),
+                "player_stats": dict(state.get("player_stats", {})),
+                "team_stats": dict(state.get("team_stats", {})),
+                "game_results": dict(state.get("game_results", {})),
+            },
+            "phase_results": {
+                "preseason": {
+                    "games": list(state.get("phase_results", {}).get("preseason", {}).get("games", [])),
+                    "player_stats": dict(state.get("phase_results", {}).get("preseason", {}).get("player_stats", {})),
+                    "team_stats": dict(state.get("phase_results", {}).get("preseason", {}).get("team_stats", {})),
+                    "game_results": dict(state.get("phase_results", {}).get("preseason", {}).get("game_results", {})),
+                },
+                "play_in": {
+                    "games": list(state.get("phase_results", {}).get("play_in", {}).get("games", [])),
+                    "player_stats": dict(state.get("phase_results", {}).get("play_in", {}).get("player_stats", {})),
+                    "team_stats": dict(state.get("phase_results", {}).get("play_in", {}).get("team_stats", {})),
+                    "game_results": dict(state.get("phase_results", {}).get("play_in", {}).get("game_results", {})),
+                },
+                "playoffs": {
+                    "games": list(state.get("phase_results", {}).get("playoffs", {}).get("games", [])),
+                    "player_stats": dict(state.get("phase_results", {}).get("playoffs", {}).get("player_stats", {})),
+                    "team_stats": dict(state.get("phase_results", {}).get("playoffs", {}).get("team_stats", {})),
+                    "game_results": dict(state.get("phase_results", {}).get("playoffs", {}).get("game_results", {})),
+                },
+            },
         }
 
-    GAME_STATE["games"] = []
-    GAME_STATE["player_stats"] = {}
-    GAME_STATE["team_stats"] = {}
-    GAME_STATE["game_results"] = {}
-    GAME_STATE["postseason"] = {}
+    state["games"] = []
+    state["player_stats"] = {}
+    state["team_stats"] = {}
+    state["game_results"] = {}
+    state["phase_results"] = {
+        "preseason": {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}},
+        "play_in": {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}},
+        "playoffs": {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}},
+    }
 
-    GAME_STATE["active_season_id"] = next_season_id
-    _reset_cached_views_for_new_season()
-    _ensure_trade_state()
+    state["active_season_id"] = next_season_id
+    _reset_cached_views_for_new_season(state)
+    _ensure_trade_state(state)
+    from state_schema import validate_game_state
+    validate_game_state(state)
 
 
-def _ensure_active_season_id(season_id: str) -> None:
+def _ensure_active_season_id(state: dict, season_id: str) -> None:
     """리그 시즌과 누적 시즌이 불일치하면 새 시즌 누적으로 전환한다."""
     if not season_id:
         return
-    active = GAME_STATE.get("active_season_id")
+    active = state.get("active_season_id")
     if active is None:
-        GAME_STATE["active_season_id"] = str(season_id)
-        _ensure_trade_state()
+        state["active_season_id"] = str(season_id)
+        _ensure_trade_state(state)
         return
     if str(active) != str(season_id):
-        _archive_and_reset_season_accumulators(str(active), str(season_id))
+        _archive_and_reset_season_accumulators(state, str(active), str(season_id))
 
 
-def _get_phase_container(phase: str) -> Dict[str, Any]:
+def _get_phase_container(state: dict, phase: str) -> Dict[str, Any]:
     """phase별 누적 컨테이너를 반환한다."""
     if phase == "regular":
-        return GAME_STATE
-    postseason = GAME_STATE.setdefault("postseason", {})
-    return postseason.setdefault(phase, {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}})
+        return state
+    phase_results = state.setdefault("phase_results", {})
+    return phase_results.setdefault(phase, {"games": [], "player_stats": {}, "team_stats": {}, "game_results": {}})

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
 from team_utils import _init_players_and_teams_if_needed
-from state import GAME_STATE, get_current_date_as_date
+from state import export_workflow_state, get_current_date_as_date, players_get, players_set
 
 from .errors import (
     APPLY_FAILED,
@@ -125,7 +125,7 @@ def apply_deal(
     if deal is None:
         if isinstance(game_state, Deal):
             deal = game_state
-            game_state = GAME_STATE
+            game_state = export_workflow_state()
         else:
             raise TypeError("apply_deal requires a Deal")
 
@@ -158,7 +158,7 @@ def apply_deal(
             tx = svc.execute_trade(deal, source=source, trade_date=trade_date, deal_id=deal_id)
 
         # Optional: update lightweight cached player fields in state (NOT assets ledger)
-        players_state = game_state.get("players", {})
+        players_state = players_get()
         if isinstance(players_state, dict):
             for move in player_moves:
                 ps = players_state.get(move.player_id)
@@ -177,6 +177,7 @@ def apply_deal(
                     if move.from_team not in season_bans:
                         season_bans.append(move.from_team)
                     bans[season_key] = season_bans
+            players_set(players_state)
 
         return tx
     except TradeError:

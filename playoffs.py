@@ -13,15 +13,49 @@ from matchengine_v2_adapter import adapt_matchengine_result_to_v2, build_context
 from matchengine_v3.sim_game import simulate_game
 from sim.roster_adapter import build_team_state_from_db
 from state import (
-    GAME_STATE,
-    _accumulate_player_rows,
+    cached_view_get,
+    cached_view_set,
     ensure_league_block,
     ingest_game_result,
+    postseason_get_state,
+    postseason_set,
     set_current_date,
 )
 from team_utils import get_conference_standings
 
 HomePattern = [True, True, False, False, True, False, True]
+
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _accumulate_player_rows(rows: List[Dict[str, Any]], season_player_stats: Dict[str, Any]) -> None:
+    for row in rows:
+        player_id = str(row.get("PlayerID"))
+        team_id = str(row.get("TeamID"))
+
+        entry = season_player_stats.setdefault(
+            player_id,
+            {"player_id": player_id, "name": row.get("Name"), "team_id": team_id, "games": 0, "totals": {}},
+        )
+        entry["name"] = row.get("Name", entry.get("name"))
+        entry["team_id"] = team_id
+        entry["games"] = int(entry.get("games", 0) or 0) + 1
+
+        totals = entry.setdefault("totals", {})
+        for k, v in row.items():
+            if k in {"PlayerID", "TeamID", "Name", "Pos", "Position"}:
+                continue
+            if _is_number(v):
+                try:
+                    totals[k] = float(totals.get(k, 0.0)) + float(v)
+                except (TypeError, ValueError):
+                    continue
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +75,21 @@ def _repo_ctx() -> LeagueRepo:
         yield repo
 
 def _ensure_postseason_state() -> Dict[str, Any]:
-    postseason = GAME_STATE.setdefault("postseason", {})
-    postseason.setdefault("field", None)
-    postseason.setdefault("play_in", None)
-    postseason.setdefault("playoffs", None)
-    postseason.setdefault("champion", None)
-    postseason.setdefault("my_team_id", None)
-    postseason.setdefault("playoff_player_stats", {})
+    postseason = postseason_get_state()
+    if not isinstance(postseason, dict):
+        postseason = {}
+    defaults = {
+        "field": None,
+        "play_in": None,
+        "playoffs": None,
+        "champion": None,
+        "my_team_id": None,
+        "playoff_player_stats": {},
+    }
+    for key, value in defaults.items():
+        postseason.setdefault(key, value)
+    for key, value in postseason.items():
+        postseason_set(key, value)
     return postseason
 
 
@@ -119,7 +161,7 @@ def _next_round_start(series_list: List[Dict[str, Any]], buffer_days: int = 2) -
 
 
 def reset_postseason_state() -> Dict[str, Any]:
-    GAME_STATE["postseason"] = {
+    defaults = {
         "field": None,
         "play_in": None,
         "playoffs": None,
@@ -127,12 +169,16 @@ def reset_postseason_state() -> Dict[str, Any]:
         "my_team_id": None,
         "playoff_player_stats": {},
     }
-    cached_views = GAME_STATE.setdefault("cached_views", {})
-    playoff_news = cached_views.setdefault("playoff_news", {})
+    for key, value in defaults.items():
+        postseason_set(key, value)
+    playoff_news = cached_view_get("playoff_news") or {}
     playoff_news["series_game_counts"] = {}
     playoff_news["items"] = []
-    cached_views.setdefault("stats", {}).pop("playoff_leaders", None)
-    return GAME_STATE["postseason"]
+    cached_view_set("playoff_news", playoff_news)
+    stats_cache = cached_view_get("stats") or {}
+    stats_cache.pop("playoff_leaders", None)
+    cached_view_set("stats", stats_cache)
+    return postseason_get_state()
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +312,7 @@ def _simulate_postseason_game(
         rows = (v2_result.get("teams", {}).get(tid) or {}).get("players") or []
         if isinstance(rows, list):
             _accumulate_player_rows(rows, playoff_stats)
+    postseason_set("playoff_player_stats", playoff_stats)
 
     final = v2_result.get("final") or {}
     home_score = int(final.get(home_team_id, 0))

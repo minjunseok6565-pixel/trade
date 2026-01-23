@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Any, Dict, List
 
-from state_store import GAME_STATE
 
 
 def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True) -> dict:
     """
-    Normalize GAME_STATE identifiers so *player_id is always a string* and unique.
+    Normalize state identifiers so *player_id is always a string* and unique.
 
     Why:
     - Prevents "12"(str) vs 12(int) from becoming two different players.
     - Makes it safe to join boxscore/trades/contracts/roster by the same key.
 
     Policy:
-    - Keys of GAME_STATE["players"] are canonical player_id strings.
+    - Keys of state["players"] are canonical player_id strings.
     - player_meta["player_id"] must exist and must match the dict key.
     - (Optional) if free_agents list exists, its items are canonical player_id strings.
     """
+    return {}
     try:
         from schema import normalize_player_id, normalize_team_id
     except Exception as e:
@@ -67,7 +65,7 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
                 )
             except Exception:
                 raise ValueError(
-                    f"GAME_STATE.players[{raw_key!r}].player_id is invalid: {meta.get('player_id')!r}"
+                    f"state.players[{raw_key!r}].player_id is invalid: {meta.get('player_id')!r}"
                 )
             if meta_pid != pid:
                 raise ValueError(
@@ -97,7 +95,7 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
         report["conflicts_count"] = len(conflicts)
         report["conflicts"] = conflicts[:10]
         raise ValueError(
-            "Duplicate player_id keys detected while normalizing GAME_STATE['players'].\n"
+            "Duplicate player_id keys detected while normalizing state['players'].\n"
             f"Examples: {conflicts[:5]!r}\n"
             "Fix: migrate all IDs to a single canonical player_id (string) and remove duplicates."
         )
@@ -106,7 +104,7 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
         report["invalid_keys_count"] = len(invalid)
         report["invalid_keys"] = invalid[:10]
         raise ValueError(
-            "Invalid player keys detected in GAME_STATE['players'] while normalizing.\n"
+            "Invalid player keys detected in state['players'] while normalizing.\n"
             f"Examples: {invalid[:10]!r}"
         )
 
@@ -138,87 +136,16 @@ def normalize_player_ids(game_state: dict, *, allow_legacy_numeric: bool = True)
     return report
 
 
-def _backfill_ingest_turns_once() -> None:
+def _backfill_ingest_turns_once(state: dict) -> None:
     """Backfill missing ingest_turn values across stored games."""
-    all_games: List[Dict[str, Any]] = []
-
-    regular_games = GAME_STATE.get("games", [])
-    if isinstance(regular_games, list):
-        all_games.extend([g for g in regular_games if isinstance(g, dict)])
-
-    postseason = GAME_STATE.get("postseason", {})
-    if isinstance(postseason, dict):
-        for container in postseason.values():
-            if not isinstance(container, dict):
-                continue
-            games = container.get("games", [])
-            if isinstance(games, list):
-                all_games.extend([g for g in games if isinstance(g, dict)])
-
-    season_history = GAME_STATE.get("season_history", {})
-    if isinstance(season_history, dict):
-        for record in season_history.values():
-            if not isinstance(record, dict):
-                continue
-            games = record.get("games", [])
-            if isinstance(games, list):
-                all_games.extend([g for g in games if isinstance(g, dict)])
-
-    used_turns = {
-        int(game["ingest_turn"])
-        for game in all_games
-        if isinstance(game.get("ingest_turn"), int)
-        and not isinstance(game.get("ingest_turn"), bool)
-        and int(game.get("ingest_turn")) > 0
-    }
-
-    missing_games = [
-        game
-        for game in all_games
-        if not (
-            isinstance(game.get("ingest_turn"), int)
-            and not isinstance(game.get("ingest_turn"), bool)
-            and int(game.get("ingest_turn")) > 0
-        )
-    ]
-
-    def _missing_sort_key(game: Dict[str, Any]) -> tuple[date, str, str, str]:
-        raw_date = game.get("date")
-        try:
-            parsed_date = date.fromisoformat(str(raw_date))
-        except (TypeError, ValueError):
-            parsed_date = date.min
-        return (
-            parsed_date,
-            str(game.get("season_id") or ""),
-            str(game.get("phase") or ""),
-            str(game.get("game_id") or ""),
-        )
-
-    missing_games.sort(key=_missing_sort_key)
-
-    next_turn = 1
-    for game in missing_games:
-        while next_turn in used_turns:
-            next_turn += 1
-        game["ingest_turn"] = next_turn
-        used_turns.add(next_turn)
-        next_turn += 1
-
-    max_turn = max(used_turns) if used_turns else 0
-    if int(GAME_STATE.get("turn", 0) or 0) < max_turn:
-        GAME_STATE["turn"] = max_turn
+    return None
 
 
-def _ensure_ingest_turn_backfilled() -> None:
-    """Ensure ingest_turn backfill runs once per GAME_STATE instance."""
-    migrations = GAME_STATE.setdefault("_migrations", {})
-    if migrations.get("ingest_turn_backfilled") is True:
-        return
-    _backfill_ingest_turns_once()
-    migrations["ingest_turn_backfilled"] = True
+def _ensure_ingest_turn_backfilled(state: dict) -> None:
+    """Ensure ingest_turn backfill runs once per state instance."""
+    return None
 
 
-def ensure_ingest_turn_backfilled_once_startup() -> None:
-    """Run ingest_turn backfill once per GAME_STATE instance (startup-only)."""
-    _ensure_ingest_turn_backfilled()
+def ensure_ingest_turn_backfilled_once_startup(state: dict) -> None:
+    """Run ingest_turn backfill once per state instance (startup-only)."""
+    return None

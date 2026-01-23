@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from state import GAME_STATE
+from state import negotiations_get, negotiations_set
 
 from .errors import TradeError, NEGOTIATION_NOT_FOUND
 from .models import Deal, canonicalize_deal, parse_deal, serialize_deal
@@ -84,12 +84,14 @@ def create_session(user_team_id: str, other_team_id: str) -> Dict[str, Any]:
         "relationship": {"trust": 0, "fatigue": 0, "promises_broken": 0},
         "market_context": {},  # trade market context snapshot
     }
-    GAME_STATE.setdefault("negotiations", {})[session_id] = session
+    negotiations = negotiations_get()
+    negotiations[session_id] = session
+    negotiations_set(negotiations)
     return session
 
 
 def get_session(session_id: str) -> Dict[str, Any]:
-    session = (GAME_STATE.get("negotiations") or {}).get(session_id)
+    session = negotiations_get().get(session_id)
     if not session:
         raise TradeError(
             NEGOTIATION_NOT_FOUND,
@@ -103,6 +105,9 @@ def append_message(session_id: str, speaker: str, text: str) -> None:
     session = get_session(session_id)
     session["messages"].append({"speaker": speaker, "text": text, "at": _now_iso()})
     session["updated_at"] = _now_iso()
+    negotiations = negotiations_get()
+    negotiations[session_id] = session
+    negotiations_set(negotiations)
 
 
 def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
@@ -110,12 +115,18 @@ def set_draft_deal(session_id: str, deal_serialized: dict) -> None:
     deal: Deal = canonicalize_deal(parse_deal(deal_serialized))
     session["draft_deal"] = serialize_deal(deal)
     session["updated_at"] = _now_iso()
+    negotiations = negotiations_get()
+    negotiations[session_id] = session
+    negotiations_set(negotiations)
 
 
 def set_committed(session_id: str, deal_id: str) -> None:
     session = get_session(session_id)
     session["committed_deal_id"] = deal_id
     session["updated_at"] = _now_iso()
+    negotiations = negotiations_get()
+    negotiations[session_id] = session
+    negotiations_set(negotiations)
 
 
 def set_phase(session_id: str, phase: str) -> None:

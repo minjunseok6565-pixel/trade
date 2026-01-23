@@ -15,7 +15,6 @@ from config import BASE_DIR, ALL_TEAM_IDS
 from league_repo import LeagueRepo
 from schema import normalize_team_id
 from state import (
-    GAME_STATE,
     ensure_league_block,
     ensure_db_initialized_and_seeded,
     ensure_trade_state_keys,
@@ -27,6 +26,8 @@ from state import (
     get_current_date_as_date,
     get_schedule_summary,
     initialize_master_schedule_if_needed,
+    export_workflow_state,
+    postseason_get_state,
 )
 from sim.league_sim import simulate_single_game, advance_league_until
 from playoffs import (
@@ -286,7 +287,7 @@ async def api_postseason_field():
 
 @app.get("/api/postseason/state")
 async def api_postseason_state():
-    return GAME_STATE.get("postseason") or {}
+    return postseason_get_state()
 
 
 @app.post("/api/postseason/reset")
@@ -627,7 +628,7 @@ async def team_schedule(team_id: str):
 
 @app.get("/api/state/summary")
 async def state_summary():
-    workflow_state: Dict[str, Any] = dict(GAME_STATE)
+    workflow_state: Dict[str, Any] = export_workflow_state()
     for k in (
         # Trade assets ledger (DB SSOT)
         "draft_picks",
