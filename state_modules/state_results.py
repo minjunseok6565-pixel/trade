@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+"""
+state_results.py
 
-from .state_cache import _mark_views_dirty
-from .state_core import _ensure_active_season_id
-from .state_schedule import _mark_master_schedule_game_final
+설계 원칙:
+- 이 모듈은 **순수 계산/검증 유틸**만 제공한다.
+- 상태(state dict) 변경(ingest, season rollover, schedule status 마킹, cache dirty 등)은
+  전부 facade(state.py)에서만 수행한다.
+"""
+
+from typing import Any, Dict, List
+
 from .state_constants import _ALLOWED_PHASES, _META_PLAYER_KEYS
 from .state_utils import _is_number, _merge_counter_dict_sum, _require_dict, _require_list
-from state_schema import validate_game_state
 
 
 def _validate_game_result_v2(game_result: Dict[str, Any]) -> None:
@@ -132,84 +137,3 @@ def _accumulate_team_game_result(
     if isinstance(extra_breakdowns, dict):
         _merge_counter_dict_sum(breakdowns, extra_breakdowns)
 
-
-def ingest_game_result(
-    state: dict,
-    *,
-    game_result: Dict[str, Any],
-    game_date: Optional[str] = None,
-    store_raw_result: bool = True,
-) -> Dict[str, Any]:
-    """정식 GameResultV2 스키마 결과를 상태에 반영한다."""
-    validate_v2_game_result(game_result)
-
-    game = _require_dict(game_result["game"], "game")
-    season_id = str(game["season_id"])
-    phase = str(game["phase"])
-
-    _ensure_active_season_id(state, season_id)
-    container = _get_results_container_for_phase(state, phase)
-
-    home_id = str(game["home_team_id"])
-    away_id = str(game["away_team_id"])
-    final = _require_dict(game_result["final"], "final")
-
-    game_date_str = str(game_date) if game_date else str(game["date"])
-    game_id = str(game["game_id"])
-
-    home_score = int(final[home_id])
-    away_score = int(final[away_id])
-
-    game_obj = {
-        "game_id": game_id,
-        "date": game_date_str,
-        "home_team_id": home_id,
-        "away_team_id": away_id,
-        "home_score": home_score,
-        "away_score": away_score,
-        "status": "final",
-        "is_overtime": int(game.get("overtime_periods", 0) or 0) > 0,
-        "phase": phase,
-        "season_id": season_id,
-        "schema_version": "2.0",
-    }
-
-    state["turn"] = int(state.get("turn", 0) or 0) + 1
-    current_turn = int(state.get("turn", 0) or 0)
-    game_obj["ingest_turn"] = current_turn
-    container.setdefault("games", []).append(game_obj)
-
-    if store_raw_result:
-        container.setdefault("game_results", {})[game_id] = game_result
-
-    teams = _require_dict(game_result["teams"], "teams")
-    season_player_stats = container.setdefault("player_stats", {})
-    season_team_stats = container.setdefault("team_stats", {})
-
-    for tid in (home_id, away_id):
-        team_game = _require_dict(teams[tid], f"teams.{tid}")
-        _accumulate_team_game_result(tid, team_game, season_team_stats)
-        rows = _require_list(team_game.get("players"), f"teams.{tid}.players")
-        _accumulate_player_rows(rows, season_player_stats)
-
-    _mark_master_schedule_game_final(
-        state,
-        game_id=game_id,
-        game_date_str=game_date_str,
-        home_id=home_id,
-        away_id=away_id,
-        home_score=home_score,
-        away_score=away_score,
-    )
-    _mark_views_dirty(state)
-    validate_game_state(state)
-
-    return game_obj
-
-
-def _get_results_container_for_phase(state: dict, phase: str) -> dict:
-    if not phase or phase == "regular":
-        return state
-    if phase in ("preseason", "play_in", "playoffs"):
-        return state["phase_results"][phase]
-    raise ValueError(f"invalid phase: {phase}")
