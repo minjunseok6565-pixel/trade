@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple, TypedDict, Literal
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, Literalal
 
 from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id, season_id_from_year as _schema_season_id_from_year
 
@@ -235,6 +235,31 @@ def _normalize_breakdowns_from_raw(team_summary: Mapping[str, Any]) -> Tuple[Dic
             extra.pop(k, None)
 
     return breakdowns, extra
+
+
+def _normalize_replay_events_from_raw(
+    obj: Any,
+    *,
+    path: str,
+) -> List[Dict[str, Any]]:
+    """Normalize replay_events (list[dict]) from raw matchengine result.
+
+    We intentionally keep this validation light:
+      - Require list
+      - Require each element is a dict
+
+    Full schema validation belongs to the matchengine itself (emit_event / validation config).
+    """
+    if obj is None:
+        return []
+    if not isinstance(obj, list):
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' must be a list")
+    out: List[Dict[str, Any]] = []
+    for i, ev in enumerate(obj):
+        if not isinstance(ev, dict):
+            raise ValueError(f"raw matchengine_v3 result invalid: '{path}[{i}]' must be a dict")
+        out.append(ev)
+    return out
 
 
 def _int_like(value: Any, *, path: str) -> int:
@@ -479,6 +504,7 @@ def adapt_matchengine_result_to_v2(
     context: Mapping[str, Any],
     engine_name: str = "matchengine_v3",
     include_raw: bool = False,
+    include_replay_events: bool = True,
 ) -> Dict[str, Any]:
 
     raw = _require_dict(raw_result, "raw")
@@ -599,6 +625,18 @@ def adapt_matchengine_result_to_v2(
         path="raw.game_state.minutes_played_sec",
     )
 
+    # replay_events: new single source-of-truth play-by-play stream.
+    # Preferred location (engine patch): raw['replay_events'].
+    # Fallback: raw['game_state']['replay_events'] (if some caller embeds it there).
+    replay_events: List[Dict[str, Any]] = []
+    if include_replay_events:
+        replay_events_obj = raw.get("replay_events", None)
+        replay_events_path = "raw.replay_events"
+        if replay_events_obj is None and isinstance(gs, dict) and "replay_events" in gs:
+            replay_events_obj = gs.get("replay_events")
+            replay_events_path = "raw.game_state.replay_events"
+        replay_events = _normalize_replay_events_from_raw(replay_events_obj, path=replay_events_path)
+        
     # --- Normalize & validate game_state player-keyed dicts ------------------
     # Ensure player keys are canonical player_id AND belong to the correct team
     # ("존재하지 않는 선수", "다른 팀 선수", "중복 선수" => 즉시 에러)
@@ -703,6 +741,9 @@ def adapt_matchengine_result_to_v2(
 
     if debug:
         out["debug"] = debug
+
+    if include_replay_events and replay_events:
+        out["replay_events"] = replay_events
 
     # Include raw only if caller asks for it.
     # Note: state.py stores the entire game_result dict into state['game_results'].
