@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from .state_cache import _ensure_cached_views_meta
-from .state_schedule import _ensure_master_schedule_indices, initialize_master_schedule_if_needed
+from .state_schedule import ensure_master_schedule_indices
 
 
 def get_scores_view(state: dict, season_id: str, limit: int = 20) -> Dict[str, Any]:
@@ -69,14 +69,22 @@ def get_team_schedule_view(
     if active_season_id is not None and str(season_id) != str(active_season_id):
         return {"past_games": [], "upcoming_games": []}
 
-    initialize_master_schedule_if_needed(state)
-    _ensure_master_schedule_indices(state)
     league = state["league"]
     if not isinstance(league, dict):
         raise ValueError("league must be a dict")
     master_schedule = league["master_schedule"]
     if not isinstance(master_schedule, dict):
         raise ValueError("master_schedule must be a dict")
+
+    # 계획 1 철학: state_modules 레벨에서 schedule을 생성/재생성하지 않는다.
+    # schedule 생성은 facade(state.py)가 ensure_schedule_for_active_season()로 수행해야 한다.
+    games = master_schedule.get("games") or []
+    if not isinstance(games, list) or len(games) == 0:
+        raise ValueError(
+            "master_schedule is empty. Call state.ensure_schedule_for_active_season(force=False) first."
+        )
+
+    ensure_master_schedule_indices(master_schedule)
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
 
