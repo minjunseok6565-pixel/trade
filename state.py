@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import date
 from typing import Any
 
+from schema import season_id_from_year as _season_id_from_year
 from state_modules.state_constants import (
     DEFAULT_TRADE_RULES,
     _ALLOWED_PHASES,
@@ -76,6 +77,47 @@ def _s() -> dict:
     return _get_state()
 
 
+def _ensure_active_season_id_initialized() -> None:
+    """
+    개발/서버 부팅 시점에 active_season_id가 None인 상태를 남기지 않기 위한 가드.
+
+    설계 의도:
+    - ingest는 "암묵적 시즌 전환"을 절대 하지 않는다(레거시 차단).
+    - 따라서 active_season_id는 startup 단계에서 반드시 한 번 명시적으로 설정되어야 한다.
+    """
+    if _s().get("active_season_id") is not None:
+        return
+
+    # master_schedule 생성 후에는 league.season_year가 채워지는 것이 정상이다.
+    season_year = _s().get("league", {}).get("season_year")
+    if season_year is None:
+        # 예상 밖의 경우를 대비한 fallback: 초기 시즌 연도를 넣되,
+        # 시즌 전환/아카이브는 수행하지 않고 단순 초기화만 한다.
+        from config import INITIAL_SEASON_YEAR
+
+        season_year = INITIAL_SEASON_YEAR
+        _s()["league"]["season_year"] = season_year
+
+    sid = str(_season_id_from_year(int(season_year)))
+    set_active_season_id(sid)
+
+
+def _require_active_season_id_matches(season_id: str) -> str:
+    """ingest 등 공개 동작에서 'active season' 불일치를 fail-fast로 차단한다."""
+    active = _s().get("active_season_id")
+    if active is None:
+        raise ValueError(
+            "GameState invalid: active_season_id is None. "
+            "Call state.set_active_season_id(<season_id>) before ingest."
+        )
+    if str(active) != str(season_id):
+        raise ValueError(
+            f"Season mismatch: game_result season_id='{season_id}' != active_season_id='{active}'. "
+            "Switch seasons explicitly via state.set_active_season_id(<season_id>)."
+        )
+    return str(active)
+
+
 def startup_init_state() -> None:
     validate_game_state(_s())
     from state_modules import state_bootstrap
@@ -83,6 +125,7 @@ def startup_init_state() -> None:
 
     state_bootstrap.ensure_db_initialized_and_seeded(_s())
     initialize_master_schedule_if_needed(force=False)
+    _ensure_active_season_id_initialized()
     state_bootstrap.ensure_contracts_bootstrapped_after_schedule_creation_once(_s())
     state_bootstrap.ensure_cap_model_populated_if_needed(_s())
     state_bootstrap.validate_repo_integrity_once_startup(_s())
@@ -246,6 +289,8 @@ def ingest_game_result(
     state_results.validate_v2_game_result(game_result)
     _s()["turn"] = int(_s().get("turn", 0) or 0) + 1
     game = game_result["game"]
+    season_id = str(game["season_id"])
+    _require_active_season_id_matches(season_id)
     phase = str(game["phase"])
     if phase == "regular":
         container = _s()
@@ -254,7 +299,6 @@ def ingest_game_result(
     else:
         raise ValueError("invalid phase")
 
-    season_id = str(game["season_id"])
     home_id = str(game["home_team_id"])
     away_id = str(game["away_team_id"])
     final = game_result["final"]
