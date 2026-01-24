@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, Literalal
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, Literal
 
 from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id, season_id_from_year as _schema_season_id_from_year
 
