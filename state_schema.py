@@ -195,6 +195,7 @@ def _validate_postseason_container(container: dict, label: str) -> None:
 def validate_game_state(state: dict) -> None:
     if not isinstance(state, dict):
         raise ValueError("GameState invalid: state must be a dict")
+        
 
     _require_exact_keys(state, ALLOWED_TOP_LEVEL_KEYS, "top-level")
 
@@ -291,6 +292,64 @@ def validate_game_state(state: dict) -> None:
         raise ValueError("GameState invalid: league.master_schedule.by_date must be dict")
     if not isinstance(master_schedule.get("by_id"), dict):
         raise ValueError("GameState invalid: league.master_schedule.by_id must be dict")
+
+        # -----------------------------
+    # SSOT: active_season_id <-> league.season_year/draft_year 일치 강제
+    # -----------------------------
+    league_year = league.get("season_year")
+    draft_year = league.get("draft_year")
+
+    if league_year is not None and not isinstance(league_year, int):
+        raise ValueError("GameState invalid: league.season_year must be int or None")
+    if draft_year is not None and not isinstance(draft_year, int):
+        raise ValueError("GameState invalid: league.draft_year must be int or None")
+
+    # active_season_id와 league.season_year는 반드시 함께 존재하거나 둘 다 None이어야 한다.
+    if (active_season_id is None) != (league_year is None):
+        raise ValueError(
+            "GameState invalid: active_season_id and league.season_year must be both set or both None"
+        )
+
+    # season_year가 None이면 draft_year도 None이어야 한다(부분 초기화 금지).
+    if league_year is None:
+        if draft_year is not None:
+            raise ValueError("GameState invalid: league.draft_year must be None when league.season_year is None")
+    else:
+        # season_year가 설정되면 draft_year는 필수이며 season_year+1 이어야 한다.
+        if draft_year is None:
+            raise ValueError("GameState invalid: league.draft_year must be set when league.season_year is set")
+        if int(draft_year) != int(league_year) + 1:
+            raise ValueError("GameState invalid: league.draft_year must equal league.season_year + 1")
+
+    # active_season_id가 설정된 경우: active의 연도(YYYY)가 league.season_year와 동일해야 한다.
+    if active_season_id is not None:
+        # 포맷: 'YYYY-YY' (예: '2026-27')
+        if "-" not in active_season_id:
+            raise ValueError("GameState invalid: active_season_id must be like 'YYYY-YY'")
+        try:
+            active_year = int(str(active_season_id).split("-", 1)[0])
+        except Exception:
+            raise ValueError("GameState invalid: active_season_id must be like 'YYYY-YY'")
+        if int(league_year) != int(active_year):
+            raise ValueError("GameState invalid: league.season_year must match active_season_id year")
+
+        # -----------------------------
+        # master_schedule 시즌 일치 강제
+        # - games가 비어있으면(아직 스케줄 생성 전) 검사는 스킵한다.
+        # - games가 존재하면, season_id가 있는 모든 엔트리는 active_season_id와 일치해야 한다.
+        # -----------------------------
+        ms_games = master_schedule.get("games") or []
+        if isinstance(ms_games, list) and ms_games:
+            for i, g in enumerate(ms_games):
+                if not isinstance(g, dict):
+                    continue
+                sid = g.get("season_id")
+                if sid is None:
+                    continue
+                if str(sid) != str(active_season_id):
+                    raise ValueError(
+                        f"GameState invalid: league.master_schedule.games[{i}].season_id must match active_season_id"
+                    )
 
     for season_id, record in season_history.items():
         if not isinstance(season_id, str):
