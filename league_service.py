@@ -1699,6 +1699,11 @@ class LeagueService:
                         released_player_ids.append(player_id)
                     except KeyError:
                         # No active roster row; skip release
+                    _warn_limited(
+                        "RELEASE_TO_FA_SKIPPED_NO_ACTIVE_ROSTER",
+                        f"player_id={pid!r} team_id={team_id!r} effective_date={effective_date!r}",
+                        limit=3,
+                    )
                         pass
                 else:
                     # Contract continues: update roster salary for the new season if we can.
