@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,8 @@ from state import (
 # We intentionally do NOT import ROSTER_DF anymore.
 from config import ALL_TEAM_IDS, TEAM_TO_CONF_DIV
 
+logger = logging.getLogger(__name__)
+
 _LEAGUE_REPO_IMPORT_ERROR: Optional[Exception] = None
 try:
     from league_repo import LeagueRepo  # type: ignore
@@ -40,9 +43,12 @@ def _repo_ctx() -> "LeagueRepo":
     with LeagueRepo(str(db_path)) as repo:
         try:
             repo.init_db()
-        except Exception:
-            # init_db is idempotent; ignore if project uses a different init flow
-            pass
+        except Exception as exc:
+            logger.exception(
+                "[DB_INIT_FAILED] team_utils._repo_ctx repo.init_db() failed (db_path=%s)",
+                db_path,
+            )
+            raise
         yield repo
 
 
@@ -397,6 +403,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
