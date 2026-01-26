@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -187,7 +188,8 @@ def build_week_summary_context() -> str:
         repo = LeagueRepo(get_db_path())
         repo.init_db()
         tx_rows = repo.list_transactions(limit=500, since_date=week_start.isoformat())
-    except Exception:
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        _warn_limited("NEWS_TX_DB_FAILED_FALLBACK", f"db_path={get_db_path()!r}", limit=3)
         # Fallback (legacy/testing): if transactions exist in the workflow snapshot, use them.
         tx_rows = snapshot.get("transactions", []) or []
     finally:
@@ -195,6 +197,7 @@ def build_week_summary_context() -> str:
             if repo:
                 repo.close()
         except Exception:
+            _warn_limited("NEWS_TX_DB_CLOSE_FAILED", f"db_path={get_db_path()!r}", limit=1)
             pass
 
     for t in tx_rows:
