@@ -79,7 +79,8 @@ def _get_current_date() -> date:
     cur = get_current_date() or league_context.get("season_start") or date.today().isoformat()
     try:
         return date.fromisoformat(cur)
-    except ValueError:
+    except (TypeError, ValueError) as e:
+        _warn_limited("CURRENT_DATE_PARSE_FAILED", f"cur={cur!r} exc_type={type(e).__name__}", limit=3)
         return date.today()
 
 
