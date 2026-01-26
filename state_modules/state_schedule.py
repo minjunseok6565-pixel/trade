@@ -341,10 +341,14 @@ def get_schedule_summary(master_schedule: dict) -> Dict[str, Any]:
     - 이 함수는 schedule을 생성하지 않는다.
     - schedule 생성/재생성은 facade(state.py)가 ensure_schedule_for_active_season()로 수행해야 한다.
     """
-    ensure_master_schedule_indices(master_schedule)
+    # NOTE: This function must be PURE (no mutation). Do not call
+    # ensure_master_schedule_indices() here.
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
 
     games = master_schedule.get("games") or []
-    by_team = master_schedule.get("by_team") or {}
+    if not isinstance(games, list):
+        games = []
 
     status_counts: Dict[str, int] = {}
     home_away: Dict[str, Dict[str, int]] = {tid: {"home": 0, "away": 0} for tid in ALL_TEAM_IDS}
@@ -364,16 +368,18 @@ def get_schedule_summary(master_schedule: dict) -> Dict[str, Any]:
 
     team_breakdown: Dict[str, Dict[str, Any]] = {}
     for tid in ALL_TEAM_IDS:
-        games_for_team = by_team.get(tid, [])
+        # Compute from game scan (do not rely on by_team index).
+        home_n = home_away.get(tid, {}).get("home", 0)
+        away_n = home_away.get(tid, {}).get("away", 0)
         team_breakdown[tid] = {
-            "games": len(games_for_team) if isinstance(games_for_team, list) else 0,
-            "home": home_away.get(tid, {}).get("home", 0),
-            "away": home_away.get(tid, {}).get("away", 0),
+            "games": int(home_n) + int(away_n),
+            "home": int(home_n),
+            "away": int(away_n),
         }
         team_breakdown[tid]["home_away_diff"] = team_breakdown[tid]["home"] - team_breakdown[tid]["away"]
 
     return {
-        "total_games": len(games) if isinstance(games, list) else 0,
+        "total_games": len(games),
         "status_counts": status_counts,
         "teams": team_breakdown,
     }
