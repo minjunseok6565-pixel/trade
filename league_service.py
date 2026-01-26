@@ -17,10 +17,14 @@ import contextlib
 import datetime as _dt
 import hashlib
 import json
+import logging
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id, season_id_from_year
@@ -835,18 +839,32 @@ class LeagueService:
                 existing["already_executed"] = True
                 return existing
 
-        # Validation (best effort but should be present in real runtime).
-        # Prefer validator.validate_deal if available.
+        # Validation (required): trades.validator.validate_deal must be present in runtime.
         try:
             from trades.validator import validate_deal  # type: ignore
-        except Exception:
-            validate_deal = None  # type: ignore
-        if callable(validate_deal):
-            validate_deal(
-                deal_obj,
-                current_date=trade_date_as_date,
-                allow_locked_by_deal_id=str(deal_id),
+        except ImportError as exc:
+            logger.exception(
+                "[TRADE_VALIDATOR_IMPORT_FAILED] execute_trade cannot import trades.validator.validate_deal"
             )
+            raise ImportError(
+                "trades.validator.validate_deal is required to execute trades"
+            ) from exc
+        except Exception as exc:
+            logger.exception(
+                "[TRADE_VALIDATOR_IMPORT_FAILED] execute_trade failed while importing trades.validator.validate_deal"
+            )
+            raise RuntimeError(
+                "failed to import trades.validator.validate_deal"
+            ) from exc
+
+        if not callable(validate_deal):
+            raise TypeError("trades.validator.validate_deal must be callable")
+
+        validate_deal(
+            deal_obj,
+            current_date=trade_date_as_date,
+            allow_locked_by_deal_id=str(deal_id),
+        )
 
         # Helpers
         def _resolve_receiver(sender_team: str, asset: Any) -> str:
@@ -1287,8 +1305,25 @@ class LeagueService:
 
             try:
                 cur.execute("DELETE FROM free_agents WHERE player_id=?;", (pid,))
-            except Exception:
-                pass
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("no such table" in msg) and ("free_agents" in msg):
+                    logger.warning(
+                        "[FREE_AGENTS_TABLE_MISSING] free_agents table missing; skipping cleanup (player_id=%s)",
+                        pid,
+                    )
+                else:
+                    logger.exception(
+                        "[FREE_AGENTS_DELETE_FAILED] failed to delete free_agents row (player_id=%s)",
+                        pid,
+                    )
+                    raise
+            except Exception as exc:
+                logger.exception(
+                    "[FREE_AGENTS_DELETE_FAILED] failed to delete free_agents row (player_id=%s)",
+                    pid,
+                )
+                raise
 
             # Optional: log signing transaction
             self._insert_transactions_in_cur(
