@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
+
 
 from league_service import LeagueService
 
@@ -75,15 +87,18 @@ def process_offseason(
                     if isinstance(p, dict):
                         # Keep cache consistent with DB semantics: FA team id is "FA".
                         p["team_id"] = "FA"
-        except Exception:
+        except (TypeError, AttributeError, KeyError):
+            _warn_limited(
+                "OFFSEASON_CACHE_UPDATE_FAILED",
+                (
+                    f"released_count={len(released_ids) if isinstance(released_ids, (list, set, tuple)) else 'unknown'}"
+                ),
+                limit=3,
+            )
             pass
 
         # 2) (선택) 드래프트 정산 (SSOT)
-        draft_year_to_settle: Optional[int]
-        try:
-            draft_year_to_settle = fy + 1
-        except Exception:
-            draft_year_to_settle = None
+        draft_year_to_settle = fy + 1
 
         pick_order: Optional[Dict[str, int]] = None
         if isinstance(draft_pick_order_by_pick_id, dict) and draft_pick_order_by_pick_id:
@@ -115,7 +130,12 @@ def process_offseason(
             for k, v in dict(pick_order).items():
                 try:
                     pick_order_i[str(k)] = int(v)
-                except Exception:
+                except (TypeError, ValueError):
+                    _warn_limited(
+                        "PICK_ORDER_INT_COERCE_FAILED",
+                        f"pick_id={k!r} value={v!r}",
+                        limit=3,
+                    )
                     continue
             try:
                 events = svc.settle_draft_year(int(draft_year_to_settle), pick_order_i)
@@ -130,12 +150,14 @@ def process_offseason(
                     },
                 }
             except Exception as exc:
+                _warn_limited("DRAFT_SETTLEMENT_ERROR", f"draft_year={draft_year_to_settle!r}", limit=3)
                 settlement_result = {
                     "draft_year": draft_year_to_settle,
                     "ok": False,
                     "error": {
                         "code": "SETTLEMENT_ERROR",
                         "message": str(exc),
+                        "exc_type": type(exc).__name__,
                         "details": {},
                     },
                 }
