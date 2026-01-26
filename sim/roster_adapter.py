@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import replace
 from functools import lru_cache
@@ -11,6 +12,17 @@ from league_repo import LeagueRepo
 from matchengine_v3.models import Player, TeamState
 from matchengine_v3.tactics import TacticsConfig
 
+
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 3) -> None:
+    """Log warning with traceback, but cap repeats per code."""
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
 
 _SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.dirname(_SIM_DIR)
@@ -61,7 +73,8 @@ def _load_team_coach_preset_map() -> Dict[str, str]:
             # allow flat map
             return {str(k).upper(): str(v) for k, v in data.items() if isinstance(v, (str, int, float))}
         return {}
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        _warn_limited("ROSTER_PRESET_LOAD_FAILED", f"path={path!r}")
         return {}
 
 
@@ -100,7 +113,8 @@ def _load_coach_presets_raw() -> Dict[str, Dict[str, Any]]:
             if isinstance(k, str) and isinstance(v, dict):
                 out[k] = v
         return out
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        _warn_limited("ROSTER_PRESET_LOAD_FAILED", f"path={path!r}")
         return {}
 
 
