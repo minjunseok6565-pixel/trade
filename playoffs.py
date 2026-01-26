@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from contextlib import contextmanager
@@ -32,6 +33,8 @@ from state import (
     set_current_date,
 )
 from team_utils import get_conference_standings
+
+logger = logging.getLogger(__name__)
 
 HomePattern = [True, True, False, False, True, False, True]
 
@@ -79,8 +82,12 @@ def _repo_ctx() -> LeagueRepo:
     with LeagueRepo(str(db_path)) as repo:
         try:
             repo.init_db()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception(
+                "[DB_INIT_FAILED] playoffs._repo_ctx repo.init_db() failed (db_path=%s)",
+                db_path,
+            )
+            raise
         yield repo
 
 def _ensure_postseason_state() -> Dict[str, Any]:
