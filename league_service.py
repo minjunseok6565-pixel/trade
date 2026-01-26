@@ -47,7 +47,8 @@ from contracts.models import new_contract_id, make_contract_record
 # Season inference (fallbacks keep Service usable even in minimal test harnesses)
 try:
     from config import SEASON_START_MONTH, SEASON_START_DAY, SEASON_LENGTH_DAYS
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    _warn_limited("CONFIG_IMPORT_FAILED_FALLBACK", f"exc_type={type(e).__name__}", limit=1)
     SEASON_START_MONTH = 10
     SEASON_START_DAY = 19
     SEASON_LENGTH_DAYS = 180
@@ -169,7 +170,8 @@ class LeagueService:
             finally:
                 try:
                     cur.close()
-                except Exception:
+                except Exception as e:
+                    _warn_limited("CURSOR_CLOSE_FAILED", f"exc_type={type(e).__name__}", limit=1)
                     pass
             return
 
