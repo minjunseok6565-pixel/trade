@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, Literal
 
+import logging
+
 from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id, season_id_from_year as _schema_season_id_from_year
 
 
@@ -22,6 +24,9 @@ class AdapterContext(TypedDict, total=False):
 
 
 _ALLOWED_PHASES: Tuple[str, ...] = ("regular", "play_in", "playoffs", "preseason")
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- utilities -----------------------------------------------------------
@@ -691,12 +696,14 @@ def adapt_matchengine_result_to_v2(
     # Required integer fields
     try:
         overtime_periods = int(meta.get("overtime_periods", 0) or 0)
-    except Exception:
+    except (TypeError, ValueError):
+        logger.warning("V2_ADAPTER_INT_COERCE_FAILED overtime_periods=%r", meta.get("overtime_periods"), exc_info=True)
         overtime_periods = 0
 
     try:
         possessions_per_team = int(raw.get("possessions_per_team", 0) or 0)
-    except Exception:
+    except (TypeError, ValueError):
+        logger.warning("V2_ADAPTER_INT_COERCE_FAILED possessions_per_team=%r", raw.get("possessions_per_team"), exc_info=True)
         possessions_per_team = 0
 
     game = {
