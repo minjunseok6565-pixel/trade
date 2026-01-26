@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
-from typing import Any
+from threading import RLock
+from typing import Any, Callable, Optional
 
 from config import ALL_TEAM_IDS, INITIAL_SEASON_YEAR, SEASON_START_DAY, SEASON_START_MONTH
 from schema import season_id_from_year as _season_id_from_year
@@ -64,6 +65,9 @@ __all__ = [
     "asset_locks_set",
     "negotiations_get",
     "negotiations_set",
+    "negotiation_session_get",
+    "negotiation_session_put",
+    "negotiation_session_update",
     "trade_market_get",
     "trade_market_set",
     "trade_memory_get",
@@ -78,6 +82,11 @@ __all__ = [
 
 def _s() -> dict:
     return _get_state()
+
+
+# NOTE: Single-process safety. Serialize all negotiation session mutations
+# to prevent lost updates (read-modify-write races).
+_NEGOTIATIONS_LOCK = RLock()
 
 
 def _season_year_from_season_id(season_id: str) -> int:
@@ -718,12 +727,48 @@ def asset_locks_set(value: dict) -> None:
 
 
 def negotiations_get() -> dict:
-    return deepcopy(_s().get("negotiations") or {})
+    with _NEGOTIATIONS_LOCK:
+        return deepcopy(_s().get("negotiations") or {})
 
 
 def negotiations_set(value: dict) -> None:
-    _s()["negotiations"] = deepcopy(value)
-    validate_game_state(_s())
+    with _NEGOTIATIONS_LOCK:
+        _s()["negotiations"] = deepcopy(value)
+        validate_game_state(_s())
+
+
+def negotiation_session_get(session_id: str) -> Optional[dict]:
+    """Return a snapshot (deep copy) of one negotiation session, or None."""
+    with _NEGOTIATIONS_LOCK:
+        negotiations = _s().get("negotiations") or {}
+        session = negotiations.get(session_id)
+        return deepcopy(session) if session is not None else None
+
+
+def negotiation_session_put(session_id: str, session: dict) -> None:
+    """Upsert one negotiation session (deep-copied) and validate."""
+    with _NEGOTIATIONS_LOCK:
+        negotiations = _s().setdefault("negotiations", {})
+        negotiations[session_id] = deepcopy(session)
+        validate_game_state(_s())
+
+
+def negotiation_session_update(session_id: str, mutator: Callable[[dict], None]) -> dict:
+    """Atomically read-modify-write a single session under lock and validate.
+
+    Raises KeyError if the session_id does not exist.
+    Returns a snapshot (deep copy) of the updated session.
+    """
+    with _NEGOTIATIONS_LOCK:
+        negotiations = _s().setdefault("negotiations", {})
+        if session_id not in negotiations:
+            raise KeyError(session_id)
+
+        working = deepcopy(negotiations[session_id])
+        mutator(working)
+        negotiations[session_id] = working
+        validate_game_state(_s())
+        return deepcopy(working)
 
 
 def trade_market_get() -> dict:
