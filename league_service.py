@@ -25,6 +25,18 @@ from datetime import date
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    """Log a WARNING with traceback, but cap repeats per code.
+
+    This avoids spamming logs in hot loops while still recording error types.
+    """
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id, season_id_from_year
@@ -67,7 +79,8 @@ def _json_loads(value: Any, default: Any):
         return value
     try:
         return json.loads(value)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
+        _warn_limited("JSON_DECODE_FAILED", f"value_preview={repr(str(value))[:120]}", limit=3)
         return default
 
 
@@ -91,7 +104,8 @@ def _extract_team_ids_from_deal(deal: Any) -> List[str]:
         teams = getattr(deal, "teams", None)
         if teams:
             return [str(t) for t in list(teams)]
-    except Exception:
+    except (AttributeError, TypeError):
+        _warn_limited("DEAL_TEAMS_EXTRACT_FAILED", f"deal_type={type(deal).__name__}", limit=3)
         pass
 
     if isinstance(deal, dict):
@@ -99,7 +113,8 @@ def _extract_team_ids_from_deal(deal: Any) -> List[str]:
         if teams:
             try:
                 return [str(t) for t in list(teams)]
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DEAL_TEAMS_COERCE_FAILED", f"teams_value={teams!r}", limit=3)
                 return [str(teams)]
         legs = deal.get("legs")
         if isinstance(legs, dict) and legs:
@@ -179,13 +194,15 @@ class LeagueService:
         for k, v in salary_by_year.items():
             try:
                 year_i = int(k)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_YEAR_KEY_COERCE_FAILED", f"k={k!r}")
                 continue
             if v is None:
                 continue
             try:
                 val_f = float(v)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_VALUE_COERCE_FAILED", f"year_key={k!r} value={v!r}")
                 continue
             out[str(year_i)] = val_f
         return out
@@ -200,7 +217,8 @@ class LeagueService:
                 return None
             try:
                 return int(float(v))
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_FOR_SEASON_COERCE_FAILED", f"season_year={season_year!r} value={v!r}")
                 return None
         return None
 
@@ -374,11 +392,13 @@ class LeagueService:
             salary_by_year = c.get("salary_by_year") or {}
             try:
                 start_year_i = int(start_year) if start_year is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_START_YEAR_COERCE_FAILED", f"contract_id={contract_id} value={start_year!r}")
                 start_year_i = None
             try:
                 years_i = int(years) if years is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_YEARS_COERCE_FAILED", f"contract_id={contract_id} value={years!r}")
                 years_i = None
             start_season_id = str(season_id_from_year(start_year_i)) if start_year_i else None
             end_season_id = (
@@ -477,11 +497,13 @@ class LeagueService:
             pid = str(pick.get("pick_id") or pick_id)
             try:
                 year = int(pick.get("year") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_YEAR_COERCE_FAILED", f"pick_id={pid} value={pick.get('year')!r}")
                 year = 0
             try:
                 rnd = int(pick.get("round") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_ROUND_COERCE_FAILED", f"pick_id={pid} value={pick.get('round')!r}")
                 rnd = 0
             original = str(pick.get("original_team") or "").upper()
             owner = str(pick.get("owner_team") or "").upper()
@@ -816,7 +838,8 @@ class LeagueService:
         trade_date_iso = _coerce_iso(trade_date)
         try:
             trade_date_as_date = date.fromisoformat(str(trade_date_iso)[:10])
-        except Exception:
+        except (TypeError, ValueError):
+            _warn_limited("TRADE_DATE_PARSE_FAILED", f"trade_date={trade_date_iso!r}", limit=3)
             trade_date_as_date = date.today()
 
         # If deal_id not provided, derive a deterministic id from canonical payload.
@@ -1139,7 +1162,8 @@ class LeagueService:
         for k, v in dict(pick_order_by_pick_id).items():
             try:
                 pick_order[str(k)] = int(v)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("PICK_ORDER_INT_COERCE_FAILED", f"pick_id={k!r} value={v!r}", limit=3)
                 continue
 
         # then persist the mutated results back to DB.
@@ -1239,7 +1263,8 @@ class LeagueService:
         def _infer_start_season_year_from_date(d_iso: str) -> int:
             try:
                 d = _dt.date.fromisoformat(str(d_iso)[:10])
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SIGNED_DATE_PARSE_FAILED", f"signed_date={d_iso!r}", limit=3)
                 d = _dt.date.today()
             start_this = _dt.date(d.year, int(SEASON_START_MONTH), int(SEASON_START_DAY))
             start_prev = _dt.date(d.year - 1, int(SEASON_START_MONTH), int(SEASON_START_DAY))
@@ -1375,7 +1400,8 @@ class LeagueService:
         def _infer_start_season_year_from_date(d_iso: str) -> int:
             try:
                 d = _dt.date.fromisoformat(str(d_iso)[:10])
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SIGNED_DATE_PARSE_FAILED", f"signed_date={d_iso!r}", limit=3)
                 d = _dt.date.today()
             start_this = _dt.date(d.year, int(SEASON_START_MONTH), int(SEASON_START_DAY))
             start_prev = _dt.date(d.year - 1, int(SEASON_START_MONTH), int(SEASON_START_DAY))
@@ -1632,11 +1658,21 @@ class LeagueService:
                 # Determine expiry after option resolution
                 try:
                     start_year = int(contract.get("start_season_year") or 0)
-                except Exception:
+                except (TypeError, ValueError):
+                    _warn_limited(
+                        "CONTRACT_START_YEAR_COERCE_FAILED",
+                        f"contract_id={contract_id} value={contract.get('start_season_year')!r}",
+                        limit=3,
+                    )
                     start_year = 0
                 try:
                     years = int(contract.get("years") or 0)
-                except Exception:
+                except (TypeError, ValueError):
+                    _warn_limited(
+                        "CONTRACT_YEARS_COERCE_FAILED",
+                        f"contract_id={contract_id} value={contract.get('years')!r}",
+                        limit=3,
+                    )
                     years = 0
 
                 end_exclusive = start_year + max(years, 0)
