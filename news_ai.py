@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,15 @@ from state import (
 )
 from team_utils import get_conference_standings
 
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
+
 
 def _extract_text_from_gemini_response(resp: Any) -> str:
     text = getattr(resp, "text", None)
@@ -36,7 +46,8 @@ def _extract_text_from_gemini_response(resp: Any) -> str:
                 texts.append(t)
         if texts:
             return "\n".join(texts)
-    except Exception:
+    except (AttributeError, IndexError, TypeError):
+        _warn_limited("GEMINI_RESPONSE_SHAPE_UNEXPECTED", f"resp_type={type(resp).__name__}", limit=3)
         pass
 
     return str(resp)
@@ -133,7 +144,8 @@ def _as_date(value: Any) -> Optional[date]:
         s = s[:10]
     try:
         return date.fromisoformat(s)
-    except Exception:
+    except (TypeError, ValueError):
+        _warn_limited("DATE_PARSE_FAILED", f"value={value!r}", limit=3)
         return None
 
 
@@ -150,7 +162,8 @@ def build_week_summary_context() -> str:
     for g in snapshot.get("games", []):
         try:
             g_date = date.fromisoformat(g.get("date"))
-        except Exception:
+        except (TypeError, ValueError):
+            _warn_limited("GAME_DATE_PARSE_FAILED", f"date={g.get('date')!r}", limit=3)
             continue
         if week_start <= g_date <= current_date:
             games.append(g)
@@ -248,7 +261,8 @@ def generate_weekly_news(api_key: str) -> List[Dict[str, Any]]:
 
     try:
         data = json.loads(cleaned)
-    except Exception:
+    except json.JSONDecodeError:
+        _warn_limited("WEEKLY_NEWS_JSON_DECODE_FAILED", f"text_preview={cleaned[:120]!r}", limit=3)
         return []
 
     if not isinstance(data, list):
