@@ -1,0 +1,227 @@
+diff --git a/state_modules/state_store.py b/state_modules/state_store.py
+index 5e3c5e1..6b9dbe2 100644
+--- a/state_modules/state_store.py
++++ b/state_modules/state_store.py
+@@ -1,25 +1,250 @@
+ from __future__ import annotations
+
+-from typing import Any, Dict
++from contextlib import contextmanager
++from copy import deepcopy
++from threading import RLock, local
++from typing import Any, Dict, Iterator, Iterable, Mapping, MutableMapping, MutableSequence, Sequence, TypeVar
+
+ from state_schema import create_default_game_state, validate_game_state
+
+ # -------------------------------------------------------------------------
+-# 1. 전역 상태 및 스케줄/리그 상태 유틸
++# 전역 상태 저장소 (SSOT) + 트랜잭션 / 읽기 전용 뷰
+ # -------------------------------------------------------------------------
+ _STATE: Dict[str, Any] = create_default_game_state()
+ validate_game_state(_STATE)
+
++_STATE_LOCK = RLock()
++_TLS = local()
+
+-def _get_state() -> dict:
+-    return _STATE
++T = TypeVar("T")
++
++
++def _get_tx_depth() -> int:
++    depth = getattr(_TLS, "tx_depth", 0)
++    if not isinstance(depth, int) or depth < 0:
++        # Defensive: should never happen, but avoid cascading failures.
++        _TLS.tx_depth = 0
++        return 0
++    return depth
++
++
++def _set_tx_depth(value: int) -> None:
++    _TLS.tx_depth = value
++
++
++def _wrap_ro(value: Any) -> Any:
++    if isinstance(value, dict):
++        return _RODict(value)
++    if isinstance(value, list):
++        return _ROList(value)
++    return value
++
++
++class _RODict(Mapping[str, Any]):
++    """
++    Read-only dict view (deep, via lazy wrapping of nested dict/list).
++    Any attempt to mutate raises TypeError.
++    """
++
++    __slots__ = ("_d",)
++
++    def __init__(self, d: MutableMapping[str, Any]):
++        self._d = d
++
++    # ---- Mapping (read) ----
++    def __getitem__(self, key: str) -> Any:
++        return _wrap_ro(self._d[key])
++
++    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
++        if key in self._d:
++            return _wrap_ro(self._d.get(key))
++        return default
++
++    def __iter__(self) -> Iterator[str]:
++        return iter(self._d)
++
++    def __len__(self) -> int:
++        return len(self._d)
++
++    def __contains__(self, key: object) -> bool:
++        return key in self._d
++
++    def keys(self) -> Iterable[str]:  # type: ignore[override]
++        return self._d.keys()
++
++    def items(self) -> Iterable[tuple[str, Any]]:  # type: ignore[override]
++        for k, v in self._d.items():
++            yield (k, _wrap_ro(v))
++
++    def values(self) -> Iterable[Any]:  # type: ignore[override]
++        for v in self._d.values():
++            yield _wrap_ro(v)
++
++    def __repr__(self) -> str:
++        return f"_RODict({self._d!r})"
++
++    # ---- Mutation blockers ----
++    def _blocked(self, *_: Any, **__: Any) -> None:
++        raise TypeError("state is read-only")
++
++    __setitem__ = _blocked  # type: ignore[assignment]
++    __delitem__ = _blocked  # type: ignore[assignment]
++    clear = _blocked
++    pop = _blocked
++    popitem = _blocked
++    setdefault = _blocked
++    update = _blocked
++
++
++class _ROList(Sequence[Any]):
++    """
++    Read-only list view (deep, via lazy wrapping of nested dict/list).
++    Any attempt to mutate raises TypeError.
++    """
++
++    __slots__ = ("_l",)
++
++    def __init__(self, l: MutableSequence[Any]):
++        self._l = l
++
++    # ---- Sequence (read) ----
++    def __getitem__(self, idx: int | slice) -> Any:
++        v = self._l[idx]
++        if isinstance(idx, slice):
++            return [_wrap_ro(x) for x in v]
++        return _wrap_ro(v)
++
++    def __iter__(self) -> Iterator[Any]:
++        for v in self._l:
++            yield _wrap_ro(v)
++
++    def __len__(self) -> int:
++        return len(self._l)
++
++    def __contains__(self, item: object) -> bool:
++        return item in self._l
++
++    def __repr__(self) -> str:
++        return f"_ROList({self._l!r})"
++
++    # ---- Mutation blockers ----
++    def _blocked(self, *_: Any, **__: Any) -> None:
++        raise TypeError("state is read-only")
++
++    __setitem__ = _blocked  # type: ignore[assignment]
++    __delitem__ = _blocked  # type: ignore[assignment]
++    append = _blocked
++    extend = _blocked
++    insert = _blocked
++    remove = _blocked
++    pop = _blocked
++    clear = _blocked
++    sort = _blocked
++    reverse = _blocked
++
++
++@contextmanager
++def transaction(reason: str = "") -> Iterator[Dict[str, Any]]:
++    """
++    Stateful mutation transaction for the global game state.
++
++    - Provides the only supported mutable access to the global state.
++    - Nested transactions are allowed; validation happens only once at the
++      outermost transaction commit.
++    - Validation runs while holding the global lock (fail-fast).
++    - No rollback: if an exception occurs, the exception propagates and any
++      partial mutations remain (same behavior class as the current codebase).
++    """
++    # One lock for both reads & writes to ensure coherent view.
++    with _STATE_LOCK:
++        depth = _get_tx_depth()
++        _set_tx_depth(depth + 1)
++        try:
++            yield _STATE
++            # Commit validation only at outermost boundary.
++            depth_after = _get_tx_depth() - 1
++            _set_tx_depth(depth_after)
++            if depth_after == 0:
++                validate_game_state(_STATE)
++        except Exception as e:
++            # Ensure depth counter stays consistent even on failure.
++            depth_after = _get_tx_depth() - 1
++            _set_tx_depth(max(depth_after, 0))
++            # Preserve the original exception context; add reason detail.
++            if reason:
++                raise RuntimeError(f"state transaction failed: {reason}") from e
++            raise
++
++
++@contextmanager
++def read_state() -> Iterator[Mapping[str, Any]]:
++    """
++    Read-only (deep) view of the global state, protected by the global lock.
++    Use this for live read access (no deepcopy).
++    """
++    with _STATE_LOCK:
++        yield _RODict(_STATE)
++
++
++def snapshot_state() -> Dict[str, Any]:
++    """
++    Deepcopy snapshot of the global state, protected by the global lock.
++    Use this for exporting/serializing.
++    """
++    with _STATE_LOCK:
++        return deepcopy(_STATE)
++
+
+ def reset_state_for_dev() -> None:
++    """
++    Developer-only state reset. Disallowed inside an active transaction.
++    """
+     global _STATE
+-    _STATE = create_default_game_state()
+-    validate_game_state(_STATE)
++    with _STATE_LOCK:
++        if _get_tx_depth() > 0:
++            raise RuntimeError("reset_state_for_dev() is not allowed during a state transaction")
++        _STATE = create_default_game_state()
++        validate_game_state(_STATE)
+
+
+-__all__ = ["reset_state_for_dev"]
++__all__ = [
++    "transaction",
++    "read_state",
++    "snapshot_state",
++    "reset_state_for_dev",
++]
