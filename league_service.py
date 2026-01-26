@@ -599,14 +599,24 @@ class LeagueService:
             value = asset.get("value")
             try:
                 value_f = float(value) if value is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited(
+                    "FIXED_ASSET_VALUE_COERCE_FAILED",
+                    f"asset_id={asset_id!r} value={value!r}",
+                    limit=3,
+                )
                 value_f = None
             owner = str(asset.get("owner_team") or "").upper()
             source_pick_id = asset.get("source_pick_id")
             draft_year = asset.get("draft_year")
             try:
                 draft_year_i = int(draft_year) if draft_year is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited(
+                    "FIXED_ASSET_DRAFT_YEAR_COERCE_FAILED",
+                    f"asset_id={asset_id!r} draft_year={draft_year!r}",
+                    limit=3,
+                )
                 draft_year_i = None
             attrs = dict(asset)
             rows.append(
@@ -1520,7 +1530,12 @@ class LeagueService:
             for opt in raw_opts:
                 try:
                     normalized_opts.append(normalize_option_record(opt))
-                except Exception:
+                except (KeyError, TypeError, ValueError):
+                    _warn_limited(
+                        "CONTRACT_OPTION_NORMALIZE_FAILED",
+                        f"contract_id={contract_id!r} opt_preview={repr(opt)[:120]}",
+                        limit=3,
+                    )
                     continue
             contract["options"] = normalized_opts
 
@@ -1621,7 +1636,12 @@ class LeagueService:
                 for opt in raw_opts:
                     try:
                         normalized_opts.append(normalize_option_record(opt))
-                    except Exception:
+                    except (KeyError, TypeError, ValueError):
+                        _warn_limited(
+                            "CONTRACT_OPTION_NORMALIZE_FAILED",
+                            f"contract_id={contract_id!r} opt_preview={repr(opt)[:120]}",
+                            limit=3,
+                        )
                         continue
                 contract["options"] = normalized_opts
 
