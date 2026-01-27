@@ -5,12 +5,13 @@ import logging
 import os
 from dataclasses import replace
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from derived_formulas import compute_derived
 from league_repo import LeagueRepo
 from matchengine_v3.models import Player, TeamState
 from matchengine_v3.tactics import TacticsConfig
+import schema
 
 
 logger = logging.getLogger(__name__)
@@ -323,24 +324,46 @@ def _select_lineup(
     return chosen[:max_players]
 
 
-def load_team_players_from_db(repo: LeagueRepo, team_id: str) -> List[Player]:
-    roster_rows = repo.get_team_roster(team_id)
+def _normalize_pid_list(values: Optional[List[Any]]) -> List[str]:
+    out: List[str] = []
+    for v in values or []:
+        out.append(str(schema.normalize_player_id(v)))
+    return out
+
+
+def load_team_players_from_db(repo: LeagueRepo, team_id: str) -> Tuple[List[Player], Optional[str]]:
+    tid = schema.normalize_team_id(team_id)
+    roster_rows = repo.get_team_roster(str(tid))
     if not roster_rows:
-        raise ValueError(f"Team '{team_id}' not found in roster DB")
+        raise ValueError(f"Team '{str(tid)}' not found in roster DB")
+
+    # Best-effort display name: if roster rows provide a team display name, use it.
+    # If absent, caller should fall back to team_id (display-only default).
+    team_display_name: Optional[str] = None
+    try:
+        first = roster_rows[0]
+        if isinstance(first, dict):
+            raw = first.get("team_name") or first.get("teamName") or first.get("team_display_name")
+            if raw is not None and str(raw).strip():
+                team_display_name = str(raw).strip()
+    except Exception:
+        # Display-only; do not hide real data problems elsewhere.
+        team_display_name = None
 
     players: List[Player] = []
     for row in roster_rows:
         attrs = row.get("attrs") or {}
         derived = compute_derived(attrs)
+        pid = schema.normalize_player_id(row.get("player_id"))
         players.append(
             Player(
-                pid=str(row.get("player_id")),
+                pid=str(pid),
                 name=str(row.get("name") or attrs.get("Name") or ""),
                 pos=str(row.get("pos") or attrs.get("POS") or attrs.get("Position") or "G"),
                 derived=derived,
             )
         )
-    return players
+    return players, team_display_name
 
 
 def build_team_state_from_db(
@@ -349,26 +372,32 @@ def build_team_state_from_db(
     team_id: str,
     tactics: Optional[Dict[str, Any]] = None,
 ) -> TeamState:
+    tid = schema.normalize_team_id(team_id)
     lineup_info = tactics.get("lineup", {}) if tactics else {}
-    starters = lineup_info.get("starters") or []
-    bench = lineup_info.get("bench") or []
+    starters = _normalize_pid_list(lineup_info.get("starters") or [])
+    bench = _normalize_pid_list(lineup_info.get("bench") or [])
     max_players = int((tactics or {}).get("rotation_size") or 10)
 
-    players = load_team_players_from_db(repo, team_id)
+    players, team_display_name = load_team_players_from_db(repo, str(tid))
     max_players = max(5, min(max_players, len(players)))
     lineup = _select_lineup(players, starters, bench, max_players=max_players)
     roles = _build_roles_from_lineup(lineup[:5])
     tactics_cfg = _build_tactics_config(tactics)
-    _apply_default_coach_preset(team_id, tactics_cfg)
-    _apply_coach_preset_tactics(team_id, tactics_cfg, tactics)
+    _apply_default_coach_preset(str(tid), tactics_cfg)
+    _apply_coach_preset_tactics(str(tid), tactics_cfg, tactics)
 
-    team_state = TeamState(name=str(team_id).upper(), lineup=lineup, tactics=tactics_cfg, roles=roles)
+    # SSOT: team identity is *always* team_id. name is display-only.
+    display_name = str(team_display_name).strip() if team_display_name else ""
+    if not display_name:
+        display_name = str(tid)
+
+    team_state = TeamState(team_id=str(tid), name=display_name, lineup=lineup, tactics=tactics_cfg, roles=roles)
     minutes = (tactics or {}).get("minutes") or {}
     if isinstance(minutes, dict) and minutes:
         team_state = replace(
             team_state,
             rotation_target_sec_by_pid={
-                str(pid): int(float(mins) * 60)
+                str(schema.normalize_player_id(pid)): int(float(mins) * 60)
                 for pid, mins in minutes.items()
                 if pid is not None and mins is not None
             },
