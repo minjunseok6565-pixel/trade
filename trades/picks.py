@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import os
 import contextlib
 from typing import List
 
 def _get_db_path_from_game_state(game_state: dict) -> str:
     league = game_state.get("league", {}) if isinstance(game_state, dict) else {}
-    if isinstance(league, dict):
-        db_path = league.get("db_path")
-        if db_path:
-            return str(db_path)
-    return os.environ.get("LEAGUE_DB_PATH", "league.db")
+    if not isinstance(league, dict):
+        raise ValueError("game_state['league'] must be a dict and contain 'db_path'")
+    db_path = league.get("db_path")
+    if not db_path:
+        raise ValueError("game_state['league']['db_path'] is required")
+    return str(db_path)
 
 
 @contextlib.contextmanager
