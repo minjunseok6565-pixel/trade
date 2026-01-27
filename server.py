@@ -174,7 +174,12 @@ def extract_text_from_gemini_response(resp: Any) -> str:
 # -------------------------------------------------------------------------
 @app.post("/api/simulate-game")
 async def api_simulate_game(req: SimGameRequest):
-    """matchengine_v3를 사용해 한 경기를 시뮬레이션한다."""
+    """matchengine_v3를 사용해 한 경기를 시뮬레이션한다.
+
+    NOTE (SSOT 계약):
+    - Home/Away SSOT는 league_sim.simulate_single_game 내부에서 GameContext로 생성/주입된다.
+    - server는 엔진을 직접 호출하지 않으며(직접 호출 금지), 결과는 어댑터+validator 관문을 통과한 V2만 반환한다.
+    """
     try:
         result = simulate_single_game(
             home_team_id=req.home_team_id,
@@ -660,6 +665,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
