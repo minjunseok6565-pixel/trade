@@ -54,7 +54,6 @@ def _require_str(v: Any, path: str) -> str:
 
 
 def build_context_from_master_schedule_entry(
-    *,
     entry: Mapping[str, Any],
     league_state: Mapping[str, Any],
     *,
