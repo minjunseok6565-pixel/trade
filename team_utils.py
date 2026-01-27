@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
@@ -49,9 +48,8 @@ def _repo_ctx() -> "LeagueRepo":
     if LeagueRepo is None:
         raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
 
-    db_path = os.environ.get("LEAGUE_DB_PATH", get_db_path())
-
-    with LeagueRepo(str(db_path)) as repo:
+    db_path = get_db_path()
+    with LeagueRepo(db_path) as repo:
         try:
             repo.init_db()
         except Exception as exc:
@@ -70,10 +68,10 @@ def _list_active_team_ids() -> List[str]:
             teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
             if teams:
                 return teams
-    except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+    except (ImportError, sqlite3.Error, OSError, TypeError):
         _warn_limited(
             "LIST_TEAMS_FAILED_FALLBACK_ALL",
-            f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+            f"db_path={get_db_path()!r}",
             limit=3,
         )
         pass
@@ -84,10 +82,10 @@ def _has_free_agents_team() -> bool:
     try:
         with _repo_ctx() as repo:
             return "FA" in {str(t).upper() for t in repo.list_teams()}
-    except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+    except (ImportError, sqlite3.Error, OSError, TypeError):
         _warn_limited(
             "HAS_FA_TEAM_CHECK_FAILED",
-            f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+            f"db_path={get_db_path()!r}",
             limit=3,
         )
         return False
@@ -141,10 +139,10 @@ def _init_players_and_teams_if_needed() -> None:
                         pass
                 players_set(updated_players)
                 return
-        except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+        except (ImportError, sqlite3.Error, OSError, TypeError):
             _warn_limited(
                 "INIT_PLAYERS_CACHE_REFRESH_FAILED",
-                f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+                f"db_path={get_db_path()!r}",
                 limit=3,
             )
             return
@@ -438,6 +436,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
