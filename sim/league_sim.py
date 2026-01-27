@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+import schema
+
 from league_repo import LeagueRepo
 from matchengine_v2_adapter import (
     adapt_matchengine_result_to_v2,
@@ -50,14 +52,14 @@ def _run_match(
     game_date: str,
     home_tactics: Optional[Dict[str, Any]] = None,
     away_tactics: Optional[Dict[str, Any]] = None,
-    context: Dict[str, Any],
+    context: schema.GameContext,
 ) -> Dict[str, Any]:
     rng = random.Random()
     with _repo_ctx() as repo:
         home = build_team_state_from_db(repo=repo, team_id=home_team_id, tactics=home_tactics)
         away = build_team_state_from_db(repo=repo, team_id=away_team_id, tactics=away_tactics)
 
-    raw_result = simulate_game(rng, home, away)
+    raw_result = simulate_game(rng, home, away, context=context)
     v2_result = adapt_matchengine_result_to_v2(
         raw_result=raw_result,
         context=context,
@@ -122,10 +124,12 @@ def advance_league_until(
             if user_team_upper and (home_id == user_team_upper or away_id == user_team_upper):
                 continue
 
+            # SSOT: context date must come from entry["date"] (no override arg in builder).
+            entry_for_ctx = dict(g)
+            entry_for_ctx["date"] = day_str
             context = build_context_from_master_schedule_entry(
-                entry=g,
+                entry=entry_for_ctx,
                 league_state=league_context,
-                date_override=day_str,
                 phase=str(g.get("phase") or "regular"),
             )
 
@@ -157,7 +161,7 @@ def simulate_single_game(
 
     context = build_context_from_team_ids(
         game_id=game_id,
-        date_str=game_date_str,
+        date=game_date_str,
         home_team_id=home_team_id,
         away_team_id=away_team_id,
         league_state=league_context,
