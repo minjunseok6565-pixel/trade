@@ -185,20 +185,20 @@ def build_week_summary_context() -> str:
     # Transactions are stored in SQLite (SSOT). The workflow snapshot excludes them by default.
     tx_rows: List[Dict[str, Any]] = []
     repo: Optional[LeagueRepo] = None
+    db_path = get_db_path()
     try:
-        repo = LeagueRepo(get_db_path())
+        repo = LeagueRepo(db_path)
         repo.init_db()
         tx_rows = repo.list_transactions(limit=500, since_date=week_start.isoformat())
     except Exception as e:
-        _warn_limited("NEWS_TX_DB_FAILED_FALLBACK", f"db_path={get_db_path()!r} exc_type={type(e).__name__}", limit=3)
-        # Fallback (legacy/testing): if transactions exist in the workflow snapshot, use them.
-        tx_rows = snapshot.get("transactions", []) or []
+        _warn_limited("NEWS_TX_DB_FAILED", f"db_path={db_path!r} exc_type={type(e).__name__}", limit=3)
+        tx_rows = []
     finally:
         try:
             if repo:
                 repo.close()
         except Exception as e:
-            _warn_limited("NEWS_TX_DB_CLOSE_FAILED", f"db_path={get_db_path()!r} exc_type={type(e).__name__}", limit=1)
+            _warn_limited("NEWS_TX_DB_CLOSE_FAILED", f"db_path={db_path!r} exc_type={type(e).__name__}", limit=1)
             pass
 
     for t in tx_rows:
