@@ -12,14 +12,14 @@ Goal:
 - All runtime reads/writes go through SQLite.
 
 Usage (CLI):
-  python league_repo.py init --db league.db
-  python league_repo.py import_roster --db league.db --excel roster.xlsx
-  python league_repo.py validate --db league.db
-  python league_repo.py export_roster --db league.db --excel roster_export.xlsx
+  python league_repo.py init --db <db_path>
+  python league_repo.py import_roster --db <db_path> --excel roster.xlsx
+  python league_repo.py validate --db <db_path>
+  python league_repo.py export_roster --db <db_path> --excel roster_export.xlsx
 
 Python:
   from league_repo import LeagueRepo
-  repo = LeagueRepo("league.db")
+  repo = LeagueRepo("<db_path>")
   repo.import_roster_excel("roster.xlsx", mode="replace")
   team = repo.get_team_roster("ATL")
 """
