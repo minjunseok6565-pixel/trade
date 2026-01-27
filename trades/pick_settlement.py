@@ -7,6 +7,7 @@ from .errors import PROTECTION_INVALID, SWAP_INVALID, TradeError
 
 
 def _get_db_path_from_game_state(game_state: dict) -> str:
+    league = game_state.get("league", {}) if isinstance(game_state, dict) else {}
     if not isinstance(league, dict):
         raise ValueError("game_state['league'] must be a dict and contain 'db_path'")
     db_path = league.get("db_path")
