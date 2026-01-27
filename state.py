@@ -126,16 +126,17 @@ def _season_id_for_year(season_year: int) -> str:
     return str(_season_id_from_year(int(season_year)))
 
 
-def _ensure_db_path_in_league(league: dict) -> str:
-    """contracts.offseason이 요구하는 league.db_path를 항상 채워 넣는다."""
+def _require_db_path_in_league(league: dict) -> str:
+    """league.db_path를 반드시 요구한다(기본값/자동 주입 없음)."""
     if not isinstance(league, dict):
         raise ValueError("GameState invalid: league must be dict")
     db_path = league.get("db_path")
-    if db_path:
-        return str(db_path)
-    # 기존 코드베이스의 기본 정책과 동일하게 league.db를 기본값으로 둔다.
-    league["db_path"] = "league.db"
-    return "league.db"
+    if not db_path:
+        raise ValueError(
+            "GameState invalid: league.db_path is required. "
+            "Set it via state.set_db_path(...) before DB operations."
+        )
+    return str(db_path)
 
 
 def _clear_master_schedule(league: dict) -> None:
@@ -151,7 +152,7 @@ def _clear_master_schedule(league: dict) -> None:
 def _ensure_draft_picks_seeded_for_season_year(state: dict, season_year: int) -> None:
     """스케줄 생성/시즌 시작을 위해 필요한 draft_picks seed를 보장한다."""
     league = state["league"]
-    _ensure_db_path_in_league(league)
+    _require_db_path_in_league(league)
 
     trade_rules = league.get("trade_rules") or {}
     try:
@@ -239,7 +240,7 @@ def ensure_schedule_for_active_season(*, force: bool = False) -> None:
             from state_modules.state_cap import _apply_cap_model_for_season
             from state_modules import state_bootstrap, state_schedule
 
-            _ensure_db_path_in_league(league)
+            _require_db_path_in_league(league)
             _apply_cap_model_for_season(league, int(active_year))
             _ensure_draft_picks_seeded_for_season_year(state, int(active_year))
 
@@ -288,7 +289,7 @@ def start_new_season(
         if target_year <= 0:
             raise ValueError("season_year must be positive int")
 
-        _ensure_db_path_in_league(league)
+        _require_db_path_in_league(league)
 
         prev_active = state.get("active_season_id")
         prev_year = None
@@ -348,6 +349,12 @@ def startup_init_state() -> None:
         from state_modules import state_bootstrap
         from state_modules import state_migrations
 
+        # Enforce DB path policy early: no implicit defaults.
+        league = state.get("league")
+        if not isinstance(league, dict):
+            raise ValueError("GameState invalid: league must be dict")
+        _require_db_path_in_league(league)
+        
         state_bootstrap.ensure_db_initialized_and_seeded(state)
 
         # SSOT 초기화: active_season_id / league.season_year가 비어있으면 INITIAL 시즌을 명시적으로 시작한다.
@@ -808,9 +815,16 @@ def set_current_date(date_str: str | None) -> None:
 
 def get_db_path() -> str:
     def _impl(v: Mapping[str, Any]) -> str:
-        league = v.get("league") or {}
-        db_path = league.get("db_path") if hasattr(league, "get") else None
-        return str(db_path or "league.db")
+        league = v.get("league")
+        if not isinstance(league, Mapping):
+            raise ValueError("GameState invalid: league must be dict-like")
+        db_path = league.get("db_path")
+        if not db_path:
+            raise ValueError(
+                "GameState invalid: league.db_path is required. "
+                "Set it via state.set_db_path(...) before DB operations."
+            )
+        return str(db_path)
 
     return _read_state(_impl)
 
