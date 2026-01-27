@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+import logging
 import os
+import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    """Log warning with traceback, but cap repeats per code."""
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
+
 
 from derived_formulas import compute_derived
 from state import (
@@ -24,7 +38,7 @@ from config import ALL_TEAM_IDS, TEAM_TO_CONF_DIV
 _LEAGUE_REPO_IMPORT_ERROR: Optional[Exception] = None
 try:
     from league_repo import LeagueRepo  # type: ignore
-except Exception as e:  # pragma: no cover
+except ImportError as e:  # pragma: no cover
     LeagueRepo = None  # type: ignore
     _LEAGUE_REPO_IMPORT_ERROR = e
 
@@ -40,9 +54,12 @@ def _repo_ctx() -> "LeagueRepo":
     with LeagueRepo(str(db_path)) as repo:
         try:
             repo.init_db()
-        except Exception:
-            # init_db is idempotent; ignore if project uses a different init flow
-            pass
+        except Exception as exc:
+            logger.exception(
+                "[DB_INIT_FAILED] team_utils._repo_ctx repo.init_db() failed (db_path=%s)",
+                db_path,
+            )
+            raise
         yield repo
 
 
@@ -53,7 +70,12 @@ def _list_active_team_ids() -> List[str]:
             teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
             if teams:
                 return teams
-    except Exception:
+    except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+        _warn_limited(
+            "LIST_TEAMS_FAILED_FALLBACK_ALL",
+            f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+            limit=3,
+        )
         pass
     return list(ALL_TEAM_IDS)
 
@@ -62,7 +84,12 @@ def _has_free_agents_team() -> bool:
     try:
         with _repo_ctx() as repo:
             return "FA" in {str(t).upper() for t in repo.list_teams()}
-    except Exception:
+    except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+        _warn_limited(
+            "HAS_FA_TEAM_CHECK_FAILED",
+            f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+            limit=3,
+        )
         return False
 
 
@@ -103,16 +130,23 @@ def _init_players_and_teams_if_needed() -> None:
                         continue
                     try:
                         row = repo.get_player(str(pid))
-                    except Exception:
+                    except (sqlite3.Error, TypeError, ValueError):
+                        _warn_limited("DB_GET_PLAYER_FAILED", f"player_id={pid!r}", limit=3)
                         continue
                     attrs = row.get("attrs") or {}
                     try:
                         pdata["derived"] = compute_derived(attrs)
-                    except Exception:
+                    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                        _warn_limited("DERIVED_COMPUTE_FAILED", f"player_id={pid!r}", limit=3)
                         pass
                 players_set(updated_players)
                 return
-        except Exception:
+        except (ImportError, sqlite3.Error, OSError, TypeError, ValueError):
+            _warn_limited(
+                "INIT_PLAYERS_CACHE_REFRESH_FAILED",
+                f"db_path={os.environ.get('LEAGUE_DB_PATH', get_db_path())!r}",
+                limit=3,
+            )
             return
 
     # Fresh build from DB
@@ -126,7 +160,8 @@ def _init_players_and_teams_if_needed() -> None:
         for tid in roster_team_ids:
             try:
                 roster_rows = repo.get_team_roster(tid)
-            except Exception:
+            except (sqlite3.Error, TypeError, ValueError):
+                _warn_limited("DB_GET_TEAM_ROSTER_FAILED", f"team_id={tid!r}", limit=3)
                 continue
             for row in roster_rows:
                 pid = str(row.get("player_id"))
@@ -173,7 +208,12 @@ def _compute_team_payroll(team_id: str) -> float:
         for r in roster:
             try:
                 total += float(r.get("salary_amount") or 0.0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited(
+                    "PAYROLL_SALARY_COERCE_FAILED",
+                    f"team_id={team_id!r} raw={r.get('salary_amount')!r}",
+                    limit=3,
+                )
                 continue
     return float(total)
 
@@ -186,7 +226,8 @@ def _compute_cap_space(team_id: str) -> float:
     trade_rules = league_context.get("trade_rules", {})
     try:
         salary_cap = float(trade_rules.get("salary_cap") or 0.0)
-    except Exception:
+    except (TypeError, ValueError):
+        _warn_limited("SALARY_CAP_COERCE_FAILED", f"raw={trade_rules.get('salary_cap')!r}", limit=3)
         salary_cap = 0.0
     return salary_cap - payroll
 
@@ -397,6 +438,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 

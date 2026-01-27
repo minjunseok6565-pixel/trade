@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import date
 from typing import Optional
 
+import logging
 import random
+
+logger = logging.getLogger(__name__)
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
@@ -48,10 +51,19 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
 
     try:
         _attempt_ai_trade(target_date)
-    except TradeError:
-        pass
-    except Exception:
-        pass
+    except TradeError as exc:
+        logger.warning(
+            "[AI_GM_TRADE_ERROR] TradeError during AI GM tick (target_date=%s): %s",
+            target_date.isoformat(),
+            str(exc),
+            exc_info=True,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[AI_GM_TICK_FAILED] Unexpected error during AI GM tick (target_date=%s)",
+            target_date.isoformat(),
+        )
+        raise
 
     set_last_gm_tick_date(target_date.isoformat())
 

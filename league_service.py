@@ -17,10 +17,26 @@ import contextlib
 import datetime as _dt
 import hashlib
 import json
+import logging
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    """Log a WARNING with traceback, but cap repeats per code.
+
+    This avoids spamming logs in hot loops while still recording error types.
+    """
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id, season_id_from_year
@@ -31,7 +47,8 @@ from contracts.models import new_contract_id, make_contract_record
 # Season inference (fallbacks keep Service usable even in minimal test harnesses)
 try:
     from config import SEASON_START_MONTH, SEASON_START_DAY, SEASON_LENGTH_DAYS
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    _warn_limited("CONFIG_IMPORT_FAILED_FALLBACK", f"exc_type={type(e).__name__}", limit=1)
     SEASON_START_MONTH = 10
     SEASON_START_DAY = 19
     SEASON_LENGTH_DAYS = 180
@@ -63,7 +80,8 @@ def _json_loads(value: Any, default: Any):
         return value
     try:
         return json.loads(value)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
+        _warn_limited("JSON_DECODE_FAILED", f"value_preview={repr(str(value))[:120]}", limit=3)
         return default
 
 
@@ -87,7 +105,8 @@ def _extract_team_ids_from_deal(deal: Any) -> List[str]:
         teams = getattr(deal, "teams", None)
         if teams:
             return [str(t) for t in list(teams)]
-    except Exception:
+    except (AttributeError, TypeError):
+        _warn_limited("DEAL_TEAMS_EXTRACT_FAILED", f"deal_type={type(deal).__name__}", limit=3)
         pass
 
     if isinstance(deal, dict):
@@ -95,7 +114,8 @@ def _extract_team_ids_from_deal(deal: Any) -> List[str]:
         if teams:
             try:
                 return [str(t) for t in list(teams)]
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DEAL_TEAMS_COERCE_FAILED", f"teams_value={teams!r}", limit=3)
                 return [str(teams)]
         legs = deal.get("legs")
         if isinstance(legs, dict) and legs:
@@ -150,7 +170,8 @@ class LeagueService:
             finally:
                 try:
                     cur.close()
-                except Exception:
+                except Exception as e:
+                    _warn_limited("CURSOR_CLOSE_FAILED", f"exc_type={type(e).__name__}", limit=1)
                     pass
             return
 
@@ -175,13 +196,15 @@ class LeagueService:
         for k, v in salary_by_year.items():
             try:
                 year_i = int(k)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_YEAR_KEY_COERCE_FAILED", f"k={k!r}")
                 continue
             if v is None:
                 continue
             try:
                 val_f = float(v)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_VALUE_COERCE_FAILED", f"year_key={k!r} value={v!r}")
                 continue
             out[str(year_i)] = val_f
         return out
@@ -196,7 +219,8 @@ class LeagueService:
                 return None
             try:
                 return int(float(v))
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SALARY_FOR_SEASON_COERCE_FAILED", f"season_year={season_year!r} value={v!r}")
                 return None
         return None
 
@@ -370,11 +394,13 @@ class LeagueService:
             salary_by_year = c.get("salary_by_year") or {}
             try:
                 start_year_i = int(start_year) if start_year is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_START_YEAR_COERCE_FAILED", f"contract_id={contract_id} value={start_year!r}")
                 start_year_i = None
             try:
                 years_i = int(years) if years is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_YEARS_COERCE_FAILED", f"contract_id={contract_id} value={years!r}")
                 years_i = None
             start_season_id = str(season_id_from_year(start_year_i)) if start_year_i else None
             end_season_id = (
@@ -473,11 +499,13 @@ class LeagueService:
             pid = str(pick.get("pick_id") or pick_id)
             try:
                 year = int(pick.get("year") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_YEAR_COERCE_FAILED", f"pick_id={pid} value={pick.get('year')!r}")
                 year = 0
             try:
                 rnd = int(pick.get("round") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_ROUND_COERCE_FAILED", f"pick_id={pid} value={pick.get('round')!r}")
                 rnd = 0
             original = str(pick.get("original_team") or "").upper()
             owner = str(pick.get("owner_team") or "").upper()
@@ -573,14 +601,16 @@ class LeagueService:
             value = asset.get("value")
             try:
                 value_f = float(value) if value is not None else None
-            except Exception:
+            except (TypeError, ValueError, OverflowError) as e:
+                _warn_limited("FIXED_ASSET_VALUE_COERCE_FAILED", f"asset_id={asset_id!r} value={value!r} exc_type={type(e).__name__}", limit=3)
                 value_f = None
             owner = str(asset.get("owner_team") or "").upper()
             source_pick_id = asset.get("source_pick_id")
             draft_year = asset.get("draft_year")
             try:
                 draft_year_i = int(draft_year) if draft_year is not None else None
-            except Exception:
+            except (TypeError, ValueError, OverflowError) as e:
+                _warn_limited("FIXED_ASSET_DRAFT_YEAR_COERCE_FAILED", f"asset_id={asset_id!r} draft_year={draft_year!r} exc_type={type(e).__name__}", limit=3)
                 draft_year_i = None
             attrs = dict(asset)
             rows.append(
@@ -812,7 +842,8 @@ class LeagueService:
         trade_date_iso = _coerce_iso(trade_date)
         try:
             trade_date_as_date = date.fromisoformat(str(trade_date_iso)[:10])
-        except Exception:
+        except (TypeError, ValueError):
+            _warn_limited("TRADE_DATE_PARSE_FAILED", f"trade_date={trade_date_iso!r}", limit=3)
             trade_date_as_date = date.today()
 
         # If deal_id not provided, derive a deterministic id from canonical payload.
@@ -835,18 +866,32 @@ class LeagueService:
                 existing["already_executed"] = True
                 return existing
 
-        # Validation (best effort but should be present in real runtime).
-        # Prefer validator.validate_deal if available.
+        # Validation (required): trades.validator.validate_deal must be present in runtime.
         try:
             from trades.validator import validate_deal  # type: ignore
-        except Exception:
-            validate_deal = None  # type: ignore
-        if callable(validate_deal):
-            validate_deal(
-                deal_obj,
-                current_date=trade_date_as_date,
-                allow_locked_by_deal_id=str(deal_id),
+        except ImportError as exc:
+            logger.exception(
+                "[TRADE_VALIDATOR_IMPORT_FAILED] execute_trade cannot import trades.validator.validate_deal"
             )
+            raise ImportError(
+                "trades.validator.validate_deal is required to execute trades"
+            ) from exc
+        except Exception as exc:
+            logger.exception(
+                "[TRADE_VALIDATOR_IMPORT_FAILED] execute_trade failed while importing trades.validator.validate_deal"
+            )
+            raise RuntimeError(
+                "failed to import trades.validator.validate_deal"
+            ) from exc
+
+        if not callable(validate_deal):
+            raise TypeError("trades.validator.validate_deal must be callable")
+
+        validate_deal(
+            deal_obj,
+            current_date=trade_date_as_date,
+            allow_locked_by_deal_id=str(deal_id),
+        )
 
         # Helpers
         def _resolve_receiver(sender_team: str, asset: Any) -> str:
@@ -1121,7 +1166,8 @@ class LeagueService:
         for k, v in dict(pick_order_by_pick_id).items():
             try:
                 pick_order[str(k)] = int(v)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("PICK_ORDER_INT_COERCE_FAILED", f"pick_id={k!r} value={v!r}", limit=3)
                 continue
 
         # then persist the mutated results back to DB.
@@ -1221,7 +1267,8 @@ class LeagueService:
         def _infer_start_season_year_from_date(d_iso: str) -> int:
             try:
                 d = _dt.date.fromisoformat(str(d_iso)[:10])
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SIGNED_DATE_PARSE_FAILED", f"signed_date={d_iso!r}", limit=3)
                 d = _dt.date.today()
             start_this = _dt.date(d.year, int(SEASON_START_MONTH), int(SEASON_START_DAY))
             start_prev = _dt.date(d.year - 1, int(SEASON_START_MONTH), int(SEASON_START_DAY))
@@ -1287,8 +1334,25 @@ class LeagueService:
 
             try:
                 cur.execute("DELETE FROM free_agents WHERE player_id=?;", (pid,))
-            except Exception:
-                pass
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("no such table" in msg) and ("free_agents" in msg):
+                    logger.warning(
+                        "[FREE_AGENTS_TABLE_MISSING] free_agents table missing; skipping cleanup (player_id=%s)",
+                        pid,
+                    )
+                else:
+                    logger.exception(
+                        "[FREE_AGENTS_DELETE_FAILED] failed to delete free_agents row (player_id=%s)",
+                        pid,
+                    )
+                    raise
+            except Exception as exc:
+                logger.exception(
+                    "[FREE_AGENTS_DELETE_FAILED] failed to delete free_agents row (player_id=%s)",
+                    pid,
+                )
+                raise
 
             # Optional: log signing transaction
             self._insert_transactions_in_cur(
@@ -1340,7 +1404,8 @@ class LeagueService:
         def _infer_start_season_year_from_date(d_iso: str) -> int:
             try:
                 d = _dt.date.fromisoformat(str(d_iso)[:10])
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("SIGNED_DATE_PARSE_FAILED", f"signed_date={d_iso!r}", limit=3)
                 d = _dt.date.today()
             start_this = _dt.date(d.year, int(SEASON_START_MONTH), int(SEASON_START_DAY))
             start_prev = _dt.date(d.year - 1, int(SEASON_START_MONTH), int(SEASON_START_DAY))
@@ -1459,7 +1524,8 @@ class LeagueService:
             for opt in raw_opts:
                 try:
                     normalized_opts.append(normalize_option_record(opt))
-                except Exception:
+                except Exception as e:
+                    _warn_limited("CONTRACT_OPTION_NORMALIZE_FAILED", f"contract_id={contract_id!r} opt_preview={repr(opt)[:120]} exc_type={type(e).__name__}", limit=3)
                     continue
             contract["options"] = normalized_opts
 
@@ -1560,7 +1626,8 @@ class LeagueService:
                 for opt in raw_opts:
                     try:
                         normalized_opts.append(normalize_option_record(opt))
-                    except Exception:
+                    except Exception as e:
+                        _warn_limited("CONTRACT_OPTION_NORMALIZE_FAILED", f"contract_id={contract_id!r} opt_preview={repr(opt)[:120]} exc_type={type(e).__name__}", limit=3)
                         continue
                 contract["options"] = normalized_opts
 
@@ -1597,11 +1664,21 @@ class LeagueService:
                 # Determine expiry after option resolution
                 try:
                     start_year = int(contract.get("start_season_year") or 0)
-                except Exception:
+                except (TypeError, ValueError):
+                    _warn_limited(
+                        "CONTRACT_START_YEAR_COERCE_FAILED",
+                        f"contract_id={contract_id} value={contract.get('start_season_year')!r}",
+                        limit=3,
+                    )
                     start_year = 0
                 try:
                     years = int(contract.get("years") or 0)
-                except Exception:
+                except (TypeError, ValueError):
+                    _warn_limited(
+                        "CONTRACT_YEARS_COERCE_FAILED",
+                        f"contract_id={contract_id} value={contract.get('years')!r}",
+                        limit=3,
+                    )
                     years = 0
 
                 end_exclusive = start_year + max(years, 0)
@@ -1622,6 +1699,11 @@ class LeagueService:
                         released_player_ids.append(player_id)
                     except KeyError:
                         # No active roster row; skip release
+                    _warn_limited(
+                        "RELEASE_TO_FA_SKIPPED_NO_ACTIVE_ROSTER",
+                        f"player_id={pid!r} team_id={team_id!r} effective_date={effective_date!r}",
+                        limit=3,
+                    )
                         pass
                 else:
                     # Contract continues: update roster salary for the new season if we can.

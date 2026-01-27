@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +23,15 @@ from state import (
 )
 from team_utils import get_conference_standings
 
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
+
 
 def _extract_text_from_gemini_response(resp: Any) -> str:
     text = getattr(resp, "text", None)
@@ -36,7 +47,8 @@ def _extract_text_from_gemini_response(resp: Any) -> str:
                 texts.append(t)
         if texts:
             return "\n".join(texts)
-    except Exception:
+    except (AttributeError, IndexError, TypeError):
+        _warn_limited("GEMINI_RESPONSE_SHAPE_UNEXPECTED", f"resp_type={type(resp).__name__}", limit=3)
         pass
 
     return str(resp)
@@ -67,7 +79,8 @@ def _get_current_date() -> date:
     cur = get_current_date() or league_context.get("season_start") or date.today().isoformat()
     try:
         return date.fromisoformat(cur)
-    except ValueError:
+    except (TypeError, ValueError) as e:
+        _warn_limited("CURRENT_DATE_PARSE_FAILED", f"cur={cur!r} exc_type={type(e).__name__}", limit=3)
         return date.today()
 
 
@@ -133,7 +146,8 @@ def _as_date(value: Any) -> Optional[date]:
         s = s[:10]
     try:
         return date.fromisoformat(s)
-    except Exception:
+    except (TypeError, ValueError):
+        _warn_limited("DATE_PARSE_FAILED", f"value={value!r}", limit=3)
         return None
 
 
@@ -150,7 +164,8 @@ def build_week_summary_context() -> str:
     for g in snapshot.get("games", []):
         try:
             g_date = date.fromisoformat(g.get("date"))
-        except Exception:
+        except (TypeError, ValueError):
+            _warn_limited("GAME_DATE_PARSE_FAILED", f"date={g.get('date')!r}", limit=3)
             continue
         if week_start <= g_date <= current_date:
             games.append(g)
@@ -174,14 +189,16 @@ def build_week_summary_context() -> str:
         repo = LeagueRepo(get_db_path())
         repo.init_db()
         tx_rows = repo.list_transactions(limit=500, since_date=week_start.isoformat())
-    except Exception:
+    except Exception as e:
+        _warn_limited("NEWS_TX_DB_FAILED_FALLBACK", f"db_path={get_db_path()!r} exc_type={type(e).__name__}", limit=3)
         # Fallback (legacy/testing): if transactions exist in the workflow snapshot, use them.
         tx_rows = snapshot.get("transactions", []) or []
     finally:
         try:
             if repo:
                 repo.close()
-        except Exception:
+        except Exception as e:
+            _warn_limited("NEWS_TX_DB_CLOSE_FAILED", f"db_path={get_db_path()!r} exc_type={type(e).__name__}", limit=1)
             pass
 
     for t in tx_rows:
@@ -248,7 +265,8 @@ def generate_weekly_news(api_key: str) -> List[Dict[str, Any]]:
 
     try:
         data = json.loads(cleaned)
-    except Exception:
+    except json.JSONDecodeError:
+        _warn_limited("WEEKLY_NEWS_JSON_DECODE_FAILED", f"text_preview={cleaned[:120]!r}", limit=3)
         return []
 
     if not isinstance(data, list):

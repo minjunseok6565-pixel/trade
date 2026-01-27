@@ -31,6 +31,7 @@ import contextlib
 import datetime as _dt
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -65,6 +66,16 @@ except Exception as e:  # pragma: no cover
 _HEIGHT_RE = re.compile(r"^\s*(\d+)\s*'\s*(\d+)\s*\"?\s*$")
 _WEIGHT_RE = re.compile(r"^\s*(\d+)\s*(?:lbs?)?\s*$", re.IGNORECASE)
 
+logger = logging.getLogger(__name__)
+_WARN_COUNTS: Dict[str, int] = {}
+
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    n = _WARN_COUNTS.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _WARN_COUNTS[code] = n + 1
+
 
 def _utc_now_iso() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -91,7 +102,8 @@ def _json_loads(value: Any, default: Any):
         return value
     try:
         return json.loads(value)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
+        _warn_limited("JSON_DECODE_FAILED", f"value_preview={repr(str(value))[:120]}", limit=3)
         return default
 
 def parse_height_in(value: Any) -> Optional[int]:
@@ -133,7 +145,8 @@ def parse_salary_int(value: Any) -> Optional[int]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
             return int(value)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
+            _warn_limited("SALARY_INT_COERCE_FAILED", f"value={value!r}", limit=3)
             return None
     s = str(value).strip()
     if not s or s.lower() in {"nan", "none"}:
@@ -143,7 +156,8 @@ def parse_salary_int(value: Any) -> Optional[int]:
         return None
     try:
         return int(s)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
+        _warn_limited("SALARY_STR_COERCE_FAILED", f"value={value!r}", limit=3)
         return None
 
 
@@ -399,11 +413,13 @@ class LeagueRepo:
             pid = str(pick.get("pick_id") or pick_id)
             try:
                 year = int(pick.get("year") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_YEAR_COERCE_FAILED", f"pick_id={pid} value={pick.get('year')!r}")
                 year = 0
             try:
                 rnd = int(pick.get("round") or 0)
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("DRAFT_PICK_ROUND_COERCE_FAILED", f"pick_id={pid} value={pick.get('round')!r}")
                 rnd = 0
             original = str(pick.get("original_team") or "").upper()
             owner = str(pick.get("owner_team") or "").upper()
@@ -495,14 +511,19 @@ class LeagueRepo:
             value = asset.get("value")
             try:
                 value_f = float(value) if value is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("FIXED_ASSET_VALUE_COERCE_FAILED", f"asset_id={asset_id} value={value!r}")
                 value_f = None
             owner = str(asset.get("owner_team") or "").upper()
             source_pick_id = asset.get("source_pick_id")
             draft_year = asset.get("draft_year")
             try:
                 draft_year_i = int(draft_year) if draft_year is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited(
+                    "FIXED_ASSET_DRAFT_YEAR_COERCE_FAILED",
+                    f"asset_id={asset_id} draft_year={draft_year!r}",
+                )
                 draft_year_i = None
             attrs = dict(asset)
             rows.append((asset_id, str(label) if label is not None else None, value_f, owner, str(source_pick_id) if source_pick_id is not None else None, draft_year_i, _json_dumps(attrs), now, now))
@@ -715,11 +736,13 @@ class LeagueRepo:
             salary_by_year = c.get("salary_by_year") or {}
             try:
                 start_year_i = int(start_year) if start_year is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_START_YEAR_COERCE_FAILED", f"contract_id={contract_id} value={start_year!r}")
                 start_year_i = None
             try:
                 years_i = int(years) if years is not None else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("CONTRACT_YEARS_COERCE_FAILED", f"contract_id={contract_id} value={years!r}")
                 years_i = None
             start_season_id = str(season_id_from_year(start_year_i)) if start_year_i else None
             end_season_id = str(season_id_from_year(start_year_i + max((years_i or 1) - 1, 0))) if start_year_i and years_i else start_season_id
@@ -1091,7 +1114,8 @@ class LeagueRepo:
         try:
             value = json.loads(row["profile_json"])
             return value if isinstance(value, dict) else {"value": value}
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
+            _warn_limited("GM_PROFILE_JSON_DECODE_FAILED", f"team_id={team_id!r}", limit=3)
             # Defensive: if JSON is corrupted, don't crash the game loop.
             return None
 
@@ -1105,7 +1129,8 @@ class LeagueRepo:
             try:
                 value = json.loads(r["profile_json"])
                 out[str(r["team_id"])] = value if isinstance(value, dict) else {"value": value}
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
+                _warn_limited("GM_PROFILE_JSON_DECODE_FAILED", f"team_id={r['team_id']!r}", limit=3)
                 continue
         return out
 
@@ -1220,7 +1245,8 @@ class LeagueRepo:
                 age = row.get("Age", None)
             try:
                 age_i = int(age) if age is not None and str(age).strip() != "" else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("IMPORT_AGE_COERCE_FAILED", f"player_id={raw_pid!r} age={age!r}", limit=3)
                 age_i = None
 
             # height / weight
@@ -1246,7 +1272,8 @@ class LeagueRepo:
                 ovr = row.get("OVR", None)
             try:
                 ovr_i = int(ovr) if ovr is not None and str(ovr).strip() != "" else None
-            except Exception:
+            except (TypeError, ValueError):
+                _warn_limited("IMPORT_OVR_COERCE_FAILED", f"player_id={raw_pid!r} ovr={ovr!r}", limit=3)
                 ovr_i = None
 
             # attributes: any columns not in core
@@ -1258,12 +1285,9 @@ class LeagueRepo:
                 # keep NaN out of JSON
                 if v is None:
                     continue
-                try:
-                    # pandas NaN check without importing numpy directly
-                    if isinstance(v, float) and v != v:
-                        continue
-                except Exception:
-                    pass
+                # pandas NaN check without importing numpy directly
+                if isinstance(v, float) and v != v:
+                    continue
                 attrs[col] = v
 
             players.append(

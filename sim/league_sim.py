@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from state import (
 from trades_ai import _run_ai_gm_tick_if_needed
 from sim.roster_adapter import build_team_state_from_db
 
+logger = logging.getLogger(__name__)
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
@@ -33,8 +35,13 @@ def _repo_ctx() -> LeagueRepo:
     with LeagueRepo(str(db_path)) as repo:
         try:
             repo.init_db()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception(
+                "[DB_INIT_FAILED] sim.league_sim._repo_ctx repo.init_db() failed (db_path=%s): %s",
+                db_path,
+                str(exc),
+            )
+            raise
         yield repo
 
 

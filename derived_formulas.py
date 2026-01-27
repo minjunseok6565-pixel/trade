@@ -3,8 +3,19 @@ from __future__ import annotations
 
 from typing import Dict
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+_warn_counts: Dict[str, int] = {}
+
+def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
+    n = _warn_counts.get(code, 0)
+    if n < limit:
+        logger.warning("%s %s", code, msg, exc_info=True)
+    _warn_counts[code] = n + 1
 
 COL = {
     "CloseShot":"Close Shot",
@@ -49,7 +60,8 @@ def _get(row, key: str, default: float = 50.0) -> float:
     if c and c in row and pd.notna(row[c]):
         try:
             return float(row[c])
-        except Exception:
+        except (TypeError, ValueError):
+            _warn_limited("DERIVED_COERCE_FLOAT_FAILED", f"key={key!r} col={c!r}")
             return default
     return default
 
