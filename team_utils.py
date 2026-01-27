@@ -62,16 +62,21 @@ def _repo_ctx() -> "LeagueRepo":
 
 
 def _list_active_team_ids() -> List[str]:
-    """Return active team ids from DB if possible, else fall back to ALL_TEAM_IDS."""
+    """Return active team ids from DB if possible.
+
+    Notes:
+    - If league.db_path is not configured, get_db_path() raises ValueError and this function will propagate.
+    - If DB access fails for other reasons (e.g. sqlite error), this falls back to ALL_TEAM_IDS.
+    """
     try:
         with _repo_ctx() as repo:
             teams = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
             if teams:
                 return teams
-    except (ImportError, sqlite3.Error, OSError, TypeError):
+    except (ImportError, sqlite3.Error, OSError, TypeError) as exc:
         _warn_limited(
             "LIST_TEAMS_FAILED_FALLBACK_ALL",
-            f"db_path={get_db_path()!r}",
+            f"exc_type={type(exc).__name__}",
             limit=3,
         )
         pass
@@ -82,10 +87,10 @@ def _has_free_agents_team() -> bool:
     try:
         with _repo_ctx() as repo:
             return "FA" in {str(t).upper() for t in repo.list_teams()}
-    except (ImportError, sqlite3.Error, OSError, TypeError):
+    except (ImportError, sqlite3.Error, OSError, TypeError) as exc:
         _warn_limited(
             "HAS_FA_TEAM_CHECK_FAILED",
-            f"db_path={get_db_path()!r}",
+            f"exc_type={type(exc).__name__}",
             limit=3,
         )
         return False
@@ -139,10 +144,10 @@ def _init_players_and_teams_if_needed() -> None:
                         pass
                 players_set(updated_players)
                 return
-        except (ImportError, sqlite3.Error, OSError, TypeError):
+        except (ImportError, sqlite3.Error, OSError, TypeError) as exc:
             _warn_limited(
                 "INIT_PLAYERS_CACHE_REFRESH_FAILED",
-                f"db_path={get_db_path()!r}",
+                f"exc_type={type(exc).__name__}",
                 limit=3,
             )
             return
@@ -436,6 +441,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
