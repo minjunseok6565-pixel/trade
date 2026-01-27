@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import random
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -30,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    db_path = os.environ.get("LEAGUE_DB_PATH") or get_db_path()
-
-    with LeagueRepo(str(db_path)) as repo:
+    db_path = get_db_path()
+    with LeagueRepo(db_path) as repo:
         try:
             repo.init_db()
         except Exception as exc:
