@@ -61,8 +61,8 @@ def _run_match(
 
     raw_result = simulate_game(rng, home, away, context=context)
     v2_result = adapt_matchengine_result_to_v2(
-        raw_result=raw_result,
-        context=context,
+        raw_result,
+        context,
         engine_name="matchengine_v3",
     )
     return ingest_game_result(game_result=v2_result, game_date=game_date)
@@ -160,11 +160,11 @@ def simulate_single_game(
     game_id = f"single_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
 
     context = build_context_from_team_ids(
-        game_id=game_id,
-        date=game_date_str,
-        home_team_id=home_team_id,
-        away_team_id=away_team_id,
-        league_state=league_context,
+        game_id,
+        game_date_str,
+        home_team_id,
+        away_team_id,
+        league_context,
         phase="regular",
     )
 
