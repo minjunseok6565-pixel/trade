@@ -143,9 +143,6 @@ def build_trade_context(
             resolved_extra["allow_locked_by_deal_id"] = allow_locked_by_deal_id
 
     resolved_db_path = db_path or state.get_db_path()
-    if not resolved_db_path:
-        raise ValueError("db_path is required to build TradeContext")
-
     repo = LeagueRepo(resolved_db_path)
     repo.init_db()
 
