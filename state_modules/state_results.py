@@ -41,16 +41,48 @@ def _validate_game_result_v2(game_result: Dict[str, Any]) -> None:
     if game["phase"] not in _ALLOWED_PHASES:
         raise ValueError(f"GameResultV2 invalid: unsupported phase '{game['phase']}'")
 
+    game_id = str(game.get("game_id", "") or "").strip()
     home_id = str(game["home_team_id"])
     away_id = str(game["away_team_id"])
+    if not home_id or not away_id:
+        raise ValueError(
+            f"GameResultV2 invalid: game.home_team_id and game.away_team_id must be non-empty "
+            f"(game_id={game_id!r}, home_team_id={home_id!r}, away_team_id={away_id!r})"
+        )
+    if home_id == away_id:
+        raise ValueError(
+            f"GameResultV2 invalid: game.home_team_id must not equal game.away_team_id "
+            f"(game_id={game_id!r}, team_id={home_id!r})"
+        )
 
     final = _require_dict(game_result.get("final"), "final")
-    if home_id not in final or away_id not in final:
-        raise ValueError("GameResultV2 invalid: final must include both home and away team ids")
+    # 엄격 조건(A): final 키는 정확히 2개, 정확히 home/away team_id여야 함
+    if "home" in final or "away" in final:
+        raise ValueError(
+            f"GameResultV2 invalid: final must not use side keys 'home'/'away' "
+            f"(game_id={game_id!r}, keys={list(final.keys())!r})"
+        )
+    final_keys = set(final.keys())
+    expected = {home_id, away_id}
+    if final_keys != expected:
+        raise ValueError(
+            f"GameResultV2 invalid: final keys must match exactly {{home_team_id, away_team_id}} "
+            f"(game_id={game_id!r}, expected={sorted(list(expected))!r}, keys={list(final.keys())!r})"
+        )
 
     teams = _require_dict(game_result.get("teams"), "teams")
-    if home_id not in teams or away_id not in teams:
-        raise ValueError("GameResultV2 invalid: teams must include both home and away team ids")
+    # 엄격 조건(B)(C): teams 키도 정확히 2개, 정확히 home/away team_id여야 함 + side 키 금지
+    if "home" in teams or "away" in teams:
+        raise ValueError(
+            f"GameResultV2 invalid: teams must not use side keys 'home'/'away' "
+            f"(game_id={game_id!r}, keys={list(teams.keys())!r})"
+        )
+    teams_keys = set(teams.keys())
+    if teams_keys != expected:
+        raise ValueError(
+            f"GameResultV2 invalid: teams keys must match exactly {{home_team_id, away_team_id}} "
+            f"(game_id={game_id!r}, expected={sorted(list(expected))!r}, keys={list(teams.keys())!r})"
+        )
 
     for tid in (home_id, away_id):
         team_obj = _require_dict(teams.get(tid), f"teams.{tid}")
