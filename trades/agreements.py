@@ -47,8 +47,6 @@ def _compute_assets_hash(deal: Deal) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
     db_path = state.get_db_path()
-    if not db_path:
-        raise ValueError("db_path is required to compute trade agreement hash")
 
     # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in state.
     # Use one DB transaction snapshot and ensure repo is closed to avoid connection leaks.
