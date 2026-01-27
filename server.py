@@ -48,6 +48,11 @@ def _startup_init_state() -> None:
     # 2) players/teams cache init + player_id normalize once
     # 3) repo integrity validate once
     # 4) ingest_turn backfill once
+    db_path = os.environ.get("LEAGUE_DB_PATH")
+    if not db_path:
+        raise RuntimeError("LEAGUE_DB_PATH is required (no default db_path).")
+    state.set_db_path(db_path)
+
     state.startup_init_state()
 
 app.add_middleware(
@@ -415,13 +420,6 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     }
     return JSONResponse(status_code=400, content=payload)
 
-def _require_db_path() -> str:
-    db_path = os.environ.get("LEAGUE_DB_PATH") or state.get_db_path()
-    if not db_path:
-        raise HTTPException(status_code=500, detail="db_path is required for trade operations")
-    state.set_db_path(db_path)
-    return db_path
-
 def _validate_repo_integrity(db_path: str) -> None:
     with LeagueRepo(db_path) as repo:
         repo.init_db()
@@ -432,7 +430,7 @@ def _validate_repo_integrity(db_path: str) -> None:
 async def api_trade_submit(req: TradeSubmitRequest):
     try:
         in_game_date = state.get_current_date_as_date()
-        db_path = _require_db_path()
+        db_path = state.get_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = canonicalize_deal(parse_deal(req.deal))
         validate_deal(deal, current_date=in_game_date)
@@ -458,7 +456,7 @@ async def api_trade_submit(req: TradeSubmitRequest):
 async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
     try:
         in_game_date = state.get_current_date_as_date()
-        db_path = _require_db_path()
+        db_path = state.get_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = agreements.verify_committed_deal(req.deal_id, current_date=in_game_date)
         validate_deal(
@@ -496,7 +494,7 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
 async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
     try:
         in_game_date = state.get_current_date_as_date()
-        _require_db_path()
+        state.get_db_path()
         session = negotiation_store.get_session(req.session_id)
         deal = canonicalize_deal(parse_deal(req.deal))
         team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
@@ -530,7 +528,7 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
 @app.get("/api/roster-summary/{team_id}")
 async def roster_summary(team_id: str):
     """특정 팀의 로스터를 LLM이 보기 좋은 형태로 요약해서 돌려준다."""
-    db_path = _require_db_path()
+    db_path = state.get_db_path()
     team_id = str(normalize_team_id(team_id, strict=True))
     with LeagueRepo(db_path) as repo:
         repo.init_db()
@@ -630,7 +628,7 @@ async def state_summary():
         workflow_state.pop(k, None)
 
     # 2) DB snapshot (SSOT). Fail loud on DB path/schema issues.
-    db_path = _require_db_path()
+    db_path = state.get_db_path()
     try:
         with LeagueRepo(db_path) as repo:
             repo.init_db()
@@ -662,6 +660,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
