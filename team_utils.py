@@ -6,10 +6,15 @@ from typing import Any, Dict, List, Optional
 
 from derived_formulas import compute_derived
 from state import (
-    GAME_STATE,
-    ensure_league_block,
     ensure_cap_model_populated_if_needed,
+    export_full_state_snapshot,
+    get_db_path,
+    get_league_context_snapshot,
     initialize_master_schedule_if_needed,
+    players_get,
+    players_set,
+    teams_get,
+    teams_set,
 )
 
 # Division/Conference mapping can stay in config (static).
@@ -30,8 +35,7 @@ def _repo_ctx() -> "LeagueRepo":
     if LeagueRepo is None:
         raise ImportError(f"league_repo.py is required: {_LEAGUE_REPO_IMPORT_ERROR}")
 
-    league = GAME_STATE.setdefault("league", {})
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH", "league.db")
+    db_path = os.environ.get("LEAGUE_DB_PATH", get_db_path())
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -78,17 +82,19 @@ def _parse_potential(pot_raw: Any) -> float:
 
 
 def _init_players_and_teams_if_needed() -> None:
-    """Initialize GAME_STATE['players'] and GAME_STATE['teams'].
+    """Initialize state player/team caches.
 
     Step 6 invariant:
-    - GAME_STATE['players'] is keyed by **player_id (string)**.
+    - players are keyed by **player_id (string)**.
     - Never depend on a pandas DataFrame index for IDs.
     """
     # If players already exist, backfill missing derived using DB row (if present).
-    if isinstance(GAME_STATE.get("players"), dict) and GAME_STATE["players"]:
+    existing_players = players_get()
+    if isinstance(existing_players, dict) and existing_players:
         try:
             with _repo_ctx() as repo:
-                for pid, pdata in list(GAME_STATE["players"].items()):
+                updated_players = dict(existing_players)
+                for pid, pdata in list(updated_players.items()):
                     if not isinstance(pdata, dict):
                         continue
 
@@ -104,6 +110,7 @@ def _init_players_and_teams_if_needed() -> None:
                         pdata["derived"] = compute_derived(attrs)
                     except Exception:
                         pass
+                players_set(updated_players)
                 return
         except Exception:
             return
@@ -141,7 +148,7 @@ def _init_players_and_teams_if_needed() -> None:
                     "acquired_via_trade": False,
                 }
 
-    GAME_STATE["players"] = players
+    players_set(players)
 
     teams_meta: Dict[str, Dict[str, Any]] = {}
     for tid in team_ids:
@@ -155,7 +162,7 @@ def _init_players_and_teams_if_needed() -> None:
             "market": "mid",
             "patience": 0.5,
         }
-    GAME_STATE["teams"] = teams_meta
+    teams_set(teams_meta)
 
 
 def _compute_team_payroll(team_id: str) -> float:
@@ -175,8 +182,8 @@ def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
     # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
     ensure_cap_model_populated_if_needed()
-    league = ensure_league_block()
-    trade_rules = league.get("trade_rules", {})
+    league_context = get_league_context_snapshot()
+    trade_rules = league_context.get("trade_rules", {})
     try:
         salary_cap = float(trade_rules.get("salary_cap") or 0.0)
     except Exception:
@@ -187,8 +194,8 @@ def _compute_cap_space(team_id: str) -> float:
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
+    league = export_full_state_snapshot().get("league", {})
+    master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
     team_ids = _list_active_team_ids()
@@ -293,7 +300,7 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
-        meta = GAME_STATE.get("teams", {}).get(tid, {})
+        meta = teams_get().get(tid, {})
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -328,7 +335,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = GAME_STATE.get("teams", {}).get(tid, {})
+    meta = teams_get().get(tid, {})
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -354,7 +361,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "cap_space": _compute_cap_space(tid),
     }
 
-    season_stats = GAME_STATE.get("player_stats", {}) or {}
+    season_stats = export_workflow_state().get("player_stats", {}) or {}
     roster: List[Dict[str, Any]] = []
     with _repo_ctx() as repo:
         roster_rows = repo.get_team_roster(tid)

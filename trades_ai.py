@@ -7,9 +7,17 @@ import random
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from state import GAME_STATE, ensure_league_block, get_current_date_as_date
+from state import (
+    asset_locks_get,
+    export_full_state_snapshot,
+    export_workflow_state,
+    get_current_date_as_date,
+    get_db_path,
+    get_league_context_snapshot,
+    set_last_gm_tick_date,
+)
 from team_utils import _init_players_and_teams_if_needed, get_team_status_map
-from trades.apply import apply_deal
+from trades.apply import apply_deal_to_db
 from trades.errors import TradeError
 from trades.models import PickAsset, PlayerAsset, asset_key, canonicalize_deal, parse_deal
 from trades.validator import validate_deal
@@ -17,8 +25,8 @@ from trades import agreements
 
 
 def _run_ai_gm_tick_if_needed(target_date: date) -> None:
-    league = ensure_league_block()
-    trade_deadline_str = league.get("trade_rules", {}).get("trade_deadline")
+    league_context = get_league_context_snapshot()
+    trade_deadline_str = league_context.get("trade_rules", {}).get("trade_deadline")
     if trade_deadline_str:
         try:
             trade_deadline = date.fromisoformat(trade_deadline_str)
@@ -27,7 +35,7 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
         except ValueError:
             return
 
-    last_tick = league.get("last_gm_tick_date")
+    last_tick = export_full_state_snapshot().get("league", {}).get("last_gm_tick_date")
     if last_tick:
         try:
             last_date = date.fromisoformat(str(last_tick))
@@ -45,7 +53,7 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
     except Exception:
         pass
 
-    league["last_gm_tick_date"] = target_date.isoformat()
+    set_last_gm_tick_date(target_date.isoformat())
 
 
 def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
@@ -53,14 +61,18 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     from state import initialize_master_schedule_if_needed
 
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
-    db_path = league.get("db_path")
-    if not db_path:
-        raise ValueError("db_path is required for AI trade evaluation")
+    league = export_full_state_snapshot().get("league", {})
+    db_path = get_db_path()
     repo = LeagueRepo(db_path)
     repo.init_db()
-    draft_picks = GAME_STATE.get("draft_picks", {})
-    asset_locks = GAME_STATE.get("asset_locks", {})
+    # Trade assets are stored in SQLite (SSOT). The workflow snapshot excludes them by default.
+    try:
+        assets_snapshot = repo.get_trade_assets_snapshot()
+        draft_picks = assets_snapshot.get("draft_picks", {}) or {}
+    except Exception:
+        # Fallback for degraded environments/tests.
+        draft_picks = export_workflow_state(exclude_keys=()).get("draft_picks", {}) or {}
+    asset_locks = asset_locks_get()
 
     team_status = get_team_status_map()
     contenders = [tid for tid, status in team_status.items() if status == "contender"]
@@ -136,7 +148,14 @@ def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
                 deal = canonicalize_deal(parse_deal(payload))
                 trade_date = target_date or get_current_date_as_date()
                 validate_deal(deal, current_date=trade_date)
-                apply_deal(deal, source="ai_gm", trade_date=trade_date)
+                apply_deal_to_db(
+                    db_path=get_db_path(),
+                    deal=deal,
+                    source="ai_gm",
+                    deal_id=None,
+                    trade_date=trade_date,
+                    dry_run=False,
+                )
                 return True
     finally:
         repo.close()

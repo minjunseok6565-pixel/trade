@@ -1,19 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
-from team_utils import _init_players_and_teams_if_needed
-from state import GAME_STATE, get_current_date_as_date
 
-from .errors import (
-    APPLY_FAILED,
-    TradeError,
-)
-from .models import Deal, FixedAsset, PickAsset, PlayerAsset, SwapAsset
+from .errors import APPLY_FAILED, TradeError
+from .models import Deal, PlayerAsset
 
 
 @dataclass(frozen=True)
@@ -31,14 +25,6 @@ def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
         if other_team:
             return other_team[0]
     raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
-
-
-def _get_db_path(game_state: dict) -> str:
-    league_state = game_state.get("league") or {}
-    db_path = league_state.get("db_path")
-    if not db_path:
-        raise ValueError("game_state['league']['db_path'] is required to apply trades")
-    return db_path
 
 
 def _normalize_player_id_str(value: Any) -> str:
@@ -78,9 +64,7 @@ def _validate_player_moves(repo: LeagueRepo, moves: list[_PlayerMove]) -> None:
         try:
             current_team = repo.get_team_id_by_player(move.player_id)
         except KeyError as exc:
-            raise ValueError(
-                f"player_id not found in DB: {move.player_id}"
-            ) from exc
+            raise ValueError(f"player_id not found in DB: {move.player_id}") from exc
         if current_team != move.from_team:
             raise ValueError(
                 "player_id "
@@ -100,7 +84,7 @@ def _open_service(db_path: str):
     svc_or_cm = LeagueService.open(db_path)
     if hasattr(svc_or_cm, "__enter__"):
         return svc_or_cm  # context manager
-    # adapt plain object -> context manager
+
     @contextlib.contextmanager
     def _cm():
         svc = svc_or_cm
@@ -110,40 +94,24 @@ def _open_service(db_path: str):
             close = getattr(svc, "close", None)
             if callable(close):
                 close()
+
     return _cm()
 
 
-def apply_deal(
-    game_state: dict | Deal,
-    deal: Deal | None = None,
-    source: str = "",
-    deal_id: Optional[str] = None,
-    trade_date: Optional[date] = None,
-    *,
-    dry_run: bool = False,
+def apply_deal_to_db(
+    db_path: str,
+    deal: Deal,
+    source: str,
+    deal_id: str | None,
+    trade_date,
+    dry_run: bool,
 ) -> Dict[str, Any]:
-    if deal is None:
-        if isinstance(game_state, Deal):
-            deal = game_state
-            game_state = GAME_STATE
-        else:
-            raise TypeError("apply_deal requires a Deal")
-
-    _init_players_and_teams_if_needed()
+    if not db_path:
+        raise ValueError("db_path is required to apply trades")
 
     player_moves = _collect_player_moves(deal)
 
     try:
-        acquired_date = (trade_date or get_current_date_as_date()).isoformat()
-        season_year_raw = game_state.get("league", {}).get("season_year")
-        season_key = str(season_year_raw).strip() if season_year_raw is not None else ""
-        if not season_key.isdigit():
-            season_key = str(get_current_date_as_date().year)
-        if not season_key.isdigit():
-            season_key = None
-        db_path = _get_db_path(game_state)
-
-        # dry_run: keep existing behavior (lightweight DB checks on players only)
         if dry_run:
             with LeagueRepo(db_path) as repo:
                 repo.init_db()
@@ -153,32 +121,8 @@ def apply_deal(
                 "player_moves": [m.__dict__ for m in player_moves],
             }
 
-        # ✅ Single SSOT write: execute_trade handles players/picks/swaps/fixed_assets/log atomically
         with _open_service(db_path) as svc:
-            tx = svc.execute_trade(deal, source=source, trade_date=trade_date, deal_id=deal_id)
-
-        # Optional: update lightweight cached player fields in state (NOT assets ledger)
-        players_state = game_state.get("players", {})
-        if isinstance(players_state, dict):
-            for move in player_moves:
-                ps = players_state.get(move.player_id)
-                if not isinstance(ps, dict):
-                    continue
-                ps["team_id"] = move.to_team
-                ps.setdefault("signed_date", "1900-01-01")
-                ps.setdefault("signed_via_free_agency", False)
-                ps["acquired_date"] = acquired_date
-                ps["acquired_via_trade"] = True
-                if season_key:
-                    bans = ps.setdefault("trade_return_bans", {})
-                    season_bans = bans.get(season_key)
-                    if not isinstance(season_bans, list):
-                        season_bans = []
-                    if move.from_team not in season_bans:
-                        season_bans.append(move.from_team)
-                    bans[season_key] = season_bans
-
-        return tx
+            return svc.execute_trade(deal, source=source, trade_date=trade_date, deal_id=deal_id)
     except TradeError:
         raise
     except Exception as exc:

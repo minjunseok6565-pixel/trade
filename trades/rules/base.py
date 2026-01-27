@@ -127,36 +127,10 @@ def build_trade_context(
     extra: Optional[dict[str, Any]] = None,
     db_path: Optional[str] = None,
 ) -> TradeContext:
-    import state as state_module
-
-    player_meta_defaults = {
-        "signed_date": "1900-01-01",
-        "signed_via_free_agency": False,
-        "acquired_date": "1900-01-01",
-        "acquired_via_trade": False,
-    }
-    players = state_module.GAME_STATE.get("players")
-    if isinstance(players, dict):
-        for player in players.values():
-            if not isinstance(player, dict):
-                continue
-            for key, value in player_meta_defaults.items():
-                player.setdefault(key, value)
+    import state
 
     if current_date is None:
-        get_current_date_as_date = getattr(state_module, "get_current_date_as_date", None)
-        if callable(get_current_date_as_date):
-            current_date = get_current_date_as_date()
-        else:
-            get_current_date = getattr(state_module, "get_current_date", None)
-            current = get_current_date() if callable(get_current_date) else None
-            if current:
-                try:
-                    current_date = date.fromisoformat(str(current))
-                except ValueError:
-                    current_date = date.today()
-            else:
-                current_date = date.today()
+        current_date = state.get_current_date_as_date()
 
     resolved_extra = dict(extra) if extra else {}
     if "allow_locked_by_deal_id" not in resolved_extra:
@@ -168,19 +142,19 @@ def build_trade_context(
         if allow_locked_by_deal_id is not None:
             resolved_extra["allow_locked_by_deal_id"] = allow_locked_by_deal_id
 
-    resolved_db_path = db_path
-    if resolved_db_path is None:
-        league = state_module.GAME_STATE.get("league", {})
-        if isinstance(league, dict):
-            resolved_db_path = league.get("db_path")
+    resolved_db_path = db_path or state.get_db_path()
     if not resolved_db_path:
         raise ValueError("db_path is required to build TradeContext")
 
     repo = LeagueRepo(resolved_db_path)
     repo.init_db()
 
+    ctx_state = state.export_trade_context_snapshot()
+    assets_snap = state.export_trade_assets_snapshot()
+    resolved_extra.setdefault("assets_snapshot", assets_snap)
+
     return TradeContext(
-        game_state=state_module.GAME_STATE,
+        game_state=ctx_state,
         repo=repo,
         db_path=resolved_db_path,
         current_date=current_date,

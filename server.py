@@ -14,20 +14,7 @@ from pydantic import BaseModel, Field
 from config import BASE_DIR, ALL_TEAM_IDS
 from league_repo import LeagueRepo
 from schema import normalize_team_id
-from state import (
-    GAME_STATE,
-    ensure_league_block,
-    ensure_db_initialized_and_seeded,
-    ensure_trade_state_keys,
-    ensure_player_ids_normalized,
-    ensure_cap_model_populated_if_needed,
-    validate_repo_integrity_once_startup,
-    ensure_ingest_turn_backfilled_once_startup,
-    get_current_date,
-    get_current_date_as_date,
-    get_schedule_summary,
-    initialize_master_schedule_if_needed,
-)
+import state
 from sim.league_sim import simulate_single_game, advance_league_until
 from playoffs import (
     auto_advance_current_round,
@@ -39,17 +26,12 @@ from playoffs import (
 )
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
-from team_utils import (
-    _init_players_and_teams_if_needed,
-    get_conference_standings,
-    get_team_cards,
-    get_team_detail,
-)
+from team_utils import get_conference_standings, get_team_cards, get_team_detail
 from season_report_ai import generate_season_report
 from trades.errors import TradeError
 from trades.models import canonicalize_deal, parse_deal, serialize_deal
 from trades.validator import validate_deal
-from trades.apply import apply_deal
+from trades.apply import apply_deal_to_db
 from trades import agreements
 from trades import negotiation_store
 
@@ -66,16 +48,7 @@ def _startup_init_state() -> None:
     # 2) players/teams cache init + player_id normalize once
     # 3) repo integrity validate once
     # 4) ingest_turn backfill once
-    ensure_league_block()
-    ensure_db_initialized_and_seeded()
-    ensure_trade_state_keys()
-    _init_players_and_teams_if_needed()
-    ensure_player_ids_normalized()
-    initialize_master_schedule_if_needed()
-    # In case season_year exists and cap fields are still unset/zero.
-    ensure_cap_model_populated_if_needed()
-    validate_repo_integrity_once_startup()
-    ensure_ingest_turn_backfilled_once_startup()
+    state.startup_init_state()
 
 app.add_middleware(
     CORSMiddleware,
@@ -244,15 +217,18 @@ async def api_stats_leaders():
     # structure under stats.leaderboards with lowercase keys, which caused the
     # UI to break. Normalize here so the client always receives
     # `{ leaders: { PTS: [...], AST: [...], ... }, updated_at: <iso date> }`.
-    leaders = compute_league_leaders()
-    current_date = get_current_date()
+    workflow_state = state.export_workflow_state()
+    leaders = compute_league_leaders(workflow_state.get("player_stats") or {})
+    current_date = state.get_current_date()
     return {"leaders": leaders, "updated_at": current_date}
 
 
 @app.get("/api/stats/playoffs/leaders")
 async def api_playoff_stats_leaders():
-    leaders = compute_playoff_league_leaders()
-    current_date = get_current_date()
+    workflow_state = state.export_workflow_state()
+    playoff_stats = (workflow_state.get("phase_results") or {}).get("playoffs", {}).get("player_stats") or {}
+    leaders = compute_playoff_league_leaders(playoff_stats)
+    current_date = state.get_current_date()
     return {"leaders": leaders, "updated_at": current_date}
 
 
@@ -286,7 +262,7 @@ async def api_postseason_field():
 
 @app.get("/api/postseason/state")
 async def api_postseason_state():
-    return GAME_STATE.get("postseason") or {}
+    return state.get_postseason_snapshot()
 
 
 @app.post("/api/postseason/reset")
@@ -440,11 +416,10 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
     return JSONResponse(status_code=400, content=payload)
 
 def _require_db_path() -> str:
-    league = ensure_league_block()
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = os.environ.get("LEAGUE_DB_PATH") or state.get_db_path()
     if not db_path:
         raise HTTPException(status_code=500, detail="db_path is required for trade operations")
-    league["db_path"] = db_path
+    state.set_db_path(db_path)
     return db_path
 
 def _validate_repo_integrity(db_path: str) -> None:
@@ -456,12 +431,19 @@ def _validate_repo_integrity(db_path: str) -> None:
 @app.post("/api/trade/submit")
 async def api_trade_submit(req: TradeSubmitRequest):
     try:
-        in_game_date = get_current_date_as_date()
+        in_game_date = state.get_current_date_as_date()
         db_path = _require_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = canonicalize_deal(parse_deal(req.deal))
         validate_deal(deal, current_date=in_game_date)
-        transaction = apply_deal(deal, source="menu", trade_date=in_game_date)
+        transaction = apply_deal_to_db(
+            db_path=db_path,
+            deal=deal,
+            source="menu",
+            deal_id=None,
+            trade_date=in_game_date,
+            dry_run=False,
+        )
         _validate_repo_integrity(db_path)
         return {
             "ok": True,
@@ -475,7 +457,7 @@ async def api_trade_submit(req: TradeSubmitRequest):
 @app.post("/api/trade/submit-committed")
 async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
     try:
-        in_game_date = get_current_date_as_date()
+        in_game_date = state.get_current_date_as_date()
         db_path = _require_db_path()
         agreements.gc_expired_agreements(current_date=in_game_date)
         deal = agreements.verify_committed_deal(req.deal_id, current_date=in_game_date)
@@ -484,11 +466,13 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
             current_date=in_game_date,
             allow_locked_by_deal_id=req.deal_id,
         )
-        transaction = apply_deal(
-            deal,
+        transaction = apply_deal_to_db(
+            db_path=db_path,
+            deal=deal,
             source="negotiation",
             deal_id=req.deal_id,
             trade_date=in_game_date,
+            dry_run=False,
         )
         _validate_repo_integrity(db_path)
         agreements.mark_executed(req.deal_id)
@@ -511,7 +495,7 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
 @app.post("/api/trade/negotiation/commit")
 async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
     try:
-        in_game_date = get_current_date_as_date()
+        in_game_date = state.get_current_date_as_date()
         _require_db_path()
         session = negotiation_store.get_session(req.session_id)
         deal = canonicalize_deal(parse_deal(req.deal))
@@ -583,9 +567,9 @@ async def team_schedule(team_id: str):
         raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in league")
 
     # 마스터 스케줄이 없다면 생성
-    initialize_master_schedule_if_needed()
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
+    state.initialize_master_schedule_if_needed()
+    league = state.export_full_state_snapshot().get("league", {})
+    master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
     team_games: List[Dict[str, Any]] = [
@@ -627,7 +611,7 @@ async def team_schedule(team_id: str):
 
 @app.get("/api/state/summary")
 async def state_summary():
-    workflow_state: Dict[str, Any] = dict(GAME_STATE)
+    workflow_state: Dict[str, Any] = state.export_workflow_state()
     for k in (
         # Trade assets ledger (DB SSOT)
         "draft_picks",
@@ -677,7 +661,7 @@ async def state_summary():
 @app.get("/api/debug/schedule-summary")
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
-    return get_schedule_summary()
+    return state.get_schedule_summary()
 
 
 

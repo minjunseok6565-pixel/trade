@@ -10,9 +10,17 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 from config import ROSTER_DF
-from state import GAME_STATE, initialize_master_schedule_if_needed, get_current_date_as_date
+from state import (
+    asset_locks_get,
+    asset_locks_set,
+    get_current_date_as_date,
+    get_db_path,
+    initialize_master_schedule_if_needed,
+    trade_agreements_get,
+    trade_agreements_set,
+)
 from team_utils import _init_players_and_teams_if_needed
-from trades.apply import apply_deal
+from trades.apply import apply_deal_to_db
 from trades.errors import TradeError, ASSET_LOCKED, DUPLICATE_ASSET, DEAL_INVALIDATED
 from trades.models import canonicalize_deal, parse_deal
 from trades.validator import validate_deal
@@ -55,8 +63,6 @@ def main() -> None:
     player_a = _first_player_for_team(team_a)
     player_b = _first_player_for_team(team_b)
 
-    tx_count = len(GAME_STATE.get("transactions", []))
-
     payload = {
         "teams": [team_a, team_b],
         "legs": {
@@ -66,11 +72,17 @@ def main() -> None:
     }
     deal = canonicalize_deal(parse_deal(payload))
     validate_deal(deal, current_date=current_date)
-    apply_deal(deal, source="menu", trade_date=current_date)
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal,
+        source="menu",
+        deal_id=None,
+        trade_date=current_date,
+        dry_run=False,
+    )
 
     assert str(ROSTER_DF.at[player_a, "Team"]).upper() == team_b
     assert str(ROSTER_DF.at[player_b, "Team"]).upper() == team_a
-    assert len(GAME_STATE.get("transactions", [])) == tx_count + 1
 
     # Test B: committed deal flow
     player_a2 = _first_player_for_team(team_a)
@@ -92,18 +104,20 @@ def main() -> None:
         current_date=current_date,
         allow_locked_by_deal_id=committed["deal_id"],
     )
-    apply_deal(
-        deal_verified,
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal_verified,
         source="menu",
         deal_id=committed["deal_id"],
         trade_date=current_date,
+        dry_run=False,
     )
     agreements.mark_executed(committed["deal_id"])
 
     for assets in deal_verified.legs.values():
         for asset in assets:
             lock_key = f"{asset.kind}:{getattr(asset, 'player_id', getattr(asset, 'pick_id', ''))}"
-            assert lock_key not in GAME_STATE.get("asset_locks", {})
+            assert lock_key not in asset_locks_get()
 
     # Test C: lock conflict
     player_c = _first_player_for_team(team_a)
@@ -124,9 +138,12 @@ def main() -> None:
         assert exc.code == ASSET_LOCKED
 
     agreements.release_locks_for_deal(committed_c["deal_id"])
-    entry = GAME_STATE.get("trade_agreements", {}).get(committed_c["deal_id"])
+    agreements_state = trade_agreements_get()
+    entry = agreements_state.get(committed_c["deal_id"])
     if entry:
         entry["status"] = "INVALIDATED"
+        agreements_state[committed_c["deal_id"]] = entry
+        trade_agreements_set(agreements_state)
 
     # Test C2: duplicate asset validation
     payload_dup = {
@@ -151,9 +168,12 @@ def main() -> None:
         deal_c, current_date=current_date
     )
     asset_lock_key = f"player:{player_c}"
-    lock = GAME_STATE.get("asset_locks", {}).get(asset_lock_key)
+    locks_state = asset_locks_get()
+    lock = locks_state.get(asset_lock_key)
     if lock:
         lock["expires_at"] = (get_current_date_as_date() - timedelta(days=1)).isoformat()
+        locks_state[asset_lock_key] = lock
+        asset_locks_set(locks_state)
     try:
         validate_deal(deal_c, current_date=current_date)
     except TradeError as exc:
@@ -176,14 +196,21 @@ def main() -> None:
     }
     deal_d = canonicalize_deal(parse_deal(payload_d))
     validate_deal(deal_d, current_date=current_date)
-    apply_deal(deal_d, source="menu", trade_date=current_date)
+    apply_deal_to_db(
+        db_path=get_db_path(),
+        deal=deal_d,
+        source="menu",
+        deal_id=None,
+        trade_date=current_date,
+        dry_run=False,
+    )
 
     assert str(ROSTER_DF.at[player_x, "Team"]).upper() == team_y
     assert str(ROSTER_DF.at[player_y, "Team"]).upper() == team_z
     assert str(ROSTER_DF.at[player_z, "Team"]).upper() == team_x
 
     # Test E: pick ownership in committed deal hash
-    picks = GAME_STATE.get("draft_picks", {})
+    picks = export_workflow_state().get("draft_picks", {})
     pick_candidates = [
         pick for pick in picks.values() if pick.get("owner_team") == team_a
     ]

@@ -3,20 +3,16 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from state_cache import _ensure_cached_views_meta
-from state_core import ensure_league_block
-from state_migrations import _ensure_ingest_turn_backfilled
-from state_schedule import _ensure_master_schedule_indices, initialize_master_schedule_if_needed
-from state_store import GAME_STATE
+from .state_cache import _ensure_cached_views_meta
+from .state_schedule import ensure_master_schedule_indices
 
 
-def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
+def get_scores_view(state: dict, season_id: str, limit: int = 20) -> Dict[str, Any]:
     """Return cached or rebuilt scores view for the given season."""
-    _ensure_ingest_turn_backfilled()
-    cached = GAME_STATE.setdefault("cached_views", {})
-    scores_view = cached.setdefault("scores", {"latest_date": None, "games": []})
-    meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    cached = state["cached_views"]
+    scores_view = cached["scores"]
+    meta = _ensure_cached_views_meta(state)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
         meta["scores"].get("built_from_turn") == current_turn
@@ -27,21 +23,22 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
         return {"latest_date": scores_view.get("latest_date"), "games": limited_games}
 
     games: List[Dict[str, Any]] = []
-    active_season_id = GAME_STATE.get("active_season_id")
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(active_season_id) == str(season_id):
-        games.extend(GAME_STATE.get("games") or [])
+        games.extend(state["games"])
+        phase_results = state["phase_results"]
+        for phase in ("preseason", "play_in", "playoffs"):
+            phase_container = phase_results[phase]
+            games.extend(phase_container["games"])
     else:
-        history = GAME_STATE.get("season_history") or {}
+        history = state.get("season_history") or {}
         season_history = history.get(str(season_id)) or {}
-        games.extend(season_history.get("games") or [])
-
-    postseason = GAME_STATE.get("postseason") or {}
-    for container in postseason.values():
-        if not isinstance(container, dict):
-            continue
-        for game_obj in container.get("games") or []:
-            if str(game_obj.get("season_id")) == str(season_id):
-                games.append(game_obj)
+        regular = season_history.get("regular") or {}
+        games.extend(regular.get("games") or [])
+        phase_results = season_history.get("phase_results") or {}
+        for phase in ("preseason", "play_in", "playoffs"):
+            phase_container = phase_results.get(phase) or {}
+            games.extend(phase_container.get("games") or [])
 
     def _ingest_turn_key(game_obj: Dict[str, Any]) -> int:
         try:
@@ -62,27 +59,40 @@ def get_scores_view(season_id: str, limit: int = 20) -> Dict[str, Any]:
 
 
 def get_team_schedule_view(
+    state: dict,
     team_id: str,
     season_id: str,
     today: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return cached or rebuilt schedule view for a team."""
-    active_season_id = GAME_STATE.get("active_season_id")
+    active_season_id = state.get("active_season_id")
     if active_season_id is not None and str(season_id) != str(active_season_id):
         return {"past_games": [], "upcoming_games": []}
 
-    initialize_master_schedule_if_needed()
-    _ensure_master_schedule_indices()
-    league = ensure_league_block()
-    master_schedule = league.get("master_schedule") or {}
+    league = state["league"]
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    master_schedule = league["master_schedule"]
+    if not isinstance(master_schedule, dict):
+        raise ValueError("master_schedule must be a dict")
+
+    # 계획 1 철학: state_modules 레벨에서 schedule을 생성/재생성하지 않는다.
+    # schedule 생성은 facade(state.py)가 ensure_schedule_for_active_season()로 수행해야 한다.
+    games = master_schedule.get("games") or []
+    if not isinstance(games, list) or len(games) == 0:
+        raise ValueError(
+            "master_schedule is empty. Call state.ensure_schedule_for_active_season(force=False) first."
+        )
+
+    ensure_master_schedule_indices(master_schedule)
     by_team = master_schedule.get("by_team") or {}
     by_id = master_schedule.get("by_id") or {}
 
-    cached = GAME_STATE.setdefault("cached_views", {})
-    schedule = cached.setdefault("schedule", {})
-    teams_cache = schedule.setdefault("teams", {})
-    meta = _ensure_cached_views_meta()
-    current_turn = int(GAME_STATE.get("turn", 0) or 0)
+    cached = state["cached_views"]
+    schedule = cached["schedule"]
+    teams_cache = schedule["teams"]
+    meta = _ensure_cached_views_meta(state)
+    current_turn = int(state.get("turn", 0) or 0)
 
     if (
         meta["schedule"].get("season_id") == season_id

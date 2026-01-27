@@ -15,7 +15,9 @@ from matchengine_v2_adapter import (
 )
 from matchengine_v3.sim_game import simulate_game
 from state import (
-    ensure_league_block,
+    export_full_state_snapshot,
+    get_db_path,
+    get_league_context_snapshot,
     ingest_game_result,
     initialize_master_schedule_if_needed,
     set_current_date,
@@ -26,8 +28,7 @@ from sim.roster_adapter import build_team_state_from_db
 
 @contextmanager
 def _repo_ctx() -> LeagueRepo:
-    league = ensure_league_block()
-    db_path = league.get("db_path") or os.environ.get("LEAGUE_DB_PATH") or "league.db"
+    db_path = os.environ.get("LEAGUE_DB_PATH") or get_db_path()
 
     with LeagueRepo(str(db_path)) as repo:
         try:
@@ -65,8 +66,8 @@ def advance_league_until(
     user_team_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     initialize_master_schedule_if_needed()
-    league = ensure_league_block()
-    master_schedule = league["master_schedule"]
+    league_full = export_full_state_snapshot().get("league", {})
+    master_schedule = league_full.get("master_schedule", {})
     by_date: Dict[str, List[str]] = master_schedule.get("by_date") or {}
     games: List[Dict[str, Any]] = master_schedule.get("games") or []
 
@@ -75,16 +76,17 @@ def advance_league_until(
     except ValueError as exc:
         raise ValueError(f"invalid target_date: {target_date_str}") from exc
 
-    current_date_str = league.get("current_date")
+    league_context = get_league_context_snapshot()
+    current_date_str = league_context.get("current_date")
     if current_date_str:
         try:
             current_date = date.fromisoformat(current_date_str)
         except ValueError:
             current_date = target_date
     else:
-        if league.get("season_start"):
+        if league_context.get("season_start"):
             try:
-                season_start = date.fromisoformat(league["season_start"])
+                season_start = date.fromisoformat(league_context["season_start"])
             except ValueError:
                 season_start = target_date
         else:
@@ -117,7 +119,7 @@ def advance_league_until(
 
             context = build_context_from_master_schedule_entry(
                 entry=g,
-                league_state=league,
+                league_state=league_context,
                 date_override=day_str,
                 phase=str(g.get("phase") or "regular"),
             )
@@ -144,7 +146,7 @@ def simulate_single_game(
     home_tactics: Optional[Dict[str, Any]] = None,
     away_tactics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    league = ensure_league_block()
+    league_context = get_league_context_snapshot()
     game_date_str = game_date or date.today().isoformat()
     game_id = f"single_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
 
@@ -153,7 +155,7 @@ def simulate_single_game(
         date_str=game_date_str,
         home_team_id=home_team_id,
         away_team_id=away_team_id,
-        league_state=league,
+        league_state=league_context,
         phase="regular",
     )
 
