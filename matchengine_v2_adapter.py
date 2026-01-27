@@ -424,9 +424,54 @@ def _map_side_keyed_dict_to_team_ids(
     )
 
 
+def _require_team_id_keyed_two_team_map(
+    *,
+    obj: Any,
+    home_team_id: str,
+    away_team_id: str,
+    path: str,
+    game_id: str,
+) -> Dict[str, Any]:
+    """Require raw map to be keyed by *team_id only* and contain exactly two teams.
+
+    - Side keys ('home'/'away') are forbidden and must crash immediately.
+    - Extra team keys are forbidden.
+    """
+    if not isinstance(obj, dict):
+        raise ValueError(f"raw matchengine_v3 result invalid: '{path}' must be a dict (game_id={game_id!r})")
+
+    if "home" in obj or "away" in obj:
+        raise ValueError(
+            f"raw matchengine_v3 result invalid: '{path}' must not use side keys 'home'/'away' "
+            f"(game_id={game_id!r}, keys={list(obj.keys())!r})"
+        )
+
+    keys = set(obj.keys())
+    expected = {home_team_id, away_team_id}
+    if keys != expected:
+        raise ValueError(
+            f"raw matchengine_v3 result invalid: '{path}' must have exactly two team_id keys "
+            f"{sorted(list(expected))!r} (game_id={game_id!r}); got keys={list(obj.keys())!r}"
+        )
+
+    return obj
+
 
 def adapt_matchengine_result_to_v2(
+    raw_result: Mapping[str, Any],
+    context: schema.GameContext,
+    *,
+    engine_name: str = "matchengine_v3",
+    include_raw: bool = False,
+    include_replay_events: bool = True,
+) -> Dict[str, Any]:
+    """Convert raw matchengine_v3 results to GameResultV2 and validate.
 
+    SSOT contract:
+    - raw_result['teams'] must be keyed by team_id only and match exactly {home_team_id, away_team_id}.
+    - Side keys 'home'/'away' are forbidden.
+    - The produced V2 is validated via validate_v2_game_result() before returning.
+    """
     raw = _require_dict(raw_result, "raw")
     meta = _require_dict(raw.get("meta"), "raw.meta")
     teams_obj = _require_dict(raw.get("teams"), "raw.teams")
