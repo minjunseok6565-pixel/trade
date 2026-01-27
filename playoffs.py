@@ -279,11 +279,11 @@ def _simulate_postseason_game(
     league = export_full_state_snapshot().get("league", {})
     game_id = f"playoffs_{home_team_id}_{away_team_id}_{uuid4().hex[:8]}"
     context = build_context_from_team_ids(
-        game_id=game_id,
-        date=game_date,
-        home_team_id=home_team_id,
-        away_team_id=away_team_id,
-        league_state=league,
+        game_id,
+        game_date,
+        home_team_id,
+        away_team_id,
+        league,
         phase="playoffs",
     )
 
@@ -294,8 +294,8 @@ def _simulate_postseason_game(
 
     raw_result = simulate_game(rng, home_team, away_team, context=context)
     v2_result = adapt_matchengine_result_to_v2(
-        raw_result=raw_result,
-        context=context,
+        raw_result,
+        context,
         engine_name="matchengine_v3",
     )
     ingest_game_result(game_result=v2_result, game_date=game_date)
