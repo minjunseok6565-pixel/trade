@@ -5,12 +5,20 @@ from .state_cap import _apply_cap_model_for_season
 from .state_migrations import normalize_player_ids
 
 
+def _require_db_path(league: dict) -> str:
+    """Return league.db_path or raise (no implicit defaults)."""
+    if not isinstance(league, dict):
+        raise ValueError("league must be a dict")
+    db_path = league.get("db_path")
+    if not db_path:
+        raise ValueError("league.db_path is required")
+    return str(db_path)
+
+
 def ensure_db_initialized_and_seeded(state: dict) -> None:
     """Ensure LeagueRepo is initialized and GM profiles are seeded (startup-only)."""
     league = state["league"]
-    if not isinstance(league, dict):
-        raise ValueError("league must be a dict")
-    db_path = str(league.get("db_path") or "league.db")
+    db_path = _require_db_path(league)
 
     migrations = state["_migrations"]
     if not isinstance(migrations, dict):
@@ -79,7 +87,7 @@ def ensure_contracts_bootstrapped_after_schedule_creation_once(state: dict) -> N
 
     from league_repo import LeagueRepo
 
-    db_path = str(league.get("db_path") or "league.db")
+    db_path = _require_db_path(league)
     with LeagueRepo(db_path) as repo:
         repo.init_db()
         repo.ensure_contracts_bootstrapped_from_roster(season_year_int)
@@ -93,9 +101,7 @@ def ensure_contracts_bootstrapped_after_schedule_creation_once(state: dict) -> N
 def validate_repo_integrity_once_startup(state: dict) -> None:
     """Validate DB integrity once at startup (per db_path)."""
     league = state["league"]
-    if not isinstance(league, dict):
-        raise ValueError("league must be a dict")
-    db_path = str(league.get("db_path") or "league.db")
+    db_path = _require_db_path(league)
     migrations = state["_migrations"]
     if not isinstance(migrations, dict):
         raise ValueError("_migrations must be a dict")
