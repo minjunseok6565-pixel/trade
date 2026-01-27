@@ -23,6 +23,12 @@ Phase = Literal["regular", "play_in", "playoffs", "preseason"]
 
 ALLOWED_PHASES: Tuple[Phase, ...] = ("regular", "play_in", "playoffs", "preseason")
 
+# Side is a derived label (never a SSOT key)
+Side = Literal["home", "away"]
+
+# Date string in ISO format ("YYYY-MM-DD"); treated as an opaque, validated string.
+DateStr = NewType("DateStr", str)
+
 # PlayerID canonical format recommendation:
 #   P000001, P000002, ...
 # (Human-friendly, sortable, avoids int/str split.)
@@ -41,9 +47,108 @@ def is_canonical_team_id(tid: str) -> bool:
     return bool(TEAM_ID_RE.match(tid))
 
 # Engine raw often uses these side keys for home/away mapping.
-SIDE_HOME: str = "home"
-SIDE_AWAY: str = "away"
-RAW_SIDE_KEYS: Tuple[str, str] = (SIDE_HOME, SIDE_AWAY)
+SIDE_HOME: Side = "home"
+SIDE_AWAY: Side = "away"
+RAW_SIDE_KEYS: Tuple[Side, Side] = (SIDE_HOME, SIDE_AWAY)
+
+
+# ============================================================================
+# 0.5) GameContext (SSOT for home/away)
+# ============================================================================
+
+@dataclass(frozen=True, slots=True)
+class GameContext:
+    """Immutable SSOT container for a single game.
+
+    Home/Away SSOT is *only* (home_team_id, away_team_id) in this context.
+    Engine/external modules must NOT infer/correct/override home/away elsewhere.
+    """
+
+    game_id: str
+    date: DateStr
+    season_id: SeasonId
+    phase: Phase
+    home_team_id: TeamId
+    away_team_id: TeamId
+
+    def __post_init__(self) -> None:
+        # Keep schema "pure": strict, explicit validation. No fallback.
+        if not str(self.game_id).strip():
+            raise ValueError("GameContext.game_id is empty")
+        if not str(self.date).strip():
+            raise ValueError("GameContext.date is empty")
+        if not str(self.season_id).strip():
+            raise ValueError("GameContext.season_id is empty")
+
+        if str(self.phase) not in ALLOWED_PHASES:
+            raise ValueError(f"GameContext.phase must be one of {ALLOWED_PHASES}, got {self.phase!r}")
+
+        hid = normalize_team_id(self.home_team_id)
+        aid = normalize_team_id(self.away_team_id)
+
+        # Prevent non-canonical IDs from sneaking in via direct construction.
+        if str(self.home_team_id) != str(hid):
+            raise ValueError(
+                f"GameContext.home_team_id must be normalized; got {self.home_team_id!r}, expected {str(hid)!r}"
+            )
+        if str(self.away_team_id) != str(aid):
+            raise ValueError(
+                f"GameContext.away_team_id must be normalized; got {self.away_team_id!r}, expected {str(aid)!r}"
+            )
+
+        if str(hid) == str(aid):
+            raise ValueError(f"GameContext.home_team_id and away_team_id must differ (both {str(hid)!r})")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        game_id: str,
+        date: DateStr,
+        season_id: SeasonId,
+        phase: Phase,
+        home_team_id: str,
+        away_team_id: str,
+    ) -> "GameContext":
+        """Normalize + validate and return a canonical GameContext.
+
+        This is the *only* recommended constructor for creating SSOT from external inputs.
+        """
+        gid = str(game_id).strip()
+        if not gid:
+            raise ValueError("game_id is empty")
+
+        d = str(date).strip()
+        if not d:
+            raise ValueError("date is empty")
+
+        sid = str(season_id).strip()
+        if not sid:
+            raise ValueError("season_id is empty")
+
+        if str(phase) not in ALLOWED_PHASES:
+            raise ValueError(f"phase must be one of {ALLOWED_PHASES}, got {phase!r}")
+
+        hid = normalize_team_id(home_team_id)
+        aid = normalize_team_id(away_team_id)
+
+        if str(hid) == str(aid):
+            raise ValueError(f"home_team_id and away_team_id must differ (both {str(hid)!r})")
+
+        return cls(
+            game_id=gid,
+            date=DateStr(d),
+            season_id=SeasonId(sid),
+            phase=phase,
+            home_team_id=hid,
+            away_team_id=aid,
+        )
+
+    def team_id_to_side(self) -> dict[TeamId, Side]:
+        return {self.home_team_id: SIDE_HOME, self.away_team_id: SIDE_AWAY}
+
+    def side_to_team_id(self) -> dict[Side, TeamId]:
+        return {SIDE_HOME: self.home_team_id, SIDE_AWAY: self.away_team_id}
 
 
 # ============================================================================
