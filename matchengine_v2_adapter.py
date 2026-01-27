@@ -1,26 +1,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple, TypedDict, Literal
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Literal
 
 import logging
 
-from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id, season_id_from_year as _schema_season_id_from_year
+import schema
+from schema import SCHEMA_VERSION, normalize_player_id, normalize_team_id
 
 
 Phase = Literal["regular", "play_in", "playoffs", "preseason"]
-
-
-class AdapterContext(TypedDict, total=False):
-
-    game_id: str
-    date: str
-    season_id: str
-    phase: Phase
-    home_team_id: str
-    away_team_id: str
-    home_raw_team_key: str
-    away_raw_team_key: str
 
 
 _ALLOWED_PHASES: Tuple[str, ...] = ("regular", "play_in", "playoffs", "preseason")
@@ -64,79 +53,53 @@ def _require_str(v: Any, path: str) -> str:
     return s
 
 
-def season_id_from_year(season_year: int) -> str:
-    """Convert season start year to season_id format used by state.py.
-
-    Example: 2025 -> "2025-26"
-    """
-    return str(_schema_season_id_from_year(int(season_year)))
-
-
 def build_context_from_master_schedule_entry(
     *,
     entry: Mapping[str, Any],
     league_state: Mapping[str, Any],
-    date_override: Optional[str] = None,
+    *,
     phase: Phase = "regular",
-) -> AdapterContext:
+) -> schema.GameContext:
     game_id = _require_str(entry.get("game_id"), "entry.game_id")
-    date_str = _require_str(date_override or entry.get("date"), "entry.date")
-    home_team_id = _normalize_team_id_strict(entry.get("home_team_id"), path="entry.home_team_id")
-    away_team_id = _normalize_team_id_strict(entry.get("away_team_id"), path="entry.away_team_id")
+    date_str = _require_str(entry.get("date"), "entry.date")
+    home_team_id = _require_str(entry.get("home_team_id"), "entry.home_team_id")
+    away_team_id = _require_str(entry.get("away_team_id"), "entry.away_team_id")
  
     if phase not in _ALLOWED_PHASES:
         raise ValueError(f"context invalid: phase must be one of {_ALLOWED_PHASES}, got '{phase}'")
 
-    season_year_val = league_state.get("season_year")
-    if season_year_val is None:
-        raise ValueError("context invalid: league_state.season_year is required")
-    try:
-        season_year_int = int(season_year_val)
-    except (TypeError, ValueError):
-        raise ValueError(f"context invalid: league_state.season_year must be int-like, got {season_year_val!r}")
+    season_id = _require_str(league_state.get("active_season_id"), "league_state.active_season_id")
 
-    season_id = season_id_from_year(season_year_int)
-
-    # Default assumption (that should hold when TeamState.name == team_id):
-    # raw_result['teams'] keys are team_id strings.
-    return {
-        "game_id": game_id,
-        "date": date_str,
-        "season_id": season_id,
-        "phase": phase,
-        "home_team_id": home_team_id,
-        "away_team_id": away_team_id,
-        "home_raw_team_key": home_team_id,
-        "away_raw_team_key": away_team_id,
-    }
+    # SSOT: Home/Away is fixed by external schedule context.
+    return schema.GameContext.create(
+        game_id=game_id,
+        date=date_str,
+        season_id=season_id,
+        phase=phase,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+    )
 
 
 def build_context_from_team_ids(
-    *,
     game_id: str,
-    date_str: str,
+    date: str,
     home_team_id: str,
     away_team_id: str,
     league_state: Mapping[str, Any],
+    *,
     phase: Phase = "regular",
-    home_raw_team_key: Optional[str] = None,
-    away_raw_team_key: Optional[str] = None,
-) -> AdapterContext:
-    base = build_context_from_master_schedule_entry(
+) -> schema.GameContext:
+    return build_context_from_master_schedule_entry(
         entry={
             "game_id": game_id,
-            "date": date_str,
+            "date": date,
             "home_team_id": home_team_id,
             "away_team_id": away_team_id,
         },
         league_state=league_state,
         phase=phase,
     )
-    if home_raw_team_key is not None:
-        base["home_raw_team_key"] = str(home_raw_team_key)
-    if away_raw_team_key is not None:
-        base["away_raw_team_key"] = str(away_raw_team_key)
-    return base
 
 
 # --- adapter core --------------------------------------------------------
@@ -462,84 +425,38 @@ def _map_side_keyed_dict_to_team_ids(
     )
 
 
-def _resolve_raw_team_keys(
-    *,
-    raw_teams: Mapping[str, Any],
-    home_team_id: str,
-    away_team_id: str,
-    home_raw_team_key: Optional[str],
-    away_raw_team_key: Optional[str],
-) -> Tuple[str, str]:
-    """Resolve raw team keys safely.
-
-    Strategy:
-    1) If explicit raw keys are provided, require they exist.
-    2) Else: accept only if raw_teams contains keys exactly equal to team ids.
-    3) Else: raise ValueError with the available keys.
-
-    (We intentionally do NOT rely on dict insertion order here; callers can pass explicit keys.)
-    """
-    if home_raw_team_key and away_raw_team_key:
-        if home_raw_team_key not in raw_teams:
-            raise ValueError(
-                f"raw matchengine_v3 result invalid: teams missing home_raw_team_key='{home_raw_team_key}'. "
-                f"available_keys={list(raw_teams.keys())!r}"
-            )
-        if away_raw_team_key not in raw_teams:
-            raise ValueError(
-                f"raw matchengine_v3 result invalid: teams missing away_raw_team_key='{away_raw_team_key}'. "
-                f"available_keys={list(raw_teams.keys())!r}"
-            )
-        return home_raw_team_key, away_raw_team_key
-
-    # Fallback: raw teams keyed by team_id
-    if home_team_id in raw_teams and away_team_id in raw_teams:
-        return home_team_id, away_team_id
-
-    raise ValueError(
-        "raw matchengine_v3 result invalid: cannot resolve raw team keys. "
-        f"Provide context.home_raw_team_key/away_raw_team_key. "
-        f"available_keys={list(raw_teams.keys())!r}, home_team_id='{home_team_id}', away_team_id='{away_team_id}'."
-    )
-
 
 def adapt_matchengine_result_to_v2(
-    *,
-    raw_result: Mapping[str, Any],
-    context: Mapping[str, Any],
-    engine_name: str = "matchengine_v3",
-    include_raw: bool = False,
-    include_replay_events: bool = True,
-) -> Dict[str, Any]:
 
     raw = _require_dict(raw_result, "raw")
     meta = _require_dict(raw.get("meta"), "raw.meta")
     teams_obj = _require_dict(raw.get("teams"), "raw.teams")
     gs = _require_dict(raw.get("game_state"), "raw.game_state")
 
-    game_id = _require_str(context.get("game_id"), "context.game_id")
-    date_str = _require_str(context.get("date"), "context.date")
-    season_id = _require_str(context.get("season_id"), "context.season_id")
-    phase = _require_str(context.get("phase"), "context.phase")
+    game_id = _require_str(getattr(context, "game_id", None), "context.game_id")
+    date_str = _require_str(getattr(context, "date", None), "context.date")
+    season_id = _require_str(getattr(context, "season_id", None), "context.season_id")
+    phase = _require_str(getattr(context, "phase", None), "context.phase")
     if phase not in _ALLOWED_PHASES:
         raise ValueError(f"context invalid: phase must be one of {_ALLOWED_PHASES}, got '{phase}'")
 
-    home_team_id = _normalize_team_id_strict(context.get("home_team_id"), path="context.home_team_id")
-    away_team_id = _normalize_team_id_strict(context.get("away_team_id"), path="context.away_team_id")
- 
-    home_raw_team_key = context.get("home_raw_team_key")
-    away_raw_team_key = context.get("away_raw_team_key")
+    home_team_id = _normalize_team_id_strict(getattr(context, "home_team_id", None), path="context.home_team_id")
+    away_team_id = _normalize_team_id_strict(getattr(context, "away_team_id", None), path="context.away_team_id")
 
-    home_raw_key, away_raw_key = _resolve_raw_team_keys(
-        raw_teams=teams_obj,
+    if home_team_id == away_team_id:
+        raise ValueError(f"context invalid: home_team_id == away_team_id == {home_team_id!r} (game_id={game_id!r})")
+
+    # Raw result MUST be keyed by team_id only (no side keys, no extra teams).
+    _require_team_id_keyed_two_team_map(
+        obj=teams_obj,
         home_team_id=home_team_id,
         away_team_id=away_team_id,
-        home_raw_team_key=str(home_raw_team_key) if home_raw_team_key else None,
-        away_raw_team_key=str(away_raw_team_key) if away_raw_team_key else None,
+        path="raw.teams",
+        game_id=game_id,
     )
 
-    home_summary = _require_dict(teams_obj.get(home_raw_key), f"raw.teams[{home_raw_key}]")
-    away_summary = _require_dict(teams_obj.get(away_raw_key), f"raw.teams[{away_raw_key}]")
+    home_summary = _require_dict(teams_obj.get(home_team_id), f"raw.teams[{home_team_id}]")
+    away_summary = _require_dict(teams_obj.get(away_team_id), f"raw.teams[{away_team_id}]")
 
     # Build team results
     v2_teams: Dict[str, Any] = {}
@@ -604,30 +521,34 @@ def adapt_matchengine_result_to_v2(
         away_team_id: int(float(v2_teams[away_team_id]["totals"].get("PTS", 0))),
     }
 
-    # game_state mapping: raw uses 'home'/'away'
-    team_fouls = _map_side_keyed_dict_to_team_ids(
-        obj=gs.get("team_fouls"),
+    # game_state: team-keyed dicts MUST be team_id only (no 'home'/'away' side keys).
+    team_fouls = _require_team_id_keyed_two_team_map(
+        obj=_require_dict(gs.get("team_fouls"), "raw.game_state.team_fouls"),
         home_team_id=home_team_id,
         away_team_id=away_team_id,
         path="raw.game_state.team_fouls",
+        game_id=game_id,
     )
-    player_fouls = _map_side_keyed_dict_to_team_ids(
-        obj=gs.get("player_fouls"),
+    player_fouls = _require_team_id_keyed_two_team_map(
+        obj=_require_dict(gs.get("player_fouls"), "raw.game_state.player_fouls"),
         home_team_id=home_team_id,
         away_team_id=away_team_id,
         path="raw.game_state.player_fouls",
+        game_id=game_id,
     )
-    fatigue = _map_side_keyed_dict_to_team_ids(
-        obj=gs.get("fatigue"),
+    fatigue = _require_team_id_keyed_two_team_map(
+        obj=_require_dict(gs.get("fatigue"), "raw.game_state.fatigue"),
         home_team_id=home_team_id,
         away_team_id=away_team_id,
         path="raw.game_state.fatigue",
+        game_id=game_id,
     )
-    minutes_played_sec = _map_side_keyed_dict_to_team_ids(
-        obj=gs.get("minutes_played_sec"),
+    minutes_played_sec = _require_team_id_keyed_two_team_map(
+        obj=_require_dict(gs.get("minutes_played_sec"), "raw.game_state.minutes_played_sec"),
         home_team_id=home_team_id,
         away_team_id=away_team_id,
         path="raw.game_state.minutes_played_sec",
+        game_id=game_id,
     )
 
     # replay_events: new single source-of-truth play-by-play stream.
@@ -758,4 +679,9 @@ def adapt_matchengine_result_to_v2(
     if include_raw:
         out["raw"] = raw
 
+    # --- FINAL CONTRACT GATE: v2 validator MUST pass -----------------------
+    # Lazy import to avoid circular imports at module import time.
+    from state_modules.state_results import validate_v2_game_result
+
+    validate_v2_game_result(out)
     return out
