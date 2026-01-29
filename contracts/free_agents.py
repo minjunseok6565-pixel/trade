@@ -29,7 +29,7 @@ def _open_repo(game_state: dict, repo: LeagueRepo | None) -> Iterator[LeagueRepo
 
     db_path = _get_db_path(game_state)
     with LeagueRepo(db_path) as managed_repo:
-        managed_repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         yield managed_repo
 
 
