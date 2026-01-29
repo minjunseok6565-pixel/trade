@@ -23,6 +23,7 @@ from state import (
     export_workflow_state,
     get_db_path,
     get_league_context_snapshot,
+    ui_cache_set,
     ui_players_get,
     ui_players_set,
     ui_teams_get,
@@ -551,6 +552,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
