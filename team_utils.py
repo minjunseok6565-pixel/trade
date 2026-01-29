@@ -23,7 +23,6 @@ from state import (
     export_full_state_snapshot,
     get_db_path,
     get_league_context_snapshot,
-    initialize_master_schedule_if_needed,
     players_get,
     players_set,
     teams_get,
@@ -237,11 +236,15 @@ def _compute_cap_space(team_id: str) -> float:
 
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
-    initialize_master_schedule_if_needed()
     league = export_full_state_snapshot().get("league", {})
     master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
+    if not games:
+        raise RuntimeError(
+            "Master schedule is not initialized. Expected state.startup_init_state() to run before calling team_utils._compute_team_records()."
+        )
+    
     team_ids = _list_active_team_ids()
     records: Dict[str, Dict[str, Any]] = {
         tid: {"wins": 0, "losses": 0, "pf": 0, "pa": 0}
@@ -441,6 +444,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
