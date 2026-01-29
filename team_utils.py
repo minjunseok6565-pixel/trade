@@ -19,7 +19,6 @@ def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
 
 from derived_formulas import compute_derived
 from state import (
-    ensure_cap_model_populated_if_needed,
     export_full_state_snapshot,
     get_db_path,
     get_league_context_snapshot,
@@ -222,8 +221,7 @@ def _compute_team_payroll(team_id: str) -> float:
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
-    # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
-    ensure_cap_model_populated_if_needed()
+    # Assumes cap model (salary_cap/aprons) is already populated during server startup/hydration.
     league_context = get_league_context_snapshot()
     trade_rules = league_context.get("trade_rules", {})
     try:
@@ -444,6 +442,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
