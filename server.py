@@ -26,7 +26,7 @@ from playoffs import (
 )
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
-from team_utils import get_conference_standings, get_team_cards, get_team_detail
+from team_utils import get_conference_standings, get_team_cards, get_team_detail, ui_cache_rebuild_all
 from season_report_ai import generate_season_report
 from trades.errors import TradeError
 from trades.models import canonicalize_deal, parse_deal, serialize_deal
@@ -54,6 +54,13 @@ def _startup_init_state() -> None:
     state.set_db_path(db_path)
 
     state.startup_init_state()
+
+    # Explicit UI-only cache bootstrap (derived, non-authoritative).
+    # Ensures team/player UI metadata exists from server boot without requiring any read path to "init".
+    try:
+        ui_cache_rebuild_all()
+    except Exception as e:
+        raise RuntimeError(f"ui_cache_rebuild_all() failed during startup: {e}") from e
 
 app.add_middleware(
     CORSMiddleware,
@@ -671,6 +678,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
