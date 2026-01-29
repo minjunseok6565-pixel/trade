@@ -21,7 +21,6 @@ from state import (
     get_db_path,
     get_league_context_snapshot,
     ingest_game_result,
-    initialize_master_schedule_if_needed,
     set_current_date,
 )
 from trades_ai import _run_ai_gm_tick_if_needed
@@ -72,12 +71,17 @@ def advance_league_until(
     target_date_str: str,
     user_team_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    initialize_master_schedule_if_needed()
     league_full = export_full_state_snapshot().get("league", {})
     master_schedule = league_full.get("master_schedule", {})
     by_date: Dict[str, List[str]] = master_schedule.get("by_date") or {}
     games: List[Dict[str, Any]] = master_schedule.get("games") or []
 
+    if not by_date or not games:
+        raise RuntimeError(
+            "Master schedule is not initialized. Expected state.startup_init_state() to run before calling advance_league_until()."
+        )
+
+    
     try:
         target_date = date.fromisoformat(target_date_str)
     except ValueError as exc:
