@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from schema import normalize_player_id
+
 from ...errors import DEAL_INVALIDATED, TradeError
 from ...models import PlayerAsset
 from ..base import TradeContext
@@ -15,6 +17,7 @@ class PlayerEligibilityRule:
     enabled: bool = True
 
     def validate(self, deal, ctx: TradeContext) -> None:
+        players = _require_rule_players(ctx)
         trade_rules = ctx.game_state.get("league", {}).get("trade_rules", {})
         new_fa_sign_ban_days = int(trade_rules.get("new_fa_sign_ban_days") or 90)
         aggregation_ban_days = int(trade_rules.get("aggregation_ban_days") or 60)
@@ -23,9 +26,13 @@ class PlayerEligibilityRule:
             for asset in assets:
                 if not isinstance(asset, PlayerAsset):
                     continue
-                player_state = ctx.game_state.get("players", {}).get(asset.player_id, {})
-                if not player_state:
-                    continue
+                pid = _canonical_player_id(asset.player_id)
+                if pid not in players:
+                    raise RuntimeError(
+                        "Trade rule evaluation requires SSOT-backed rule players meta; "
+                        f"missing meta for player_id={pid}"
+                    )
+                player_state = players[pid]
                 contract_action_type = player_state.get("last_contract_action_type")
                 is_recent_signing = contract_action_type in {
                     "SIGN_FREE_AGENT",
@@ -52,7 +59,7 @@ class PlayerEligibilityRule:
                         {
                             "rule": self.rule_id,
                             "team_id": team_id,
-                            "player_id": asset.player_id,
+                            "player_id": pid,
                             "reason": "recent_contract_signing",
                             "trade_date": ctx.current_date.isoformat(),
                             "signed_date": signed_date.isoformat(),
@@ -71,9 +78,13 @@ class PlayerEligibilityRule:
             if len(outgoing_players) < 2:
                 continue
             for asset in outgoing_players:
-                player_state = ctx.game_state.get("players", {}).get(asset.player_id, {})
-                if not player_state:
-                    continue
+                pid = _canonical_player_id(asset.player_id)
+                if pid not in players:
+                    raise RuntimeError(
+                        "Trade rule evaluation requires SSOT-backed rule players meta; "
+                        f"missing meta for player_id={pid}"
+                    )
+                player_state = players[pid]
                 if not player_state.get("acquired_via_trade"):
                     continue
                 acquired_date = _parse_player_date(player_state.get("acquired_date"))
@@ -85,13 +96,27 @@ class PlayerEligibilityRule:
                         {
                             "rule": self.rule_id,
                             "team_id": team_id,
-                            "player_id": asset.player_id,
+                            "player_id": pid,
                             "reason": "aggregation_ban",
                             "trade_date": ctx.current_date.isoformat(),
                             "acquired_date": acquired_date.isoformat(),
                         },
                     )
 
+
+def _require_rule_players(ctx: TradeContext) -> dict:
+    players = ctx.game_state.get("players")
+    if not isinstance(players, dict):
+        raise RuntimeError(
+            "TradeContext missing rule players meta. "
+            "build_trade_context() must inject SSOT-backed ctx.game_state['players']."
+        )
+    return players
+
+
+def _canonical_player_id(value: object) -> str:
+    return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
+    
 
 def _parse_player_date(value: object) -> date:
     """Parse player date strings like '2026-01-05T10:11:12' as 2026-01-05."""
