@@ -16,6 +16,7 @@ Phase 1 (minimal) implementation notes:
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, Iterable, Optional
 
 from league_repo import LeagueRepo
@@ -26,6 +27,8 @@ def build_rule_players_meta(
     repo: LeagueRepo,
     player_ids: Iterable[str],
     *,
+    season_year: Optional[int] = None,
+    as_of_date: Optional[date] = None,
     unknown_signed_date: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Build rule-only player metadata for the given player_ids.
@@ -35,6 +38,8 @@ def build_rule_players_meta(
     Args:
         repo: LeagueRepo (SSOT-backed).
         player_ids: iterable of player_id-like values.
+        season_year: current season year (SSOT) for rule evaluation. (Phase 2 uses this.)
+        as_of_date: "as-of" date for filtering future transactions. (Phase 2 uses this.)
         unknown_signed_date: optional fallback when a player has no active contract
             signed_date in SSOT. (e.g., "1900-01-01" to make everyone immediately eligible)
     """
