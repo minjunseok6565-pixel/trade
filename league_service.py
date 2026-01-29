@@ -13,16 +13,14 @@ This file intentionally starts with a small, safe subset of write APIs. More com
 commands (trade commit, draft settlement, contract lifecycle) can be added incrementally.
 """
 
-import contextlib
 import datetime as _dt
 import hashlib
 import json
-from typing import Any, Dict, List, Mapping, Optional, Sequence
 import logging
 import sqlite3
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -174,7 +172,7 @@ class LeagueService:
     # ----------------------------
     # Internal common helpers
     # ----------------------------
-    @contextlib.contextmanager
+    @contextmanager
     def _atomic(self):
         """
         Yield a cursor inside a DB transaction.
@@ -275,6 +273,13 @@ class LeagueService:
         for e in entries:
             if not isinstance(e, dict):
                 e = dict(e)
+            # Store season_year as a first-class column when provided (else NULL).
+            sy = e.get("season_year")
+            try:
+                season_year_i = int(sy) if sy is not None and str(sy) != "" else None
+            except (TypeError, ValueError):
+                _warn_limited("TX_SEASON_YEAR_COERCE_FAILED", f"value={sy!r}", limit=3)
+                season_year_i = None
             payload = _json_dumps(dict(e))
             tx_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
             rows.append(
@@ -282,6 +287,7 @@ class LeagueService:
                     tx_hash,
                     str(e.get("type") or "unknown"),
                     str(e.get("date") or "") if e.get("date") is not None else None,
+                    season_year_i,
                     str(e.get("deal_id") or "") if e.get("deal_id") is not None else None,
                     str(e.get("source") or "") if e.get("source") is not None else None,
                     _json_dumps(e.get("teams") or []),
@@ -291,8 +297,10 @@ class LeagueService:
             )
         cur.executemany(
             """
-            INSERT OR IGNORE INTO transactions_log(tx_hash, tx_type, tx_date, deal_id, source, teams_json, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
++            INSERT OR IGNORE INTO transactions_log(
++                tx_hash, tx_type, tx_date, season_year, deal_id, source, teams_json, payload_json, created_at
++            )
++            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             rows,
         )
@@ -752,6 +760,7 @@ class LeagueService:
         This intentionally does *not* assume a specific Deal model shape.
         The raw deal object is stored under payload.deal for traceability.
         """
+        season_year_i = _current_season_year_ssot()
         entry: Dict[str, Any] = {
             "type": "trade",
             "date": _coerce_iso(trade_date),
@@ -760,6 +769,7 @@ class LeagueService:
             "deal_id": deal_id,
             "meta": dict(meta) if meta else {},
             "deal": deal if isinstance(deal, dict) else None,
+            "season_year": int(season_year_i),
         }
         # Remove noisy keys if empty
         if entry.get("deal_id") is None:
@@ -956,7 +966,8 @@ class LeagueService:
             allow_locked_by_deal_id=str(deal_id),
         )
 
-        season_year_i = _infer_season_year_from_date(trade_date_as_date)
+        # SSOT: season_year must come from league context snapshot (state["league"]["season_year"])
+        season_year_i = _current_season_year_ssot()
 
         # Helpers
         def _resolve_receiver(sender_team: str, asset: Any) -> str:
