@@ -72,10 +72,12 @@ __all__ = [
     "trade_market_set",
     "trade_memory_get",
     "trade_memory_set",
-    "players_get",
-    "players_set",
-    "teams_get",
-    "teams_set",
+    "ui_cache_get",
+    "ui_cache_set",
+    "ui_players_get",
+    "ui_players_set",
+    "ui_teams_get",
+    "ui_teams_set",
     "reset_state_for_dev",
 ]
 
@@ -585,8 +587,6 @@ def set_cached_playoff_news_snapshot(cache: dict) -> None:
 def export_trade_context_snapshot() -> dict:
     def _impl(v: Mapping[str, Any]) -> dict:
         return {
-            "players": _to_plain(v.get("players") or {}),
-            "teams": _to_plain(v.get("teams") or {}),
             "asset_locks": _to_plain(v.get("asset_locks") or {}),
             "league": get_league_context_snapshot(),
             "my_team_id": v["postseason"]["my_team_id"],
@@ -610,14 +610,6 @@ def ensure_cap_model_populated_if_needed() -> None:
 
     _mutate_state("ensure_cap_model_populated_if_needed", _impl)
 
-
-def ensure_player_ids_normalized(*, allow_legacy_numeric: bool = True) -> dict:
-    from state_modules import state_bootstrap
-
-    def _impl(state: dict) -> dict:
-        return state_bootstrap.ensure_player_ids_normalized(state, allow_legacy_numeric=allow_legacy_numeric)
-
-    return _mutate_state("ensure_player_ids_normalized", _impl)
 
 
 def ensure_trade_state_keys() -> None:
@@ -730,26 +722,62 @@ def trade_memory_set(value: dict) -> None:
     _mutate_state("trade_memory_set", _impl)
 
 
-def players_get() -> dict:
-    return _read_state(lambda v: _to_plain(v.get("players") or {}))
+# ---------------------------------------------------------------------
+# UI cache (read-model) accessors.
+# - This is explicitly *non-authoritative* data meant for UI rendering.
+# - Game rules and validations must not depend on these values.
+# ---------------------------------------------------------------------
 
 
-def players_set(value: dict) -> None:
+def ui_cache_get() -> dict:
+    return _read_state(lambda v: _to_plain(v.get("ui_cache") or {}))
+
+
+def ui_cache_set(value: dict) -> None:
     def _impl(state: dict) -> None:
-        state["players"] = deepcopy(value)
+        state["ui_cache"] = deepcopy(value)
 
-    _mutate_state("players_set", _impl)
-
-
-def teams_get() -> dict:
-    return _read_state(lambda v: _to_plain(v.get("teams") or {}))
+    _mutate_state("ui_cache_set", _impl)
 
 
-def teams_set(value: dict) -> None:
+def ui_players_get() -> dict:
+    def _impl(v: Mapping[str, Any]) -> dict:
+        ui_cache = v.get("ui_cache") or {}
+        if not isinstance(ui_cache, Mapping):
+            return {}
+        return _to_plain(ui_cache.get("players") or {})
+
+    return _read_state(_impl)
+
+
+def ui_players_set(value: dict) -> None:
     def _impl(state: dict) -> None:
-        state["teams"] = deepcopy(value)
+        ui_cache = state.get("ui_cache")
+        if not isinstance(ui_cache, dict):
+            raise ValueError("ui_players_set: ui_cache missing or invalid; UI cache must be initialized explicitly")
+        ui_cache["players"] = deepcopy(value)
 
-    _mutate_state("teams_set", _impl)
+    _mutate_state("ui_players_set", _impl)
+
+
+def ui_teams_get() -> dict:
+    def _impl(v: Mapping[str, Any]) -> dict:
+        ui_cache = v.get("ui_cache") or {}
+        if not isinstance(ui_cache, Mapping):
+            return {}
+        return _to_plain(ui_cache.get("teams") or {})
+
+    return _read_state(_impl)
+
+
+def ui_teams_set(value: dict) -> None:
+    def _impl(state: dict) -> None:
+        ui_cache = state.get("ui_cache")
+        if not isinstance(ui_cache, dict):
+            raise ValueError("ui_teams_set: ui_cache missing or invalid; UI cache must be initialized explicitly")
+        ui_cache["teams"] = deepcopy(value)
+
+    _mutate_state("ui_teams_set", _impl)
 
 
 def reset_state_for_dev() -> None:
