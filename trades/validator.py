@@ -13,7 +13,7 @@ def validate_deal(
     current_date: Optional[date] = None,
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> None:
-    ctx = build_trade_context(current_date=current_date, db_path=get_db_path())
+     ctx = build_trade_context(deal, current_date=current_date, db_path=get_db_path())
     try:
         ctx.repo.validate_integrity()
         validate_all(deal, ctx)
