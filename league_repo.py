@@ -342,6 +342,7 @@ class LeagueRepo:
                     tx_hash TEXT PRIMARY KEY,
                     tx_type TEXT NOT NULL,
                     tx_date TEXT,
+                    season_year INTEGER,
                     deal_id TEXT,
                     source TEXT,
                     teams_json TEXT,
@@ -396,6 +397,24 @@ class LeagueRepo:
                     "status": "TEXT",
                     "contract_json": "TEXT",
                 },
+            )
+
+            # Ensure transactions_log has season_year as a first-class column (SSOT)
+            # This keeps rule queries fast and avoids parsing payload_json for season filtering.
+            self._ensure_table_columns(
+                cur,
+                "transactions_log",
+                {
+                    "season_year": "INTEGER",
+                },
+            )
+
+            # Indices for fast rule filtering (safe after ensuring columns exist).
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tx_season_year ON transactions_log(season_year);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tx_season_type_date ON transactions_log(season_year, tx_type, tx_date);"
             )
 
     # ------------------------
@@ -652,6 +671,13 @@ class LeagueRepo:
         for e in entries:
             if not isinstance(e, dict):
                 continue
+            # Store season_year as a first-class column when provided (else NULL).
+            sy = e.get("season_year")
+            try:
+                season_year_i = int(sy) if sy is not None and str(sy) != "" else None
+            except (TypeError, ValueError):
+                _warn_limited("TX_SEASON_YEAR_COERCE_FAILED", f"value={sy!r}", limit=3)
+                season_year_i = None
             payload = _json_dumps(e)
             tx_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
             rows.append(
@@ -659,6 +685,7 @@ class LeagueRepo:
                     tx_hash,
                     str(e.get("type") or "unknown"),
                     str(e.get("date") or "") if e.get("date") is not None else None,
+                    season_year_i,
                     str(e.get("deal_id") or "") if e.get("deal_id") is not None else None,
                     str(e.get("source") or "") if e.get("source") is not None else None,
                     _json_dumps(e.get("teams") or []),
@@ -669,8 +696,10 @@ class LeagueRepo:
         with self.transaction() as cur:
             cur.executemany(
                 """
-                INSERT OR IGNORE INTO transactions_log(tx_hash, tx_type, tx_date, deal_id, source, teams_json, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT OR IGNORE INTO transactions_log(
+                    tx_hash, tx_type, tx_date, season_year, deal_id, source, teams_json, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 rows,
             )
@@ -680,6 +709,7 @@ class LeagueRepo:
         *,
         limit: int = 200,
         since_date: Optional[str] = None,
+        season_year: Optional[int] = None,
         deal_id: Optional[str] = None,
         tx_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -689,6 +719,9 @@ class LeagueRepo:
         if since_date:
             where.append("tx_date >= ?")
             params.append(str(since_date))
+        if season_year is not None:
+            where.append("season_year = ?")
+            params.append(int(season_year))
         if deal_id:
             where.append("deal_id = ?")
             params.append(str(deal_id))
@@ -710,6 +743,116 @@ class LeagueRepo:
                 out.append(payload)
             else:
                 out.append({"value": payload})
+        return out
+
+    def get_transactions_for_players(
+        self,
+        player_ids: Sequence[str],
+        *,
+        types: Optional[Sequence[str]] = None,
+        season_year: Optional[int] = None,
+        up_to_date: Optional[Any] = None,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch transactions relevant to the given players.
+
+        Minimal Phase-2 support:
+        - Filters by season_year / tx_type / up_to_date in SQL (fast).
+        - Filters by player_ids in Python by parsing payload_json (because player_id is not a first-class column).
+
+        NOTE / unresolved:
+        - transactions_log does NOT have a player_id column (only payload_json), so we can't do SQL filtering by player.
+          If this becomes slow, consider adding:
+            (a) a player_id column for contract-type tx, and/or
+            (b) a tx_players bridge table (tx_hash, player_id) for trade moves and contract actions.
+        """
+        pid_set = {str(p) for p in (player_ids or []) if p is not None and str(p).strip()}
+        if not pid_set:
+            return []
+
+        def _normalize_up_to_iso(v: Any) -> Optional[str]:
+            # We store tx_date as ISO strings. For date-only inputs, treat as end-of-day UTC.
+            if v is None:
+                return None
+            if isinstance(v, _dt.datetime):
+                dt = v
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+                return dt.replace(microsecond=0).isoformat() + "Z"
+            if isinstance(v, _dt.date):
+                d = v
+                return f"{d.isoformat()}T23:59:59Z"
+            s = str(v).strip()
+            if not s:
+                return None
+            # If user passes YYYY-MM-DD, interpret as end-of-day to include same-day tx with time.
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+                return f"{s}T23:59:59Z"
+            return s
+
+        up_to_iso = _normalize_up_to_iso(up_to_date)
+        types_list = [str(t) for t in (types or []) if t is not None and str(t).strip()]
+
+        where: List[str] = []
+        params: List[Any] = []
+
+        if season_year is not None:
+            where.append("season_year = ?")
+            params.append(int(season_year))
+
+        if types_list:
+            placeholders = ",".join(["?"] * len(types_list))
+            where.append(f"tx_type IN ({placeholders})")
+            params.extend(types_list)
+
+        if up_to_iso:
+            # Include NULL dates defensively (legacy); ideally tx_date is always set going forward.
+            where.append("(tx_date IS NULL OR tx_date <= ?)")
+            params.append(up_to_iso)
+
+        sql = "SELECT payload_json FROM transactions_log"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY COALESCE(tx_date,'') DESC, created_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+
+        rows = self._conn.execute(sql, params).fetchall()
+
+        def _tx_mentions_player(tx: Dict[str, Any]) -> bool:
+            # 1) Contract-type tx: top-level player_id
+            pid = tx.get("player_id")
+            if pid is not None and str(pid) in pid_set:
+                return True
+
+            # 2) Trade-type tx: player_moves list (Phase 2 normalized payload)
+            pm = tx.get("player_moves")
+            if isinstance(pm, list):
+                for m in pm:
+                    if isinstance(m, dict) and str(m.get("player_id")) in pid_set:
+                        return True
+
+            # 3) Legacy trade payload: assets summary might have team -> players lists
+            assets = tx.get("assets")
+            if isinstance(assets, dict):
+                for _team, a in assets.items():
+                    if isinstance(a, dict):
+                        players = a.get("players")
+                        if isinstance(players, list) and any(str(x) in pid_set for x in players):
+                            return True
+
+            return False
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            payload = _json_loads(r["payload_json"], None)
+            if isinstance(payload, dict):
+                if _tx_mentions_player(payload):
+                    out.append(payload)
+            else:
+                # keep non-dict payloads out; rules expect dict payload
+                continue
+
         return out
 
     # ------------------------
