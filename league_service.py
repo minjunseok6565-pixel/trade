@@ -297,10 +297,10 @@ class LeagueService:
             )
         cur.executemany(
             """
-+            INSERT OR IGNORE INTO transactions_log(
-+                tx_hash, tx_type, tx_date, season_year, deal_id, source, teams_json, payload_json, created_at
-+            )
-+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR IGNORE INTO transactions_log(
+                tx_hash, tx_type, tx_date, season_year, deal_id, source, teams_json, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             rows,
         )
