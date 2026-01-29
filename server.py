@@ -569,11 +569,17 @@ async def team_schedule(team_id: str):
     if team_id not in ALL_TEAM_IDS:
         raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in league")
 
-    # 마스터 스케줄이 없다면 생성
-    state.initialize_master_schedule_if_needed()
+    # (startup 보장 전제) 마스터 스케줄은 이미 초기화되어 있어야 함
     league = state.export_full_state_snapshot().get("league", {})
     master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
+
+    if not games:
+        raise HTTPException(
+            status_code=500,
+            detail="Master schedule is not initialized. Expected server startup_init_state() to run.",
+        )
+        
 
     team_games: List[Dict[str, Any]] = [
         g for g in games
@@ -665,6 +671,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
