@@ -48,15 +48,7 @@ def _repo_ctx() -> "LeagueRepo":
 
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
-        try:
-            repo.init_db()
-        except Exception as exc:
-            logger.exception(
-                "[DB_INIT_FAILED] team_utils._repo_ctx repo.init_db() failed (db_path=%s)",
-                db_path,
-            )
-            raise
-        yield repo
+        # DB schema is guaranteed during server startup (state.startup_init_state()). repo
 
 
 def _list_active_team_ids() -> List[str]:
@@ -442,6 +434,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
