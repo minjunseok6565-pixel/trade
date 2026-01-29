@@ -20,6 +20,7 @@ def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
 from derived_formulas import compute_derived
 from state import (
     export_full_state_snapshot,
+    export_workflow_state,
     get_db_path,
     get_league_context_snapshot,
     players_get,
@@ -49,7 +50,7 @@ def _repo_ctx() -> "LeagueRepo":
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
         # DB schema is guaranteed during server startup (state.startup_init_state()). repo
-
+        yield repo
 
 def _list_active_team_ids() -> List[str]:
     """Return active team ids from DB if possible.
@@ -434,6 +435,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
