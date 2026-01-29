@@ -1431,6 +1431,87 @@ class LeagueRepo:
             raise KeyError(f"active roster entry not found for player_id={player_id}")
         return str(row["team_id"])
 
+    def get_team_ids_by_players(self, player_ids: Iterable[str]) -> Dict[str, str]:
+        """Bulk lookup: player_id -> active roster team_id.
+
+        Notes:
+        - Uses SQLite SSOT (roster table).
+        - Returns only players found on an active roster.
+        - Keys are normalized canonical player_id strings.
+        """
+        # Normalize and de-dup while preserving deterministic order.
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for pid in player_ids:
+            npid = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            if npid in seen:
+                continue
+            seen.add(npid)
+            normalized.append(npid)
+
+        if not normalized:
+            return {}
+
+        out: Dict[str, str] = {}
+        # SQLite default variable limit is often 999; chunk defensively.
+        CHUNK = 900
+        for i in range(0, len(normalized), CHUNK):
+            chunk = normalized[i : i + CHUNK]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT player_id, team_id FROM roster WHERE status='active' AND player_id IN ({placeholders});",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                out[str(r["player_id"])] = str(r["team_id"]).upper()
+        return out
+
+    def get_active_signed_dates_by_players(self, player_ids: Iterable[str]) -> Dict[str, Optional[str]]:
+        """Bulk lookup: player_id -> signed_date for the active contract.
+
+        Notes:
+        - Uses SQLite SSOT (contracts table).
+        - For players without an active contract, value will be None.
+        - Keys are normalized canonical player_id strings.
+        """
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for pid in player_ids:
+            npid = str(normalize_player_id(pid, strict=False, allow_legacy_numeric=True))
+            if npid in seen:
+                continue
+            seen.add(npid)
+            normalized.append(npid)
+
+        if not normalized:
+            return {}
+
+        # Pre-fill with None so callers can fail-fast if needed.
+        out: Dict[str, Optional[str]] = {pid: None for pid in normalized}
+
+        CHUNK = 900
+        for i in range(0, len(normalized), CHUNK):
+            chunk = normalized[i : i + CHUNK]
+            placeholders = ",".join(["?"] * len(chunk))
+            # Prefer contracts.is_active (robust even if derived tables aren't rebuilt).
+            rows = self._conn.execute(
+                f"""
+                SELECT player_id, signed_date, updated_at
+                FROM contracts
+                WHERE is_active=1 AND player_id IN ({placeholders})
+                ORDER BY updated_at DESC;
+                """,
+                chunk,
+            ).fetchall()
+
+            # If duplicates exist (shouldn't), keep the most recently updated.
+            for r in rows:
+                pid = str(r["player_id"])
+                if out.get(pid) is None:
+                    out[pid] = r["signed_date"]
+
+        return out
+
     def get_salary_amount(self, player_id: str) -> Optional[int]:
         pid = normalize_player_id(player_id, strict=False, allow_legacy_numeric=True)
         row = self._conn.execute(
