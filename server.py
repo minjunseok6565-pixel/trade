@@ -427,7 +427,7 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
 
 def _validate_repo_integrity(db_path: str) -> None:
     with LeagueRepo(db_path) as repo:
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         repo.validate_integrity()
 
 
@@ -536,7 +536,7 @@ async def roster_summary(team_id: str):
     db_path = state.get_db_path()
     team_id = str(normalize_team_id(team_id, strict=True))
     with LeagueRepo(db_path) as repo:
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         roster = repo.get_team_roster(team_id)
 
     if not roster:
@@ -642,7 +642,7 @@ async def state_summary():
     db_path = state.get_db_path()
     try:
         with LeagueRepo(db_path) as repo:
-            repo.init_db()
+            # DB schema is guaranteed during server startup (state.startup_init_state()).
             db_snapshot: Dict[str, Any] = {
                 "ok": True,
                 "db_path": db_path,
@@ -671,6 +671,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
