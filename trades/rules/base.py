@@ -144,7 +144,7 @@ def build_trade_context(
 
     resolved_db_path = db_path or state.get_db_path()
     repo = LeagueRepo(resolved_db_path)
-    repo.init_db()
+    # DB schema is guaranteed during server startup (state.startup_init_state()).
 
     ctx_state = state.export_trade_context_snapshot()
     assets_snap = state.export_trade_assets_snapshot()
