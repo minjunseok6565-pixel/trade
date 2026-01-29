@@ -23,10 +23,10 @@ from state import (
     export_workflow_state,
     get_db_path,
     get_league_context_snapshot,
-    players_get,
-    players_set,
-    teams_get,
-    teams_set,
+    ui_players_get,
+    ui_players_set,
+    ui_teams_get,
+    ui_teams_set,
 )
 
 # Division/Conference mapping can stay in config (static).
@@ -133,7 +133,7 @@ def _init_players_and_teams_if_needed() -> None:
                     except (KeyError, TypeError, ValueError, ZeroDivisionError):
                         _warn_limited("DERIVED_COMPUTE_FAILED", f"player_id={pid!r}", limit=3)
                         pass
-                players_set(updated_players)
+                ui_players_set(updated_players)
                 return
         except (ImportError, sqlite3.Error, OSError, TypeError) as exc:
             _warn_limited(
@@ -177,7 +177,7 @@ def _init_players_and_teams_if_needed() -> None:
                     "acquired_via_trade": False,
                 }
 
-    players_set(players)
+    ui_players_set(players)
 
     teams_meta: Dict[str, Dict[str, Any]] = {}
     for tid in team_ids:
@@ -191,7 +191,7 @@ def _init_players_and_teams_if_needed() -> None:
             "market": "mid",
             "patience": 0.5,
         }
-    teams_set(teams_meta)
+    ui_teams_set(teams_meta)
 
 
 def _compute_team_payroll(team_id: str) -> float:
@@ -337,7 +337,7 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
-        meta = teams_get().get(tid, {})
+        meta = ui_teams_get().get(tid, {})
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -372,7 +372,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = teams_get().get(tid, {})
+    meta = ui_teams_get().get(tid, {})
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -434,6 +434,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
