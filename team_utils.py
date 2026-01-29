@@ -271,7 +271,6 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
 
 def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
     """Return standings grouped by conference."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
 
     standings = {"east": [], "west": []}
@@ -435,6 +434,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
