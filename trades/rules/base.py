@@ -151,6 +151,7 @@ def build_trade_context(
     ctx_state = state.export_trade_context_snapshot()
     assets_snap = state.export_trade_assets_snapshot()
     resolved_extra.setdefault("assets_snapshot", assets_snap)
+    season_year = int(ctx_state["league"]["season_year"])
 
     # -----------------------------------------------------------------
     # Inject rule-only player metadata derived from SSOT (DB).
@@ -175,7 +176,11 @@ def build_trade_context(
             seen.add(pid)
             deal_player_ids.append(pid)
 
-    players_meta = rule_player_meta.build_rule_players_meta(repo, deal_player_ids)
+    # Fail-fast if season_year is missing or current_date format is inconsistent.
+    # season_year SSOT is ctx_state["league"]["season_year"] (from league context snapshot).
+    players_meta = rule_player_meta.build_rule_players_meta(
+        repo, deal_player_ids, season_year=season_year, as_of_date=current_date
+    )
     missing = sorted(set(deal_player_ids) - set(players_meta.keys()))
     if missing:
         raise RuntimeError(
