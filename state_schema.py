@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 from state_modules.state_constants import DEFAULT_TRADE_RULES, _DEFAULT_TRADE_MARKET, _DEFAULT_TRADE_MEMORY
 
-STATE_SCHEMA_VERSION = "3.0"
+STATE_SCHEMA_VERSION = "4.0"
 ALLOWED_PHASES = {"regular", "preseason", "play_in", "playoffs"}
 NON_REGULAR_PHASES = {"preseason", "play_in", "playoffs"}
 ALLOWED_TOP_LEVEL_KEYS = {
@@ -19,8 +19,7 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "phase_results",
     "cached_views",
     "league",
-    "teams",
-    "players",
+    "ui_cache",
     "trade_agreements",
     "negotiations",
     "asset_locks",
@@ -29,6 +28,9 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "postseason",
     "_migrations",
 }
+
+# UI-only read model cache. Never treat this as authoritative SSOT.
+ALLOWED_UI_CACHE_KEYS = {"players", "teams"}
 ALLOWED_PHASE_RESULTS_KEYS = {"games", "player_stats", "team_stats", "game_results"}
 ALLOWED_POSTSEASON_KEYS = {
     "field",
@@ -135,8 +137,10 @@ def create_default_game_state() -> Dict[str, Any]:
             "trade_rules": {**DEFAULT_TRADE_RULES},
             "last_gm_tick_date": None,  # 마지막 AI GM 트레이드 시도 날짜
         },
-        "teams": {},  # 팀 성향 / 메타 정보
-        "players": {},  # 선수 메타 정보
+        "ui_cache": {
+            "teams": {},  # UI용 팀 성향 / 메타(권위 없음)
+            "players": {},  # UI용 선수 메타(권위 없음)
+        },
         "trade_agreements": {},  # deal_id -> committed deal data
         "negotiations": {},  # session_id -> negotiation sessions
         "asset_locks": {},  # asset_key -> {deal_id, expires_at}
@@ -221,14 +225,19 @@ def validate_game_state(state: dict) -> None:
     cached_views = _require_container(state, "cached_views", dict, "dict")
     postseason = _require_container(state, "postseason", dict, "dict")
     league = _require_container(state, "league", dict, "dict")
-    _require_container(state, "teams", dict, "dict")
-    _require_container(state, "players", dict, "dict")
+    ui_cache = _require_container(state, "ui_cache", dict, "dict")
     _require_container(state, "trade_agreements", dict, "dict")
     _require_container(state, "negotiations", dict, "dict")
     _require_container(state, "asset_locks", dict, "dict")
     _require_container(state, "trade_market", dict, "dict")
     _require_container(state, "trade_memory", dict, "dict")
     migrations = _require_container(state, "_migrations", dict, "dict")
+
+    _require_exact_keys(ui_cache, ALLOWED_UI_CACHE_KEYS, "ui_cache")
+    if not isinstance(ui_cache.get("teams"), dict):
+        raise ValueError("GameState invalid: ui_cache.teams must be dict")
+    if not isinstance(ui_cache.get("players"), dict):
+        raise ValueError("GameState invalid: ui_cache.players must be dict")
 
     _require_exact_keys(phase_results, NON_REGULAR_PHASES, "phase_results")
     for phase_key in NON_REGULAR_PHASES:
