@@ -78,14 +78,6 @@ def _accumulate_player_rows(rows: List[Dict[str, Any]], season_player_stats: Dic
 def _repo_ctx() -> LeagueRepo:
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
-        try:
-            repo.init_db()
-        except Exception as exc:
-            logger.exception(
-                "[DB_INIT_FAILED] playoffs._repo_ctx repo.init_db() failed (db_path=%s)",
-                db_path,
-            )
-            raise
         yield repo
 
 def _ensure_postseason_state() -> Dict[str, Any]:
