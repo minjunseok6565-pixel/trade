@@ -993,6 +993,7 @@ class TeamSituationEvaluator:
     ) -> Tuple[CompetitiveTier, TradePosture, TimeHorizon, float, Dict[str, float], List[TeamNeed], List[str]]:
         # 1) competitive score
         season_progress = _safe_float(self.ctx.records_index.get(tid, {}).get("season_progress"), 0.0)
+        stat_trust = _early_stat_trust(season_progress)  # 0~0.2 구간: 스타일/효율 신호 영향 완화(최저 0.5)
 
         perf_score = _compute_perf_score(signals, season_progress)
         roster_score = 0.62 * signals.star_power + 0.38 * signals.depth
@@ -1050,12 +1051,13 @@ class TeamSituationEvaluator:
         # 4) needs: merge role + style + roster gaps
         needs: List[TeamNeed] = []
         needs.extend(_dedupe_needs(role_needs))
-        needs.extend(_style_to_needs(tid, signals, style_sig))
+        # Season-early dampening: use stat_trust so style/efficiency signals don't overreact on small samples.
+        needs.extend(_style_to_needs(tid, signals, style_sig, stat_trust=stat_trust))
         needs.extend(_roster_gap_needs(tid, roster_sig, signals))
         needs = _merge_and_clip_needs(needs)
 
         # ORtg/DRtg percentile based boosting (align needs with clear team weaknesses).
-        needs = _boost_needs_by_efficiency_percentiles(needs, signals)
+        needs = _boost_needs_by_efficiency_percentiles(needs, signals, stat_trust=stat_trust)
         needs = _merge_and_clip_needs(needs)
 
         need_intensity = _avg([n.weight for n in needs]) if needs else 0.0
@@ -1171,6 +1173,12 @@ class TeamSituationEvaluator:
 
         # 8) reasons (Korean, for player-facing realism)
         reasons = _build_reasons(tid, tier, horizon, posture, signals, constraints, roster_sig, asset_sig, style_sig, prefs, needs)
+        # Add a short transparency note for early season dampening (helps debugging/explanations).
+        if stat_trust < 1.0:
+            reasons.insert(
+                0,
+                f"시즌 초반(진행도 {season_progress:.0%})이라 팀 스타일/효율 지표의 영향도를 낮춰 반영함(trust={stat_trust:.2f}).",
+            )
 
         return tier, posture, horizon, float(urgency), prefs, needs, reasons
 
@@ -1532,8 +1540,23 @@ def _compute_perf_score(sig: TeamSituationSignals, season_progress: float) -> fl
 
     score = 0.58 * wp + 0.20 * pd_norm + 0.12 * nr_norm + 0.10 * trend_norm
     return float(_clamp(score, 0.0, 1.0))
-
-
+ 
+ 
+ def _early_stat_trust(season_progress: float, *, full_at: float = 0.20, min_trust: float = 0.50) -> float:
+     """Return trust factor (0..1) for team-stats driven signals early in the season.
+ 
+     - season_progress >= full_at : trust = 1.0
+     - season_progress = 0        : trust = min_trust (default 0.5; "half weight")
+     - Between: linear ramp.
+     """
+     sp = _clamp(_safe_float(season_progress, 0.0), 0.0, 1.0)
+     if sp >= full_at:
+         return 1.0
+     if full_at <= 1e-9:
+         return 1.0
+     t = _clamp(sp / full_at, 0.0, 1.0)
+     return float(_clamp(min_trust + (1.0 - min_trust) * t, 0.0, 1.0))
+     
 def _deadline_pressure(today: date, trade_deadline: Any) -> float:
     if not trade_deadline:
         return 0.0
@@ -1631,13 +1654,27 @@ def _dedupe_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
     return list(best.values())
 
 
-def _style_to_needs(team_id: str, sig: TeamSituationSignals, style_sig: Dict[str, Any]) -> List[TeamNeed]:
+def _style_to_needs(
+     team_id: str,
+     sig: TeamSituationSignals,
+     style_sig: Dict[str, Any],
+     *,
+     stat_trust: float = 1.0,
+ ) -> List[TeamNeed]:
     needs: List[TeamNeed] = []
 
-    three_rate = _safe_float(style_sig.get("three_rate"), 0.0)
-    rim_rate = _safe_float(style_sig.get("rim_rate"), 0.0)
-    tov_rate = _safe_float(style_sig.get("tov_rate"), 0.0)
-    pnr_rate = _safe_float(style_sig.get("pnr_rate"), 0.0)
+     raw_three = _safe_float(style_sig.get("three_rate"), 0.0)
+     raw_rim = _safe_float(style_sig.get("rim_rate"), 0.0)
+     raw_tov = _safe_float(style_sig.get("tov_rate"), 0.0)
+     raw_pnr = _safe_float(style_sig.get("pnr_rate"), 0.0)
+ 
+     # Early season dampening: shrink toward neutral baselines used in the weight formulas.
+     # This makes the "signal strength" scale ~linearly with stat_trust (0.5 -> half effect).
+     tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
+     three_rate = 0.34 + (raw_three - 0.34) * tr
+     rim_rate = 0.28 + (raw_rim - 0.28) * tr
+     tov_rate = 0.155 + (raw_tov - 0.155) * tr
+     pnr_rate = 0.28 + (raw_pnr - 0.28) * tr
 
     # Baselines (NBA-ish feel)
     if three_rate < 0.32:
@@ -1646,8 +1683,8 @@ def _style_to_needs(team_id: str, sig: TeamSituationSignals, style_sig: Dict[str
             TeamNeed(
                 tag="SPACING",
                 weight=float(w),
-                reason=f"3점 시도 비중이 낮음({three_rate:.0%}) → 스페이싱/슈터 보강 필요.",
-                evidence={"three_rate": three_rate},
+                reason=f"3점 시도 비중이 낮음({raw_three:.0%}) → 스페이싱/슈터 보강 필요.",
+                evidence={"three_rate_raw": raw_three, "three_rate_used": three_rate, "stat_trust": tr},
             )
         )
 
@@ -1658,8 +1695,8 @@ def _style_to_needs(team_id: str, sig: TeamSituationSignals, style_sig: Dict[str
             TeamNeed(
                 tag="RIM_PRESSURE",
                 weight=float(w),
-                reason=f"림 공격 비중이 낮음({rim_rate:.0%}) → {label} 자원 필요.",
-                evidence={"rim_rate": rim_rate, "pnr_rate": pnr_rate},
+                reason=f"림 공격 비중이 낮음({raw_rim:.0%}) → {label} 자원 필요.",
+                evidence={"rim_rate_raw": raw_rim, "rim_rate_used": rim_rate, "pnr_rate_raw": raw_pnr, "pnr_rate_used": pnr_rate, "stat_trust": tr},
             )
         )
 
@@ -1669,8 +1706,8 @@ def _style_to_needs(team_id: str, sig: TeamSituationSignals, style_sig: Dict[str
             TeamNeed(
                 tag="BALL_SECURITY",
                 weight=float(w),
-                reason=f"턴오버 비중이 높음({tov_rate:.1%}) → 안정적인 볼핸들/패스 필요.",
-                evidence={"tov_rate": tov_rate},
+                reason=f"턴오버 비중이 높음({raw_tov:.1%}) → 안정적인 볼핸들/패스 필요.",
+                evidence={"tov_rate_raw": raw_tov, "tov_rate_used": tov_rate, "stat_trust": tr},
             )
         )
 
@@ -1681,8 +1718,13 @@ def _style_to_needs(team_id: str, sig: TeamSituationSignals, style_sig: Dict[str
             TeamNeed(
                 tag="PNR_ENGINE",
                 weight=float(w),
-                reason=f"PnR 의존도가 높음({pnr_rate:.0%}) → 핸들러/롤러의 질을 끌어올릴 필요.",
-                evidence={"pnr_rate": pnr_rate, "three_rate": three_rate, "rim_rate": rim_rate},
+                reason=f"PnR 의존도가 높음({raw_pnr:.0%}) → 핸들러/롤러의 질을 끌어올릴 필요.",
+                evidence={
+                    "pnr_rate_raw": raw_pnr, "pnr_rate_used": pnr_rate,
+                    "three_rate_raw": raw_three, "three_rate_used": three_rate,
+                    "rim_rate_raw": raw_rim, "rim_rate_used": rim_rate,
+                    "stat_trust": tr,
+                },
             )
         )
 
@@ -1776,7 +1818,12 @@ def _merge_and_clip_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
     return out[:10]
 
 
-def _boost_needs_by_efficiency_percentiles(needs: List[TeamNeed], sig: TeamSituationSignals) -> List[TeamNeed]:
+ def _boost_needs_by_efficiency_percentiles(
+     needs: List[TeamNeed],
+     sig: TeamSituationSignals,
+     *,
+     stat_trust: float = 1.0,
+ ) -> List[TeamNeed]:
     """Boost need weights based on ORtg/DRtg percentiles and inject directional needs when missing.
 
     - If offense percentile is low, boost offensive creation/spacing/rim pressure needs.
@@ -1785,8 +1832,13 @@ def _boost_needs_by_efficiency_percentiles(needs: List[TeamNeed], sig: TeamSitua
     if not needs:
         needs = []
 
-    ortg_pct = _clamp(_safe_float(getattr(sig, "ortg_pct", 0.5), 0.5), 0.0, 1.0)
-    def_pct = _clamp(_safe_float(getattr(sig, "def_pct", 0.5), 0.5), 0.0, 1.0)
+     tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
+     ortg_pct_raw = _clamp(_safe_float(getattr(sig, "ortg_pct", 0.5), 0.5), 0.0, 1.0)
+     def_pct_raw = _clamp(_safe_float(getattr(sig, "def_pct", 0.5), 0.5), 0.0, 1.0)
+     # Early season dampening: shrink percentiles toward 0.5.
+     # This makes weakness scale ~linearly with tr (0.5 -> half effect).
+     ortg_pct = _clamp(0.5 + (ortg_pct_raw - 0.5) * tr, 0.0, 1.0)
+     def_pct = _clamp(0.5 + (def_pct_raw - 0.5) * tr, 0.0, 1.0)
 
     # Weakness in 0..1 (bottom half ramps up; bottom ~20% is strong signal).
     off_weak = _clamp((0.50 - ortg_pct) / 0.50, 0.0, 1.0)
@@ -1814,8 +1866,11 @@ def _boost_needs_by_efficiency_percentiles(needs: List[TeamNeed], sig: TeamSitua
         # Always attach percentile evidence (useful for debugging/explanations).
         ev.setdefault("ortg", float(getattr(sig, "ortg", 0.0)))
         ev.setdefault("drtg", float(getattr(sig, "drtg", 0.0)))
-        ev.setdefault("ortg_pct", float(ortg_pct))
-        ev.setdefault("def_pct", float(def_pct))
+        ev.setdefault("ortg_pct_raw", float(ortg_pct_raw))
+        ev.setdefault("def_pct_raw", float(def_pct_raw))
+        ev.setdefault("ortg_pct_used", float(ortg_pct))
+        ev.setdefault("def_pct_used", float(def_pct))
+        ev.setdefault("stat_trust", float(tr))
         ev.setdefault("net_pct", float(_clamp(_safe_float(getattr(sig, "net_pct", 0.5), 0.5), 0.0, 1.0)))
 
         if n.tag in offense_tags and off_weak > 0.0:
