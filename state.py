@@ -197,7 +197,7 @@ def ensure_schedule_for_active_season(*, force: bool = False) -> None:
 
         active_year = _season_year_from_season_id(active)
 
-        # SSOT 동기화(미리 채움): league.season_year/draft_year는 active와 일치해야 한다.
+        # 상태 일관성(미리 채움): active_season_id 기준으로 league.season_year/draft_year를 맞춘다.
         league_year = league.get("season_year")
         if league_year is None:
             league["season_year"] = int(active_year)
@@ -316,7 +316,7 @@ def start_new_season(
         next_sid = _season_id_for_year(int(target_year))
         set_active_season_id(next_sid)
 
-        # SSOT 동기화는 set_active_season_id가 수행한다.
+        # 상태 일관성 동기화는 set_active_season_id가 수행한다.
 
         if rebuild_schedule:
             ensure_schedule_for_active_season(force=True)
@@ -334,7 +334,7 @@ def start_new_season(
     result = _mutate_state("start_new_season", _impl)
 
     # Best-effort UI cache rebuild after offseason / season transition.
-    # UI cache is derived and must not be authoritative; it should never block SSOT updates.
+    # UI cache is derived and must not be authoritative; it should never block core state updates.
     try:
         if run_offseason and isinstance(result, dict) and result.get("offseason") is not None:
             # Import locally to avoid import-time cycles (team_utils imports state).
@@ -379,7 +379,9 @@ def startup_init_state() -> None:
         
         state_bootstrap.ensure_db_initialized_and_seeded(state)
 
-        # SSOT 초기화: active_season_id / league.season_year가 비어있으면 INITIAL 시즌을 명시적으로 시작한다.
+        # 상태 초기화/일관성 보정:
+        # - active_season_id와 league.season_year가 모두 비어있으면 INITIAL 시즌을 명시적으로 시작한다.
+        # - 한쪽만 존재하면 다른 쪽을 최소 보정한다(아카이브/리셋 없음).
         league = state.get("league") or {}
         if state.get("active_season_id") is None and league.get("season_year") is None:
             start_new_season(INITIAL_SEASON_YEAR, rebuild_schedule=True, run_offseason=False)
