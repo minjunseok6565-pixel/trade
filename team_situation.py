@@ -1542,20 +1542,20 @@ def _compute_perf_score(sig: TeamSituationSignals, season_progress: float) -> fl
     return float(_clamp(score, 0.0, 1.0))
  
  
- def _early_stat_trust(season_progress: float, *, full_at: float = 0.20, min_trust: float = 0.50) -> float:
-     """Return trust factor (0..1) for team-stats driven signals early in the season.
- 
-     - season_progress >= full_at : trust = 1.0
-     - season_progress = 0        : trust = min_trust (default 0.5; "half weight")
-     - Between: linear ramp.
-     """
-     sp = _clamp(_safe_float(season_progress, 0.0), 0.0, 1.0)
-     if sp >= full_at:
-         return 1.0
-     if full_at <= 1e-9:
-         return 1.0
-     t = _clamp(sp / full_at, 0.0, 1.0)
-     return float(_clamp(min_trust + (1.0 - min_trust) * t, 0.0, 1.0))
+def _early_stat_trust(season_progress: float, *, full_at: float = 0.20, min_trust: float = 0.50) -> float:
+    """Return trust factor (0..1) for team-stats driven signals early in the season.
+
+    - season_progress >= full_at : trust = 1.0
+    - season_progress = 0        : trust = min_trust (default 0.5; "half weight")
+    - Between: linear ramp.
+    """
+    sp = _clamp(_safe_float(season_progress, 0.0), 0.0, 1.0)
+    if sp >= full_at:
+        return 1.0
+    if full_at <= 1e-9:
+        return 1.0
+    t = _clamp(sp / full_at, 0.0, 1.0)
+    return float(_clamp(min_trust + (1.0 - min_trust) * t, 0.0, 1.0))
      
 def _deadline_pressure(today: date, trade_deadline: Any) -> float:
     if not trade_deadline:
@@ -1655,26 +1655,26 @@ def _dedupe_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
 
 
 def _style_to_needs(
-     team_id: str,
-     sig: TeamSituationSignals,
-     style_sig: Dict[str, Any],
-     *,
-     stat_trust: float = 1.0,
- ) -> List[TeamNeed]:
+    team_id: str,
+    sig: TeamSituationSignals,
+    style_sig: Dict[str, Any],
+    *,
+    stat_trust: float = 1.0,
+) -> List[TeamNeed]:
     needs: List[TeamNeed] = []
 
-     raw_three = _safe_float(style_sig.get("three_rate"), 0.0)
-     raw_rim = _safe_float(style_sig.get("rim_rate"), 0.0)
-     raw_tov = _safe_float(style_sig.get("tov_rate"), 0.0)
-     raw_pnr = _safe_float(style_sig.get("pnr_rate"), 0.0)
- 
-     # Early season dampening: shrink toward neutral baselines used in the weight formulas.
-     # This makes the "signal strength" scale ~linearly with stat_trust (0.5 -> half effect).
-     tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
-     three_rate = 0.34 + (raw_three - 0.34) * tr
-     rim_rate = 0.28 + (raw_rim - 0.28) * tr
-     tov_rate = 0.155 + (raw_tov - 0.155) * tr
-     pnr_rate = 0.28 + (raw_pnr - 0.28) * tr
+    raw_three = _safe_float(style_sig.get("three_rate"), 0.0)
+    raw_rim = _safe_float(style_sig.get("rim_rate"), 0.0)
+    raw_tov = _safe_float(style_sig.get("tov_rate"), 0.0)
+    raw_pnr = _safe_float(style_sig.get("pnr_rate"), 0.0)
+
+    # Early season dampening: shrink toward neutral baselines used in the weight formulas.
+    # This makes the "signal strength" scale ~linearly with stat_trust (0.5 -> half effect).
+    tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
+    three_rate = 0.34 + (raw_three - 0.34) * tr
+    rim_rate = 0.28 + (raw_rim - 0.28) * tr
+    tov_rate = 0.155 + (raw_tov - 0.155) * tr
+    pnr_rate = 0.28 + (raw_pnr - 0.28) * tr
 
     # Baselines (NBA-ish feel)
     if three_rate < 0.32:
@@ -1818,12 +1818,12 @@ def _merge_and_clip_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
     return out[:10]
 
 
- def _boost_needs_by_efficiency_percentiles(
-     needs: List[TeamNeed],
-     sig: TeamSituationSignals,
-     *,
-     stat_trust: float = 1.0,
- ) -> List[TeamNeed]:
+def _boost_needs_by_efficiency_percentiles(
+    needs: List[TeamNeed],
+    sig: TeamSituationSignals,
+    *,
+    stat_trust: float = 1.0,
+) -> List[TeamNeed]:
     """Boost need weights based on ORtg/DRtg percentiles and inject directional needs when missing.
 
     - If offense percentile is low, boost offensive creation/spacing/rim pressure needs.
@@ -1832,13 +1832,13 @@ def _merge_and_clip_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
     if not needs:
         needs = []
 
-     tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
-     ortg_pct_raw = _clamp(_safe_float(getattr(sig, "ortg_pct", 0.5), 0.5), 0.0, 1.0)
-     def_pct_raw = _clamp(_safe_float(getattr(sig, "def_pct", 0.5), 0.5), 0.0, 1.0)
-     # Early season dampening: shrink percentiles toward 0.5.
-     # This makes weakness scale ~linearly with tr (0.5 -> half effect).
-     ortg_pct = _clamp(0.5 + (ortg_pct_raw - 0.5) * tr, 0.0, 1.0)
-     def_pct = _clamp(0.5 + (def_pct_raw - 0.5) * tr, 0.0, 1.0)
+    tr = _clamp(_safe_float(stat_trust, 1.0), 0.0, 1.0)
+    ortg_pct_raw = _clamp(_safe_float(getattr(sig, "ortg_pct", 0.5), 0.5), 0.0, 1.0)
+    def_pct_raw = _clamp(_safe_float(getattr(sig, "def_pct", 0.5), 0.5), 0.0, 1.0)
+    # Early season dampening: shrink percentiles toward 0.5.
+    # This makes weakness scale ~linearly with tr (0.5 -> half effect).
+    ortg_pct = _clamp(0.5 + (ortg_pct_raw - 0.5) * tr, 0.0, 1.0)
+    def_pct = _clamp(0.5 + (def_pct_raw - 0.5) * tr, 0.0, 1.0)
 
     # Weakness in 0..1 (bottom half ramps up; bottom ~20% is strong signal).
     off_weak = _clamp((0.50 - ortg_pct) / 0.50, 0.0, 1.0)
