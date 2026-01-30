@@ -935,9 +935,9 @@ class TeamSituationEvaluator:
     def _compute_role_fit_and_needs(self, team_id: str, roster: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[TeamNeed]]:
         # Evaluate 12 roles using role_fit tables.
         try:
-             # Project standard: matchengine_v3.*
-             from matchengine_v3.role_fit_data import ROLE_FIT_WEIGHTS  # type: ignore
-             from matchengine_v3.role_fit import role_fit_score, role_fit_grade  # type: ignore
+            # Project standard: matchengine_v3.*
+            from matchengine_v3.role_fit_data import ROLE_FIT_WEIGHTS  # type: ignore
+            from matchengine_v3.role_fit import role_fit_score, role_fit_grade  # type: ignore
 
         except Exception:
             # If role fit data isn't available, return neutral.
@@ -1365,29 +1365,29 @@ class TeamSituationEvaluator:
             if pick.get("pick_id"):
                 pick_ids_owned.add(str(pick.get("pick_id")))
 
-         swap_ids_owned = set()
-         for sw in (self.ctx.assets_snapshot.get("swap_rights", {}) or {}).values():
-             if not isinstance(sw, dict):
-                 continue
-             if str(sw.get("owner_team", "")).upper() != team_id:
-                 continue
-             # swap_rights table has `active` (1/0). Only count active by default.
-             try:
-                 if int(sw.get("active", 1) or 0) == 0:
-                     continue
-             except Exception:
-                 pass
-             if sw.get("swap_id"):
-                 swap_ids_owned.add(str(sw.get("swap_id")))
- 
-         fixed_ids_owned = set()
-         for fa in (self.ctx.assets_snapshot.get("fixed_assets", {}) or {}).values():
-             if not isinstance(fa, dict):
-                 continue
-             if str(fa.get("owner_team", "")).upper() != team_id:
-                 continue
-             if fa.get("asset_id"):
-                 fixed_ids_owned.add(str(fa.get("asset_id")))
+        swap_ids_owned = set()
+        for sw in (self.ctx.assets_snapshot.get("swap_rights", {}) or {}).values():
+            if not isinstance(sw, dict):
+                continue
+            if str(sw.get("owner_team", "")).upper() != team_id:
+                continue
+            # swap_rights table has `active` (1/0). Only count active by default.
+            try:
+                if int(sw.get("active", 1) or 0) == 0:
+                    continue
+            except Exception:
+                pass
+            if sw.get("swap_id"):
+                swap_ids_owned.add(str(sw.get("swap_id")))
+
+        fixed_ids_owned = set()
+        for fa in (self.ctx.assets_snapshot.get("fixed_assets", {}) or {}).values():
+            if not isinstance(fa, dict):
+                continue
+            if str(fa.get("owner_team", "")).upper() != team_id:
+                continue
+            if fa.get("asset_id"):
+                fixed_ids_owned.add(str(fa.get("asset_id")))
 
         n = 0
         for key in locks.keys():
@@ -1400,6 +1400,14 @@ class TeamSituationEvaluator:
             elif key.startswith("pick:"):
                 pid = key.split(":", 1)[1]
                 if pid in pick_ids_owned:
+                    n += 1
+            elif key.startswith("swap:"):
+                sid = key.split(":", 1)[1]
+                if sid in swap_ids_owned:
+                    n += 1
+            elif key.startswith("fixed_asset:"):
+                aid = key.split(":", 1)[1]
+                if aid in fixed_ids_owned:
                     n += 1
         return n
 
