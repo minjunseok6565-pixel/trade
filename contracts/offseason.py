@@ -78,24 +78,8 @@ def process_offseason(
         released = int(expire_result.get("released") or 0)
         released_ids = [str(x) for x in (expire_result.get("released_player_ids") or [])]
 
-        # Maintain minimal workflow/UI cache in state for released players (best-effort)
-        try:
-            players_cache = game_state.get("players")
-            if isinstance(players_cache, dict):
-                for pid in released_ids:
-                    p = players_cache.get(pid)
-                    if isinstance(p, dict):
-                        # Keep cache consistent with DB semantics: FA team id is "FA".
-                        p["team_id"] = "FA"
-        except (TypeError, AttributeError, KeyError):
-            _warn_limited(
-                "OFFSEASON_CACHE_UPDATE_FAILED",
-                (
-                    f"released_count={len(released_ids) if isinstance(released_ids, (list, set, tuple)) else 'unknown'}"
-                ),
-                limit=3,
-            )
-            pass
+        # NOTE: UI cache updates are handled outside via state.start_new_season() post-mutation
+        # (ui_cache_rebuild_all). Do not mutate legacy game_state["players"] here.
 
         # 2) (선택) 드래프트 정산 (SSOT)
         draft_year_to_settle = fy + 1
