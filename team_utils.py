@@ -510,7 +510,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     summary = {
         "team_id": tid,
         "conference": conf,
-        "division": div,,
+        "division": div,
         "wins": wins,
         "losses": losses,
         "win_pct": win_pct,
@@ -558,6 +558,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
