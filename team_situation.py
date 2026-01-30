@@ -821,7 +821,7 @@ class TeamSituationEvaluator:
             hard_flags["AGGREGATION_BAN"] = True
 
         # asset locks that touch this team
-        locks_count = self._count_team_related_locks(team_id)
+        locks_count = self._count_team_related_locks(team_id, roster)
 
         # market cooldown (from workflow_state["trade_market"]["cooldowns"])
         cooldown_active = _cooldown_active(self.ctx.trade_market, team_id)
@@ -1315,14 +1315,20 @@ class TeamSituationEvaluator:
         return float(sum(_safe_float(p.get("salary"), 0.0) for p in roster if isinstance(p, dict)))
 
 
-    def _count_team_related_locks(self, team_id: str) -> int:
+    def _count_team_related_locks(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> int:
         locks = self.ctx.asset_locks or {}
         if not isinstance(locks, dict) or not locks:
             return 0
 
         # Build quick membership sets
-        roster_pids = {p.get("player_id") for p in self._load_roster_with_derived(team_id)}
-        roster_pids = {str(x) for x in roster_pids if x}
+        if roster is None:
+            # Fallback: keep method safe when called outside the main evaluation path.
+            try:
+                roster = self._load_roster_with_derived(team_id)
+            except Exception:
+                roster = []
+ 
+        roster_pids = {str(p.get("player_id")) for p in roster if isinstance(p, dict) and p.get("player_id")}
 
         pick_ids_owned = set()
         for pick in (self.ctx.assets_snapshot.get("draft_picks", {}) or {}).values():
