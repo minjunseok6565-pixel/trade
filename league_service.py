@@ -71,7 +71,7 @@ def _utc_now_iso() -> str:
 
 
 def _current_season_year_ssot() -> int:
-    """SSOT for season_year: always use state league context snapshot.
+    """Authoritative season_year source for commands: use state league context snapshot.
 
     This intentionally fails fast if state is unavailable/missing season_year,
     to avoid mixed definitions (date-based inference vs explicit league season).
