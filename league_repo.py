@@ -1,15 +1,16 @@
 # league_repo.py
 # Developer note:
-# - SQLite DB is the single source of truth (SSOT).
+# - SQLite DB is the single source of truth (SSOT) for persisted league data (tables managed here).
 # - Excel files are import/export only (no runtime reads/writes).
 # - player_id and team_id are canonical strings.
 # - Never use DataFrame indices as IDs; always use schema.py normalization helpers.
 """
-LeagueRepository: single source of truth (SQLite)
+LeagueRepository: persisted-data SSOT (SQLite)
 
 Goal:
 - Excel is import/export only.
-- All runtime reads/writes go through SQLite.
+- All persisted league-data reads/writes go through SQLite (via LeagueRepo).
+  (Runtime GameState / caches live in memory; see state_schema.py / state_modules/state_store.py.)
 
 Usage (CLI):
   python league_repo.py init --db <db_path>
