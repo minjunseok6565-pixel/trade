@@ -65,7 +65,6 @@ def process_offseason(
 
     # Run DB writes in a single service context.
     with LeagueService.open(db_path) as svc:
-        svc.repo.init_db()
 
         # 1) 계약 만료/옵션 처리 (SSOT)
         expire_result = svc.expire_contracts_for_season_transition(
