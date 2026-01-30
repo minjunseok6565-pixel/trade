@@ -608,10 +608,24 @@ def set_cached_playoff_news_snapshot(cache: dict) -> None:
 
 def export_trade_context_snapshot() -> dict:
     def _impl(v: Mapping[str, Any]) -> dict:
+        # Include GM/team profiles (e.g., patience/attitude) in the trade context.
+        # Source of truth: SQLite gm_profiles table via LeagueRepo.
+        teams = {}
+        try:
+            from league_repo import LeagueRepo
+
+            with LeagueRepo(get_db_path()) as repo:
+                teams = repo.get_all_gm_profiles() or {}
+            teams = _to_plain(teams)
+        except Exception:
+            # If DB isn't ready or profiles are missing/malformed, fail closed with empty dict.
+            teams = {}
+            
         return {
             "asset_locks": _to_plain(v.get("asset_locks") or {}),
             "league": get_league_context_snapshot(),
             "my_team_id": v["postseason"]["my_team_id"],
+            "teams": teams,
         }
 
     return _read_state(_impl)
