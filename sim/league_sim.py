@@ -23,7 +23,6 @@ from state import (
     ingest_game_result,
     set_current_date,
 )
-from trades_ai import _run_ai_gm_tick_if_needed
 from sim.roster_adapter import build_team_state_from_db
 
 logger = logging.getLogger(__name__)
@@ -148,7 +147,6 @@ def advance_league_until(
         day += timedelta(days=1)
 
     set_current_date(target_date_str)
-    _run_ai_gm_tick_if_needed(target_date)
     return simulated_game_objs
 
 
