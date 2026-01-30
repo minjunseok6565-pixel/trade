@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Dict, Optional, List
 
@@ -27,7 +28,7 @@ from playoffs import (
 )
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
-from team_utils import get_conference_standings, get_team_cards, get_team_detail, ui_cache_rebuild_all
+from team_utils import get_conference_standings, get_team_cards, get_team_detail, ui_cache_rebuild_all, ui_cache_refresh_players
 from season_report_ai import generate_season_report
 from trades.errors import TradeError
 from trades.models import canonicalize_deal, parse_deal, serialize_deal
@@ -36,6 +37,7 @@ from trades.apply import apply_deal_to_db
 from trades import agreements
 from trades import negotiation_store
 
+logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------------
 # FastAPI 앱 생성 및 기본 설정
@@ -463,6 +465,23 @@ def _validate_repo_integrity(db_path: str) -> None:
         repo.validate_integrity()
 
 
+def _try_ui_cache_refresh_players(player_ids: List[str], *, context: str) -> None:
+    """Best-effort UI cache refresh. Never fails the API call.
+
+    Policy: DB SSOT write APIs should succeed even if UI cache refresh fails.
+    """
+    try:
+        if not player_ids:
+            return
+        ui_cache_refresh_players(player_ids)
+    except Exception:
+        logger.warning(
+            "UI cache refresh failed (%s): player_ids=%r",
+            context,
+            player_ids,
+            exc_info=True,
+        )
+
 # -------------------------------------------------------------------------
 # Contracts / Roster Write API
 # -------------------------------------------------------------------------
@@ -479,7 +498,10 @@ async def api_contracts_release_to_fa(req: ReleaseToFARequest):
                 released_date=req.released_date or in_game_date,
             )
         _validate_repo_integrity(db_path)
-        return {"ok": True, "event": event.to_dict()}
+        event_dict = event.to_dict()
+        affected = event_dict.get("affected_player_ids") or []
+        _try_ui_cache_refresh_players(list(affected), context="contracts.release_to_fa")
+        return {"ok": True, "event": event_dict}
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -504,7 +526,10 @@ async def api_contracts_sign_free_agent(req: SignFreeAgentRequest):
                 salary_by_year=req.salary_by_year,
             )
         _validate_repo_integrity(db_path)
-        return {"ok": True, "event": event.to_dict()}
+        event_dict = event.to_dict()
+        affected = event_dict.get("affected_player_ids") or []
+        _try_ui_cache_refresh_players(list(affected), context="contracts.sign_free_agent")
+        return {"ok": True, "event": event_dict}
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -529,7 +554,10 @@ async def api_contracts_re_sign_or_extend(req: ReSignOrExtendRequest):
                 salary_by_year=req.salary_by_year,
             )
         _validate_repo_integrity(db_path)
-        return {"ok": True, "event": event.to_dict()}
+        event_dict = event.to_dict()
+        affected = event_dict.get("affected_player_ids") or []
+        _try_ui_cache_refresh_players(list(affected), context="contracts.re_sign_or_extend")
+        return {"ok": True, "event": event_dict}
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -555,6 +583,13 @@ async def api_trade_submit(req: TradeSubmitRequest):
             dry_run=False,
         )
         _validate_repo_integrity(db_path)
+        moved_ids: List[str] = []
+        for mv in (transaction.get("player_moves") or []):
+            if isinstance(mv, dict):
+                pid = mv.get("player_id")
+                if pid:
+                    moved_ids.append(str(pid))
+        _try_ui_cache_refresh_players(moved_ids, context="trade.submit")
         return {
             "ok": True,
             "deal": serialize_deal(deal),
@@ -586,6 +621,13 @@ async def api_trade_submit_committed(req: TradeSubmitCommittedRequest):
         )
         _validate_repo_integrity(db_path)
         agreements.mark_executed(req.deal_id)
+        moved_ids: List[str] = []
+        for mv in (transaction.get("player_moves") or []):
+            if isinstance(mv, dict):
+                pid = mv.get("player_id")
+                if pid:
+                    moved_ids.append(str(pid))
+        _try_ui_cache_refresh_players(moved_ids, context="trade.submit_committed")
         return {"ok": True, "deal_id": req.deal_id, "transaction": transaction}
     except TradeError as exc:
         return _trade_error_response(exc)
@@ -778,6 +820,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
