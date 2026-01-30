@@ -30,8 +30,15 @@ import state
 from league_repo import LeagueRepo
 from derived_formulas import compute_derived
 from team_utils import get_conference_standings
+from config import ALL_TEAM_IDS
+from trades.rules.rule_player_meta import build_rule_players_meta
+from trades.rules.policies.player_ban_policy import (
+    compute_aggregation_banned_until,
+    compute_recent_signing_banned_until,
+)
 
 logger = logging.getLogger(__name__)
+_BAN_SAMPLE_LIMIT = 8
 _WARN_COUNTS: Dict[str, int] = {}
 
 
@@ -135,6 +142,8 @@ class TeamSituationContext:
     asset_locks: Dict[str, Any]
     # Precomputed per-team ratings and percentiles for league-relative evaluation.
     team_ratings_index: Dict[str, Dict[str, float]]
+    # Precomputed per-team trade eligibility summaries (SSOT-backed).
+    team_ban_index: Dict[str, Dict[str, Any]]
 
 
 # ------------------------------------------------------------
@@ -192,6 +201,7 @@ def build_team_situation_context(
 
     assets_snapshot: Dict[str, Any] = {}
     contract_ledger: Dict[str, Any] = {}
+    team_ban_index: Dict[str, Dict[str, Any]] = {}
 
     if resolved_db_path:
         try:
@@ -199,10 +209,101 @@ def build_team_situation_context(
                 repo.init_db()
                 assets_snapshot = repo.get_trade_assets_snapshot() or {}
                 contract_ledger = repo.get_contract_ledger_snapshot() or {}
+
+                # Build a league-wide "ban index" once (SSOT-backed) so evaluating 30 teams stays cheap.
+                try:
+                    # Prefer explicit season_year from league snapshots; fallback to infer from current date.
+                    season_year: Optional[int] = None
+                    raw_sy = (league_ctx.get("season_year") or (workflow_state.get("league", {}) or {}).get("season_year"))
+                    try:
+                        season_year = int(raw_sy) if raw_sy is not None else None
+                    except Exception:
+                        season_year = None
+                    if season_year is None:
+                        # NBA season_year convention in this project: e.g., 2025 season spans into early 2026.
+                        season_year = int(current_date.year if current_date.month >= 7 else (current_date.year - 1))
+
+                    roster_pids_by_team: Dict[str, set[str]] = {}
+                    all_pids: set[str] = set()
+                    for raw_tid in ALL_TEAM_IDS:
+                        tid = str(normalize_team_id(raw_tid, strict=True))
+                        pids = repo.get_roster_player_ids(tid) or set()
+                        roster_pids_by_team[tid] = {str(x) for x in pids if x}
+                        all_pids.update(roster_pids_by_team[tid])
+
+                    players_meta = build_rule_players_meta(
+                        repo,
+                        all_pids,
+                        season_year=season_year,
+                        as_of_date=current_date,
+                        unknown_signed_date=None,
+                    ) or {}
+
+                    trade_rules = (league_ctx.get("trade_rules", {}) or {})
+
+                    for tid, pids in roster_pids_by_team.items():
+                        signed_n = 0
+                        agg_n = 0
+                        signed_sample: List[Dict[str, Any]] = []
+                        agg_sample: List[Dict[str, Any]] = []
+                        for pid in pids:
+                            ps = players_meta.get(str(pid))
+                            if not isinstance(ps, dict):
+                                continue
+
+                            banned_until, ev = compute_recent_signing_banned_until(
+                                ps,
+                                trade_rules=trade_rules,
+                                season_year=season_year,
+                                strict=False,
+                            )
+                            if banned_until and current_date < banned_until:
+                                signed_n += 1
+                                if len(signed_sample) < _BAN_SAMPLE_LIMIT:
+                                    signed_date = (ev or {}).get("signed_date")
+                                    if isinstance(signed_date, date):
+                                        signed_date = signed_date.isoformat()
+                                    signed_sample.append(
+                                        {
+                                            "player_id": str(pid),
+                                            "banned_until": banned_until.isoformat(),
+                                            "signed_date": signed_date,
+                                            "contract_action_type": (ev or {}).get("contract_action_type"),
+                                        }
+                                    )
+
+                            banned_until2, ev2 = compute_aggregation_banned_until(
+                                ps,
+                                trade_rules=trade_rules,
+                                strict=False,
+                            )
+                            if banned_until2 and current_date < banned_until2:
+                                agg_n += 1
+                                if len(agg_sample) < _BAN_SAMPLE_LIMIT:
+                                    acquired_date = (ev2 or {}).get("acquired_date")
+                                    if isinstance(acquired_date, date):
+                                        acquired_date = acquired_date.isoformat()
+                                    agg_sample.append(
+                                        {
+                                            "player_id": str(pid),
+                                            "banned_until": banned_until2.isoformat(),
+                                            "acquired_date": acquired_date,
+                                        }
+                                    )
+
+                        team_ban_index[tid] = {
+                            "recent_signing_banned_count": int(signed_n),
+                            "aggregation_banned_count": int(agg_n),
+                            "recent_signing_banned_players": signed_sample,
+                            "aggregation_banned_players": agg_sample,
+                        }
+                except Exception:
+                    _warn_limited("BAN_INDEX_BUILD_FAILED", f"db_path={resolved_db_path!r}")
         except Exception:
             _warn_limited("DB_SNAPSHOT_FAILED", f"db_path={resolved_db_path!r}")
             assets_snapshot = {}
             contract_ledger = {}
+            team_ban_index = {}
 
     try:
         standings = get_conference_standings()
@@ -238,6 +339,7 @@ def build_team_situation_context(
         negotiations=_to_plain(workflow_state.get("negotiations", {}) or {}),
         asset_locks=_to_plain(trade_state.get("asset_locks", {}) or {}),
         team_ratings_index=ratings_index,
+        team_ban_index=_to_plain(team_ban_index),
     )
 
 
@@ -725,12 +827,10 @@ class TeamSituationEvaluator:
         elif apron_status == "ABOVE_1ST_APRON":
             hard_flags.update({"LIMITED_MATCHING": True})
 
-        # Recent signing / aggregation bans (if we can infer dates)
-        new_fa_ban_days = _safe_int(trade_rules.get("new_fa_sign_ban_days"), 90)
-        agg_ban_days = _safe_int(trade_rules.get("aggregation_ban_days"), 60)
-
-        signed_ban = self._count_recently_signed_players(team_id, new_fa_ban_days)
-        acquired_ban = self._count_recently_acquired_players(team_id, agg_ban_days)
+        # Recent signing / aggregation bans (SSOT-backed, precomputed in ctx.team_ban_index).
+        ban = (self.ctx.team_ban_index.get(team_id, {}) or {})
+        signed_ban = int(ban.get("recent_signing_banned_count", 0) or 0)
+        acquired_ban = int(ban.get("aggregation_banned_count", 0) or 0)
         if signed_ban > 0:
             hard_flags["NEW_FA_TRADE_BAN"] = True
         if acquired_ban > 0:
@@ -1230,56 +1330,6 @@ class TeamSituationEvaluator:
                 roster = []
         return float(sum(_safe_float(p.get("salary"), 0.0) for p in roster if isinstance(p, dict)))
 
-    def _count_recently_signed_players(self, team_id: str, ban_days: int) -> int:
-        # Uses state.players cache if present
-        try:
-            players = state.players_get() or {}
-        except Exception:
-            return 0
-        if not isinstance(players, dict) or not players:
-            return 0
-        today = self.ctx.current_date
-        n = 0
-        for p in players.values():
-            if not isinstance(p, dict):
-                continue
-            if str(p.get("team_id", "")).upper() != team_id:
-                continue
-            signed = p.get("signed_date")
-            if not signed or str(signed).startswith("1900"):
-                continue
-            try:
-                d = date.fromisoformat(str(signed))
-                if (today - d).days < int(ban_days):
-                    n += 1
-            except Exception:
-                continue
-        return n
-
-    def _count_recently_acquired_players(self, team_id: str, ban_days: int) -> int:
-        try:
-            players = state.players_get() or {}
-        except Exception:
-            return 0
-        if not isinstance(players, dict) or not players:
-            return 0
-        today = self.ctx.current_date
-        n = 0
-        for p in players.values():
-            if not isinstance(p, dict):
-                continue
-            if str(p.get("team_id", "")).upper() != team_id:
-                continue
-            acquired = p.get("acquired_date")
-            if not acquired or str(acquired).startswith("1900"):
-                continue
-            try:
-                d = date.fromisoformat(str(acquired))
-                if (today - d).days < int(ban_days):
-                    n += 1
-            except Exception:
-                continue
-        return n
 
     def _count_team_related_locks(self, team_id: str) -> int:
         locks = self.ctx.asset_locks or {}
