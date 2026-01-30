@@ -8,7 +8,11 @@ from typing import Any, Dict, Iterator, Iterable, Mapping, MutableMapping, Mutab
 from state_schema import create_default_game_state, validate_game_state
 
 # -------------------------------------------------------------------------
-# 전역 상태 저장소 (SSOT) + 트랜잭션 / 읽기 전용 뷰
+# 전역 런타임 상태 저장소 (process-local, in-memory) + 트랜잭션 / 읽기 전용 뷰
+# 
+# 용어 정리:
+# - 이 모듈의 _STATE는 "런타임 게임 상태(GameState)"를 담는 프로세스-로컬 메모리 저장소다.
+# - SQLite(league_repo.py / LeagueRepo)는 영속 데이터(테이블) 관점의 SSOT로 취급한다.
 # -------------------------------------------------------------------------
 _STATE: Dict[str, Any] = create_default_game_state()
 validate_game_state(_STATE)
