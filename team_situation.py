@@ -354,14 +354,26 @@ class TeamSituationEvaluator:
         self.ctx = ctx
         self.db_path = db_path or _safe_get_db_path()
 
+    def _get_roster(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Single roster access gate.
+
+        IMPORTANT:
+        - In evaluation logic, pass along the already-loaded `roster` whenever possible.
+        - This method is the *only* place other methods should use to obtain a roster.
+        - The DB I/O happens inside `_load_roster_with_derived()` only.
+        """
+        if roster is not None:
+            return roster
+        return self._load_roster_with_derived(team_id)
+
     def evaluate_team(self, team_id: str) -> TeamSituation:
         tid = str(normalize_team_id(team_id, strict=True))
 
         perf = self._compute_performance(tid)
         rt = (self.ctx.team_ratings_index.get(tid, {}) or {})
-        roster = self._load_roster_with_derived(tid)
+        roster = self._get_roster(tid)
         roster_sig = self._compute_roster_signals(tid, roster)
-        asset_sig = self._compute_asset_signals(tid)
+        asset_sig = self._compute_asset_signals(tid, roster)
         contract_sig = self._compute_contract_pressure(tid, roster)
         constraints = self._compute_constraints(tid, roster, perf)
         style_sig = self._compute_style_signals(tid)
@@ -538,6 +550,10 @@ class TeamSituationEvaluator:
         }
 
     def _load_roster_with_derived(self, team_id: str) -> List[Dict[str, Any]]:
+        """DB I/O only.
+
+        Do NOT call this directly from evaluation logic. Use `_get_roster()` instead.
+        """
         if not self.db_path:
             return []
         out: List[Dict[str, Any]] = []
@@ -634,7 +650,7 @@ class TeamSituationEvaluator:
             "rotation": top8,
         }
 
-    def _compute_asset_signals(self, team_id: str) -> Dict[str, Any]:
+    def _compute_asset_signals(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         assets = self.ctx.assets_snapshot or {}
         draft_picks = assets.get("draft_picks", {}) or {}
         swaps = assets.get("swap_rights", {}) or {}
@@ -733,7 +749,7 @@ class TeamSituationEvaluator:
         asset_score = _clamp(score_total / 6.5, 0.0, 1.0)
 
         # Flexibility: cap space + expiring + medium contracts
-        flex = self._compute_flexibility(team_id)
+        flex = self._compute_flexibility(team_id, roster)
 
         return {
             "firsts": firsts,
@@ -747,12 +763,12 @@ class TeamSituationEvaluator:
             "max_years": max_years,
         }
 
-    def _compute_flexibility(self, team_id: str) -> float:
+    def _compute_flexibility(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> float:
         # cap space (normalized)
         trade_rules = (self.ctx.league_ctx.get("trade_rules", {}) or {})
         salary_cap = _safe_float(trade_rules.get("salary_cap"), 0.0)
 
-        payroll = self._compute_payroll_from_contracts_or_roster(team_id)
+        payroll = self._compute_payroll_from_contracts_or_roster(team_id, roster)
         cap_space = salary_cap - payroll
 
         # expiring count and "matchable" mid salaries
@@ -765,7 +781,7 @@ class TeamSituationEvaluator:
                 if rem == 1:
                     expiring += 1
         # from roster salaries if DB accessible
-        for p in self._load_roster_with_derived(team_id)[:12]:
+        for p in self._get_roster(team_id, roster)[:12]:
             sal = _safe_float(p.get("salary"), 0.0)
             if 5_000_000 <= sal <= 25_000_000:
                 matchable += 1
@@ -919,8 +935,10 @@ class TeamSituationEvaluator:
     def _compute_role_fit_and_needs(self, team_id: str, roster: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[TeamNeed]]:
         # Evaluate 12 roles using role_fit tables.
         try:
-            from role_fit_data import ROLE_FIT_WEIGHTS  # type: ignore
-            from role_fit import role_fit_score, role_fit_grade  # type: ignore
+             # Project standard: matchengine_v3.*
+             from matchengine_v3.role_fit_data import ROLE_FIT_WEIGHTS  # type: ignore
+             from matchengine_v3.role_fit import role_fit_score, role_fit_grade  # type: ignore
+
         except Exception:
             # If role fit data isn't available, return neutral.
             return ({"role_fit_health": 0.5, "role_best": {}}, [])
@@ -1317,7 +1335,7 @@ class TeamSituationEvaluator:
         if roster is None:
             roster = []
             try:
-                roster = self._load_roster_with_derived(team_id)
+                roster = self._get_roster(team_id)
             except Exception:
                 roster = []
         return float(sum(_safe_float(p.get("salary"), 0.0) for p in roster if isinstance(p, dict)))
@@ -1332,7 +1350,7 @@ class TeamSituationEvaluator:
         if roster is None:
             # Fallback: keep method safe when called outside the main evaluation path.
             try:
-                roster = self._load_roster_with_derived(team_id)
+                roster = self._get_roster(team_id)
             except Exception:
                 roster = []
  
@@ -1346,6 +1364,30 @@ class TeamSituationEvaluator:
                 continue
             if pick.get("pick_id"):
                 pick_ids_owned.add(str(pick.get("pick_id")))
+
+         swap_ids_owned = set()
+         for sw in (self.ctx.assets_snapshot.get("swap_rights", {}) or {}).values():
+             if not isinstance(sw, dict):
+                 continue
+             if str(sw.get("owner_team", "")).upper() != team_id:
+                 continue
+             # swap_rights table has `active` (1/0). Only count active by default.
+             try:
+                 if int(sw.get("active", 1) or 0) == 0:
+                     continue
+             except Exception:
+                 pass
+             if sw.get("swap_id"):
+                 swap_ids_owned.add(str(sw.get("swap_id")))
+ 
+         fixed_ids_owned = set()
+         for fa in (self.ctx.assets_snapshot.get("fixed_assets", {}) or {}).values():
+             if not isinstance(fa, dict):
+                 continue
+             if str(fa.get("owner_team", "")).upper() != team_id:
+                 continue
+             if fa.get("asset_id"):
+                 fixed_ids_owned.add(str(fa.get("asset_id")))
 
         n = 0
         for key in locks.keys():
