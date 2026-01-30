@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from config import ALL_TEAM_IDS
 from .state_cap import _apply_cap_model_for_season
-from .state_migrations import normalize_player_ids
 
 
 def _require_db_path(league: dict) -> str:
@@ -57,11 +56,6 @@ def ensure_cap_model_populated_if_needed(state: dict) -> None:
         salary_cap_value = 0.0
     if salary_cap_value <= 0:
         _apply_cap_model_for_season(league, season_year_int)
-
-
-def ensure_player_ids_normalized(state: dict, *, allow_legacy_numeric: bool = True) -> dict:
-    """Normalize player IDs in state (startup-only)."""
-    return normalize_player_ids(state, allow_legacy_numeric=allow_legacy_numeric)
 
 
 def ensure_contracts_bootstrapped_after_schedule_creation_once(state: dict) -> None:
