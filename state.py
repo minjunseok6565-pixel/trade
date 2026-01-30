@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import date
+import logging
 from threading import RLock
 from typing import Any, Callable, Optional, TypeVar
 
@@ -17,6 +18,8 @@ from state_modules.state_constants import (
     _META_PLAYER_KEYS,
 )
 from state_modules.state_store import read_state, reset_state_for_dev as _reset_state_for_dev, snapshot_state, transaction
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_TRADE_RULES",
@@ -328,7 +331,24 @@ def start_new_season(
             "active_season_id": state.get("active_season_id"),
         }
 
-    return _mutate_state("start_new_season", _impl)
+    result = _mutate_state("start_new_season", _impl)
+
+    # Best-effort UI cache rebuild after offseason / season transition.
+    # UI cache is derived and must not be authoritative; it should never block SSOT updates.
+    try:
+        if run_offseason and isinstance(result, dict) and result.get("offseason") is not None:
+            # Import locally to avoid import-time cycles (team_utils imports state).
+            from team_utils import ui_cache_rebuild_all
+
+            ui_cache_rebuild_all()
+    except Exception:
+        logger.warning(
+            "UI cache rebuild failed after start_new_season: result=%r",
+            result,
+            exc_info=True,
+        )
+
+    return result
 
 def _require_active_season_id_matches(state: dict, season_id: str) -> str:
     """ingest 등 공개 동작에서 'active season' 불일치를 fail-fast로 차단한다."""
