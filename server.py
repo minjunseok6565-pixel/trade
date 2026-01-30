@@ -46,11 +46,11 @@ app = FastAPI(title="느바 시뮬 GM 서버")
 
 @app.on_event("startup")
 def _startup_init_state() -> None:
-    # Startup-only bootstraps (agreed policy):
-    # 1) DB init + seed once
-    # 2) players/teams cache init + player_id normalize once
-    # 3) repo integrity validate once
-    # 4) ingest_turn backfill once
+    # 1) DB init + seed once (per db_path)
+    # 2) SSOT state init: season/schedule + cap model
+    # 3) repo integrity validate once (per db_path)
+    # 4) ingest_turn backfill once (per state instance)
+    # 5) UI-only cache bootstrap (derived, non-authoritative)
     db_path = os.environ.get("LEAGUE_DB_PATH")
     if not db_path:
         raise RuntimeError("LEAGUE_DB_PATH is required (no default db_path).")
@@ -820,6 +820,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
