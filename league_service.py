@@ -849,8 +849,14 @@ class LeagueService:
         event = ServiceEvent(
             type="release_to_free_agency",
             payload={
+                # Standardize payload so API callers can rely on it without
+                # performing additional DB reads.
                 "date": released_date_iso,
-                "player_id": str(player_id),
+                "season_year": int(season_year_i),
+                "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": from_team,
+                "to_team": "FA",
             },
         )
         return event
@@ -1452,6 +1458,8 @@ class LeagueService:
                         "teams": [team_norm],
                         "team_id": team_norm,
                         "player_id": pid,
+                        "from_team": "FA",
+                        "to_team": team_norm,
                         "contract_id": contract_id,
                         "start_season_year": int(start_season_year),
                         "years": years_i,
@@ -1462,8 +1470,14 @@ class LeagueService:
         return ServiceEvent(
             type="sign_free_agent",
             payload={
-                "team_id": team_norm,
+                # Standardized, rule/endpoint-friendly summary.
+                "date": signed_date_iso,
+                "season_year": int(season_year_i),
                 "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": "FA",
+                "to_team": team_norm,
+                "team_id": team_norm,
                 "contract_id": contract_id,
                 "signed_date": signed_date_iso,
                 "start_season_year": int(start_season_year),
@@ -1574,6 +1588,8 @@ class LeagueService:
                         "teams": [team_norm],
                         "team_id": team_norm,
                         "player_id": pid,
+                        "from_team": team_norm,
+                        "to_team": team_norm,
                         "contract_id": contract_id,
                         "start_season_year": int(start_season_year),
                         "years": years_i,
@@ -1584,8 +1600,14 @@ class LeagueService:
         return ServiceEvent(
             type="re_sign_or_extend",
             payload={
-                "team_id": team_norm,
+                # Standardized, rule/endpoint-friendly summary.
+                "date": signed_date_iso,
+                "season_year": int(season_year_i),
                 "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": team_norm,
+                "to_team": team_norm,
+                "team_id": team_norm,
                 "contract_id": contract_id,
                 "signed_date": signed_date_iso,
                 "start_season_year": int(start_season_year),
