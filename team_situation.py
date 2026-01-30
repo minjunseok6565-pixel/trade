@@ -159,29 +159,12 @@ def build_team_situation_context(
 
     It reads state + DB once, so evaluating 30 teams is cheap.
     """
-    # Make sure core models exist (cap & schedule).
-    try:
-        state.ensure_cap_model_populated_if_needed()
-    except Exception:
-        _warn_limited("ENSURE_CAP_MODEL_FAILED", "state.ensure_cap_model_populated_if_needed() failed")
-
-    try:
-        state.initialize_master_schedule_if_needed()
-    except Exception:
-        _warn_limited("ENSURE_SCHEDULE_FAILED", "state.initialize_master_schedule_if_needed() failed")
 
     if current_date is None:
         try:
             current_date = state.get_current_date_as_date()
         except Exception:
             current_date = date.today()
-
-    league_ctx = {}
-    try:
-        league_ctx = state.get_league_context_snapshot() or {}
-    except Exception:
-        _warn_limited("LEAGUE_CTX_SNAPSHOT_FAILED", "get_league_context_snapshot failed")
-        league_ctx = {}
 
     workflow_state = {}
     try:
@@ -190,6 +173,9 @@ def build_team_situation_context(
         _warn_limited("WORKFLOW_SNAPSHOT_FAILED", "export_workflow_state failed")
         workflow_state = {}
 
+    # In integrated server mode, workflow_state already contains the league context snapshot.
+    league_ctx = (workflow_state.get("league", {}) or {}) if isinstance(workflow_state, dict) else {}
+    
     trade_state = {}
     try:
         trade_state = state.export_trade_context_snapshot() or {}
@@ -206,7 +192,6 @@ def build_team_situation_context(
     if resolved_db_path:
         try:
             with LeagueRepo(resolved_db_path) as repo:
-                repo.init_db()
                 assets_snapshot = repo.get_trade_assets_snapshot() or {}
                 contract_ledger = repo.get_contract_ledger_snapshot() or {}
 
@@ -558,7 +543,6 @@ class TeamSituationEvaluator:
         out: List[Dict[str, Any]] = []
         try:
             with LeagueRepo(self.db_path) as repo:
-                repo.init_db()
                 rows = repo.get_team_roster(team_id) or []
                 for row in rows:
                     if not isinstance(row, dict):
@@ -1362,32 +1346,6 @@ class TeamSituationEvaluator:
                 if pid in pick_ids_owned:
                     n += 1
         return n
-
-
-# ------------------------------------------------------------
-# Public helper for legacy code
-# ------------------------------------------------------------
-
-def get_team_status_map_v2(ctx: Optional[TeamSituationContext] = None) -> Dict[str, str]:
-    """Compatibility helper for existing AI code.
-
-    Returns a minimal status map:
-      - "contender": contenders + playoff buyers
-      - "rebuild": rebuild + tank
-      - "neutral": others
-    """
-    if ctx is None:
-        ctx = build_team_situation_context()
-    ev = TeamSituationEvaluator(ctx=ctx)
-    out: Dict[str, str] = {}
-    for tid, s in ev.evaluate_all().items():
-        if s.competitive_tier in ("CONTENDER", "PLAYOFF_BUYER"):
-            out[tid] = "contender"
-        elif s.competitive_tier in ("REBUILD", "TANK"):
-            out[tid] = "rebuild"
-        else:
-            out[tid] = "neutral"
-    return out
 
 
 # ------------------------------------------------------------
