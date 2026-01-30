@@ -449,13 +449,16 @@ def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
 
 def get_team_cards() -> List[Dict[str, Any]]:
     """Return team summary cards."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
     team_ids = _list_active_team_ids()
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
         meta = ui_teams_get().get(tid, {})
+        # Default meta fallback (cache may be empty): use static conf/div mapping.
+        static_info = TEAM_TO_CONF_DIV.get(tid, {}) or {}
+        conf = meta.get("conference") or static_info.get("conference")
+        div = meta.get("division") or static_info.get("division")
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -463,8 +466,8 @@ def get_team_cards() -> List[Dict[str, Any]]:
         win_pct = wins / gp if gp else 0.0
         card = {
             "team_id": tid,
-            "conference": meta.get("conference"),
-            "division": meta.get("division"),
+            "conference": conf,
+            "division": div,
             "wins": wins,
             "losses": losses,
             "win_pct": win_pct,
@@ -479,7 +482,6 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
 def get_team_detail(team_id: str) -> Dict[str, Any]:
     """Return team detail (summary + roster) using DB roster."""
-    _init_players_and_teams_if_needed()
     tid = str(team_id).upper()
 
     team_ids = set(_list_active_team_ids())
@@ -491,6 +493,10 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
     meta = ui_teams_get().get(tid, {})
+    # Default meta fallback (cache may be empty): use static conf/div mapping.
+    static_info = TEAM_TO_CONF_DIV.get(tid, {}) or {}
+    conf = meta.get("conference") or static_info.get("conference")
+    div = meta.get("division") or static_info.get("division")
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -503,8 +509,8 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
 
     summary = {
         "team_id": tid,
-        "conference": meta.get("conference"),
-        "division": meta.get("division"),
+        "conference": conf,
+        "division": div,,
         "wins": wins,
         "losses": losses,
         "win_pct": win_pct,
@@ -552,6 +558,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
