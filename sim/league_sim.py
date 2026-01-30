@@ -31,15 +31,6 @@ logger = logging.getLogger(__name__)
 def _repo_ctx() -> LeagueRepo:
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
-        try:
-            repo.init_db()
-        except Exception as exc:
-            logger.exception(
-                "[DB_INIT_FAILED] sim.league_sim._repo_ctx repo.init_db() failed (db_path=%s): %s",
-                db_path,
-                str(exc),
-            )
-            raise
         yield repo
 
 
