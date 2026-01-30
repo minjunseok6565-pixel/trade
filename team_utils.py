@@ -284,34 +284,6 @@ def ui_cache_refresh_players(player_ids: Iterable[str]) -> None:
     ui_players_set(updated_players)
 
 
-def _init_players_and_teams_if_needed() -> None:
-    """Initialize state player/team caches.
-
-    Step 6 invariant:
-    - players are keyed by **player_id (string)**.
-    - Never depend on a pandas DataFrame index for IDs.
-    """
-    existing_players = ui_players_get()
-    existing_teams = ui_teams_get()
-
-    # If cache exists, opportunistically refresh only entries missing derived.
-    if isinstance(existing_players, dict) and existing_players and isinstance(existing_teams, dict) and existing_teams:
-        missing: List[str] = []
-        for pid, pdata in existing_players.items():
-            if not isinstance(pdata, dict):
-                continue
-            derived = pdata.get("derived")
-            if isinstance(derived, dict) and derived:
-                continue
-            missing.append(str(pid))
-        if missing:
-            ui_cache_refresh_players(missing)
-        return
-
-    # Otherwise rebuild from scratch.
-    ui_cache_rebuild_all()
-
-
 def _compute_team_payroll(team_id: str) -> float:
     """Compute payroll from DB roster (NOT from Excel)."""
     total = 0.0
@@ -558,6 +530,7 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
 
 
 
