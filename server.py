@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from config import BASE_DIR, ALL_TEAM_IDS
 from league_repo import LeagueRepo
+from league_service import LeagueService
 from schema import normalize_team_id
 import state
 from sim.league_sim import simulate_single_game, advance_league_until
@@ -150,6 +151,30 @@ class TradeNegotiationStartRequest(BaseModel):
 class TradeNegotiationCommitRequest(BaseModel):
     session_id: str
     deal: Dict[str, Any]
+
+
+# -------------------------------------------------------------------------
+# Contracts / Roster Write API models
+# -------------------------------------------------------------------------
+class ReleaseToFARequest(BaseModel):
+    player_id: str
+    released_date: Optional[str] = None  # YYYY-MM-DD (default: in-game date)
+
+
+class SignFreeAgentRequest(BaseModel):
+    team_id: str
+    player_id: str
+    signed_date: Optional[str] = None  # YYYY-MM-DD (default: in-game date)
+    years: int = 1
+    salary_by_year: Optional[Dict[int, int]] = None  # {season_year: salary}
+
+
+class ReSignOrExtendRequest(BaseModel):
+    team_id: str
+    player_id: str
+    signed_date: Optional[str] = None  # YYYY-MM-DD (default: in-game date)
+    years: int = 1
+    salary_by_year: Optional[Dict[int, int]] = None  # {season_year: salary}
 
 
 # -------------------------------------------------------------------------
@@ -438,6 +463,81 @@ def _validate_repo_integrity(db_path: str) -> None:
         repo.validate_integrity()
 
 
+# -------------------------------------------------------------------------
+# Contracts / Roster Write API
+# -------------------------------------------------------------------------
+@app.post("/api/contracts/release-to-fa")
+async def api_contracts_release_to_fa(req: ReleaseToFARequest):
+    """Release a player to free agency (DB write)."""
+    try:
+        db_path = state.get_db_path()
+        in_game_date = state.get_current_date_as_date()
+        with LeagueRepo(db_path) as repo:
+            svc = LeagueService(repo)
+            event = svc.release_player_to_free_agency(
+                player_id=req.player_id,
+                released_date=req.released_date or in_game_date,
+            )
+        _validate_repo_integrity(db_path)
+        return {"ok": True, "event": event.to_dict()}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Release-to-FA failed: {e}")
+
+
+@app.post("/api/contracts/sign-free-agent")
+async def api_contracts_sign_free_agent(req: SignFreeAgentRequest):
+    """Sign a free agent (DB write): roster.team_id + contract + active contract."""
+    try:
+        db_path = state.get_db_path()
+        in_game_date = state.get_current_date_as_date()
+        with LeagueRepo(db_path) as repo:
+            svc = LeagueService(repo)
+            event = svc.sign_free_agent(
+                team_id=req.team_id,
+                player_id=req.player_id,
+                signed_date=req.signed_date or in_game_date,
+                years=req.years,
+                salary_by_year=req.salary_by_year,
+            )
+        _validate_repo_integrity(db_path)
+        return {"ok": True, "event": event.to_dict()}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sign-free-agent failed: {e}")
+
+
+@app.post("/api/contracts/re-sign-or-extend")
+async def api_contracts_re_sign_or_extend(req: ReSignOrExtendRequest):
+    """Re-sign / extend a player (DB write): contract + active contract (+ roster salary sync)."""
+    try:
+        db_path = state.get_db_path()
+        in_game_date = state.get_current_date_as_date()
+        with LeagueRepo(db_path) as repo:
+            svc = LeagueService(repo)
+            event = svc.re_sign_or_extend(
+                team_id=req.team_id,
+                player_id=req.player_id,
+                signed_date=req.signed_date or in_game_date,
+                years=req.years,
+                salary_by_year=req.salary_by_year,
+            )
+        _validate_repo_integrity(db_path)
+        return {"ok": True, "event": event.to_dict()}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Re-sign/extend failed: {e}")
+
+
 @app.post("/api/trade/submit")
 async def api_trade_submit(req: TradeSubmitRequest):
     try:
@@ -678,6 +778,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
