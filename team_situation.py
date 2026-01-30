@@ -62,6 +62,8 @@ class TeamConstraints:
     apron_status: Literal["BELOW_CAP", "OVER_CAP", "ABOVE_1ST_APRON", "ABOVE_2ND_APRON"]
     hard_flags: Dict[str, bool] = field(default_factory=dict)
     locks_count: int = 0
+    # Market-level constraint: team temporarily throttled from trading activity (anti-spam / recent-action cooldown).
+    cooldown_active: bool = False
     deadline_pressure: float = 0.0
 
 
@@ -70,10 +72,22 @@ class TeamSituationSignals:
     win_pct: float
     conf_rank: Optional[int]
     gb: Optional[float]
+    # Bubble context (conference): games-behind relative to key cut lines.
+    # gb_to_6th: distance to the 6-seed (direct playoff line)
+    # gb_to_10th: distance to the 10-seed (play-in line)
+    gb_to_6th: Optional[float]
+    gb_to_10th: Optional[float]
     point_diff_pg: float
     last10_win_pct: float
     trend: float
     net_rating: float
+    # Efficiency context (per-100 possessions) + league-relative percentiles.
+    # Percentiles are 0..1 where higher is better.
+    ortg: float
+    drtg: float
+    ortg_pct: float
+    def_pct: float
+    net_pct: float
     star_power: float
     depth: float
     core_age: float
@@ -83,6 +97,10 @@ class TeamSituationSignals:
     style_3_rate: float
     style_rim_rate: float
     role_fit_health: float
+    # Contract timing pressure: expiring key rotation increases urgency and pushes buy/sell decisions.
+    expiring_top8_count: int
+    expiring_top8_ovr_sum: float
+    re_sign_pressure: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +133,8 @@ class TeamSituationContext:
     trade_memory: Dict[str, Any]
     negotiations: Dict[str, Any]
     asset_locks: Dict[str, Any]
+    # Precomputed per-team ratings and percentiles for league-relative evaluation.
+    team_ratings_index: Dict[str, Dict[str, float]]
 
 
 # ------------------------------------------------------------
@@ -194,6 +214,14 @@ def build_team_situation_context(
         (workflow_state.get("league", {}) or {}).get("master_schedule", {})
     )
 
+    # League-relative ORtg/DRtg percentiles (robust across eras/scoring environments).
+    team_stats_plain = _to_plain(workflow_state.get("team_stats", {}) or {})
+    ratings_index = _build_team_ratings_index(
+        team_stats=team_stats_plain,
+        records_index=records_index,
+        standings=_to_plain(standings),
+    )
+
     return TeamSituationContext(
         current_date=current_date,
         league_ctx=_to_plain(league_ctx),
@@ -203,12 +231,13 @@ def build_team_situation_context(
         contract_ledger=_to_plain(contract_ledger),
         standings=_to_plain(standings),
         records_index=records_index,
-        team_stats=_to_plain(workflow_state.get("team_stats", {}) or {}),
+        team_stats=team_stats_plain,
         player_stats=_to_plain(workflow_state.get("player_stats", {}) or {}),
         trade_market=_to_plain(workflow_state.get("trade_market", {}) or {}),
         trade_memory=_to_plain(workflow_state.get("trade_memory", {}) or {}),
         negotiations=_to_plain(workflow_state.get("negotiations", {}) or {}),
         asset_locks=_to_plain(trade_state.get("asset_locks", {}) or {}),
+        team_ratings_index=ratings_index,
     )
 
 
@@ -242,9 +271,11 @@ class TeamSituationEvaluator:
         tid = str(normalize_team_id(team_id, strict=True))
 
         perf = self._compute_performance(tid)
+        rt = (self.ctx.team_ratings_index.get(tid, {}) or {})
         roster = self._load_roster_with_derived(tid)
         roster_sig = self._compute_roster_signals(tid, roster)
         asset_sig = self._compute_asset_signals(tid)
+        contract_sig = self._compute_contract_pressure(tid, roster)
         constraints = self._compute_constraints(tid, roster, perf)
         style_sig = self._compute_style_signals(tid)
         role_sig, role_needs = self._compute_role_fit_and_needs(tid, roster)
@@ -253,10 +284,17 @@ class TeamSituationEvaluator:
             win_pct=float(perf["win_pct"]),
             conf_rank=perf.get("rank"),
             gb=perf.get("gb"),
+            gb_to_6th=perf.get("gb_to_6th"),
+            gb_to_10th=perf.get("gb_to_10th"),
             point_diff_pg=float(perf["point_diff_pg"]),
             last10_win_pct=float(perf["last10_win_pct"]),
             trend=float(perf["trend"]),
             net_rating=float(perf["net_rating"]),
+            ortg=float(rt.get("ortg", perf.get("ortg", 0.0)) or 0.0),
+            drtg=float(rt.get("drtg", perf.get("drtg", 0.0)) or 0.0),
+            ortg_pct=float(rt.get("ortg_pct", 0.5) or 0.5),
+            def_pct=float(rt.get("def_pct", 0.5) or 0.5),
+            net_pct=float(rt.get("net_pct", 0.5) or 0.5),
             star_power=float(roster_sig["star_power"]),
             depth=float(roster_sig["depth"]),
             core_age=float(roster_sig["core_age"]),
@@ -266,6 +304,9 @@ class TeamSituationEvaluator:
             style_3_rate=float(style_sig["three_rate"]),
             style_rim_rate=float(style_sig["rim_rate"]),
             role_fit_health=float(role_sig["role_fit_health"]),
+            expiring_top8_count=int(contract_sig.get("expiring_top8_count", 0) or 0),
+            expiring_top8_ovr_sum=float(contract_sig.get("expiring_top8_ovr_sum", 0.0) or 0.0),
+            re_sign_pressure=float(contract_sig.get("re_sign_pressure", 0.0) or 0.0),
         )
 
         tier, posture, horizon, urgency, prefs, needs, reasons = self._classify_and_build_outputs(
@@ -328,25 +369,66 @@ class TeamSituationEvaluator:
         # rank/gb from standings
         rank = None
         gb = None
+        conf_key: Optional[str] = None
         for row in (self.ctx.standings.get("east", []) + self.ctx.standings.get("west", [])):
             if str(row.get("team_id", "")).upper() == team_id:
                 rank = row.get("rank")
                 gb = row.get("gb")
                 break
 
-        # net rating approx
+        # Determine conference + bubble distances to 6th/10th using wins/losses (more robust than leader-GB diffs).
+        # We clamp negatives to 0.0 (if you're already above the line, you're not "behind" it).
+        gb_to_6th: Optional[float] = None
+        gb_to_10th: Optional[float] = None
+        # Find which conference list contains this team
+        for ck in ("east", "west"):
+            rows = self.ctx.standings.get(ck, []) or []
+            for r in rows:
+                if str(r.get("team_id", "")).upper() == team_id:
+                    conf_key = ck
+                    break
+            if conf_key:
+                break
+        if conf_key in ("east", "west"):
+            rows = self.ctx.standings.get(conf_key, []) or []
+            def _row_by_rank(target_rank: int) -> Optional[Dict[str, Any]]:
+                for r in rows:
+                    if _safe_int(r.get("rank")) == target_rank:
+                        return r
+                return None
+            def _wins(r: Dict[str, Any]) -> int:
+                return int(_safe_int(r.get("wins"), _safe_int(r.get("W"), 0) or 0) or 0)
+            def _losses(r: Dict[str, Any]) -> int:
+                return int(_safe_int(r.get("losses"), _safe_int(r.get("L"), 0) or 0) or 0)
+
+            r6 = _row_by_rank(6)
+            if r6 is not None:
+                gb6 = _gb_between(wins, losses, _wins(r6), _losses(r6))
+                gb_to_6th = float(max(0.0, gb6))
+            r10 = _row_by_rank(10)
+            if r10 is not None:
+                gb10 = _gb_between(wins, losses, _wins(r10), _losses(r10))
+                gb_to_10th = float(max(0.0, gb10))
+
+        # ORtg/DRtg/Net (per 100 possessions). Use Possessions if available, else fallback to ~100 poss/game.
+        ortg = None
+        drtg = None
         net_rating = None
         ts = (self.ctx.team_stats.get(team_id, {}) or {})
         totals = (ts.get("totals", {}) or {}) if isinstance(ts, dict) else {}
         poss = _safe_float(totals.get("Possessions"), 0.0)
         pts = _safe_float(totals.get("PTS"), pf)
-        if poss > 1e-6 and gp > 0:
-            ortg = pts / poss * 100.0
-            drtg = pa / poss * 100.0
-            net_rating = ortg - drtg
+        if poss <= 1e-6 and gp > 0:
+            poss = float(gp) * 100.0
+        if poss > 1e-6:
+            ortg = (pts / poss) * 100.0
+            drtg = (pa / poss) * 100.0
+            net_rating = float(ortg - drtg)
         else:
-            # fallback: scale point diff
-            net_rating = point_diff_pg * 2.1
+            # hard fallback: scale point diff
+            ortg = pf
+            drtg = pa
+            net_rating = float(point_diff_pg * 2.1)
 
         return {
             "wins": wins,
@@ -360,6 +442,10 @@ class TeamSituationEvaluator:
             "trend": float(trend),
             "rank": int(rank) if rank is not None else None,
             "gb": float(gb) if gb is not None else None,
+            "ortg": float(ortg or 0.0),
+            "drtg": float(drtg or 0.0),
+            "gb_to_6th": gb_to_6th,
+            "gb_to_10th": gb_to_10th,
             "net_rating": float(net_rating),
             "season_progress": _clamp(gp / 82.0, 0.0, 1.0),
         }
@@ -653,6 +739,11 @@ class TeamSituationEvaluator:
         # asset locks that touch this team
         locks_count = self._count_team_related_locks(team_id)
 
+        # market cooldown (from workflow_state["trade_market"]["cooldowns"])
+        cooldown_active = _cooldown_active(self.ctx.trade_market, team_id)
+        if cooldown_active:
+            hard_flags["COOLDOWN_ACTIVE"] = True
+
         # deadline pressure
         deadline_pressure = _deadline_pressure(self.ctx.current_date, trade_rules.get("trade_deadline"))
 
@@ -662,6 +753,7 @@ class TeamSituationEvaluator:
             apron_status=apron_status,
             hard_flags=hard_flags,
             locks_count=int(locks_count),
+            cooldown_active=bool(cooldown_active),
             deadline_pressure=float(deadline_pressure),
         )
 
@@ -828,6 +920,8 @@ class TeamSituationEvaluator:
         wp = signals.win_pct
         nr = signals.net_rating
         tr = signals.trend
+        gb6 = signals.gb_to_6th
+        gb10 = signals.gb_to_10th
 
         # "reset" special: strong roster but bad record
         if composite >= 0.62 and wp < 0.46 and signals.star_power >= 0.70:
@@ -844,6 +938,15 @@ class TeamSituationEvaluator:
                 tier = "TANK"
             else:
                 tier = "REBUILD"
+
+        # Bubble nuance: near the 6/10 cut lines (especially later season) behaves differently from pure rank buckets.
+        # - within ~3GB of 6th late -> treat like a buyer-tier (more realistic "push for playoffs")
+        # - within ~2GB of 10th late -> treat like FRINGE (play-in chase)
+        if season_progress >= 0.55:
+            if tier == "FRINGE" and (gb6 is not None and gb6 <= 3.0) and wp >= 0.46:
+                tier = "PLAYOFF_BUYER"
+            if tier in ("REBUILD", "TANK") and (gb10 is not None and gb10 <= 2.0) and wp >= 0.40:
+                tier = "FRINGE"
 
         # 3) horizon
         core_age = signals.core_age
@@ -865,6 +968,10 @@ class TeamSituationEvaluator:
         needs.extend(_dedupe_needs(role_needs))
         needs.extend(_style_to_needs(tid, signals, style_sig))
         needs.extend(_roster_gap_needs(tid, roster_sig, signals))
+        needs = _merge_and_clip_needs(needs)
+
+        # ORtg/DRtg percentile based boosting (align needs with clear team weaknesses).
+        needs = _boost_needs_by_efficiency_percentiles(needs, signals)
         needs = _merge_and_clip_needs(needs)
 
         need_intensity = _avg([n.weight for n in needs]) if needs else 0.0
@@ -896,9 +1003,50 @@ class TeamSituationEvaluator:
         if deadline_pressure >= 0.65 and tier in ("REBUILD", "TANK"):
             posture = "SELL"
 
+        # Bubble posture refinement (late season): close to play-in/playoffs pushes toward buying;
+        # far away pushes toward selling, even if trend is mildly positive.
+        if season_progress >= 0.68 and tier in ("FRINGE", "RESET"):
+            close_to_playoffs = (gb6 is not None and gb6 <= 3.5)
+            close_to_playin = (gb10 is not None and gb10 <= 2.0)
+            far_from_playin = (gb10 is not None and gb10 >= 4.5)
+
+            if (close_to_playoffs or close_to_playin) and deadline_pressure >= 0.35:
+                # If you can realistically get in, "soft buy" becomes common (unless cap constraints block it).
+                if constraints.apron_status != "ABOVE_2ND_APRON" and asset_sig.get("asset_score", 0.0) >= 0.35:
+                    if posture == "STAND_PAT" and tr >= -0.04:
+                        posture = "SOFT_BUY"
+            elif far_from_playin and deadline_pressure >= 0.35:
+                # If you're far from even play-in late, soft sell is the realistic market behavior.
+                if posture == "STAND_PAT":
+                    posture = "SOFT_SELL"
+
         # constraints soften
         if constraints.apron_status == "ABOVE_2ND_APRON" and posture in ("AGGRESSIVE_BUY", "SOFT_BUY"):
             posture = "STAND_PAT"
+
+        # market cooldown throttles aggressiveness (prevents unrealistic repeated proposals / rapid-fire deals)
+        if getattr(constraints, "cooldown_active", False):
+            if posture in ("AGGRESSIVE_BUY", "SOFT_BUY"):
+                posture = "STAND_PAT"
+            elif posture == "SELL":
+                posture = "SOFT_SELL"
+
+        # contract timing pressure: expiring key rotation pushes teams to act
+        exp_pressure = _clamp(_safe_float(getattr(signals, "re_sign_pressure", 0.0), 0.0), 0.0, 1.0)
+        if exp_pressure >= 0.35:
+            if tier in ("CONTENDER", "PLAYOFF_BUYER"):
+                # contenders with expiring rotation tend to consolidate / upgrade rather than wait
+                if constraints.apron_status != "ABOVE_2ND_APRON":
+                    if posture == "STAND_PAT":
+                        posture = "SOFT_BUY"
+                    elif posture == "SOFT_BUY" and deadline_pressure >= 0.40 and exp_pressure >= 0.55:
+                        posture = "AGGRESSIVE_BUY"
+            else:
+                # non-contenders with expiring value tend to sell to avoid losing players for nothing
+                if posture in ("STAND_PAT", "SOFT_BUY"):
+                    posture = "SOFT_SELL"
+                elif posture == "SOFT_SELL" and deadline_pressure >= 0.40 and exp_pressure >= 0.55:
+                    posture = "SELL"
 
         # patience modifies extremeness
         if patience >= 0.70 and posture == "AGGRESSIVE_BUY":
@@ -914,6 +1062,13 @@ class TeamSituationEvaluator:
         prefs = _compute_preferences(tier, horizon, signals, constraints, asset_sig)
 
         # 7) urgency (0~1)
+        # bubble pressure: late-season proximity to 6/10 seeds increases action pressure.
+        bubble_pressure = 0.0
+        if season_progress >= 0.68:
+            if gb6 is not None and gb6 <= 3.0:
+                bubble_pressure = max(bubble_pressure, 0.35)
+            if gb10 is not None and gb10 <= 2.0:
+                bubble_pressure = max(bubble_pressure, 0.45)
         urgency = _compute_urgency(
             tier=tier,
             horizon=horizon,
@@ -922,7 +1077,13 @@ class TeamSituationEvaluator:
             trend=signals.trend,
             need_intensity=need_intensity,
             apron_status=constraints.apron_status,
+            re_sign_pressure=_safe_float(getattr(signals, "re_sign_pressure", 0.0), 0.0),
+            bubble_pressure=float(bubble_pressure),
         )
+
+        # cooldown reduces immediate action probability even if situation is urgent
+        if getattr(constraints, "cooldown_active", False):
+            urgency = _clamp(float(urgency) * 0.85, 0.0, 1.0)
 
         # 8) reasons (Korean, for player-facing realism)
         reasons = _build_reasons(tid, tier, horizon, posture, signals, constraints, roster_sig, asset_sig, style_sig, prefs, needs)
@@ -979,6 +1140,57 @@ class TeamSituationEvaluator:
         if season_year > end_year:
             return 0
         return int(end_year - season_year + 1)
+
+    def _compute_contract_pressure(self, team_id: str, roster: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compute "re-sign pressure" from expiring key rotation players.
+
+        Intuition: if multiple top-8 rotation players have <=1 year remaining,
+        teams feel pressure to either (a) push in and justify re-signing, or
+        (b) sell to avoid losing value for nothing.
+
+        Output values are normalized to 0..1 where possible.
+        """
+        if not roster:
+            return {
+                "expiring_top8_count": 0,
+                "expiring_top8_ovr_sum": 0.0,
+                "re_sign_pressure": 0.0,
+            }
+
+        season_year = _safe_int(self.ctx.league_ctx.get("season_year"), None)
+        if season_year is None:
+            season_year = int(self.ctx.current_date.year)
+
+        top8 = roster[:8]
+        expiring_count = 0
+        expiring_ovr_sum = 0.0
+        pressure_raw = 0.0
+
+        for p in top8:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("player_id")
+            if not pid:
+                continue
+            rem = self._remaining_years_for_player(str(pid), int(season_year))
+            if rem is None:
+                continue
+
+            # Remaining years is inclusive (1 means expiring this season)
+            if rem <= 1:
+                expiring_count += 1
+                ovr = _safe_float(p.get("ovr"), 0.0)
+                expiring_ovr_sum += ovr
+                # pressure is higher if good player is expiring
+                pressure_raw += _clamp((ovr - 70.0) / 20.0, 0.0, 1.0)
+
+        # Normalize: 3 good expiring players -> near max pressure
+        re_sign_pressure = _clamp(pressure_raw / 3.0, 0.0, 1.0)
+        return {
+            "expiring_top8_count": int(expiring_count),
+            "expiring_top8_ovr_sum": float(expiring_ovr_sum),
+            "re_sign_pressure": float(re_sign_pressure),
+        }
 
     def _compute_payroll_from_contracts_or_roster(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> float:
         # Prefer contract ledger if available (SSOT)
@@ -1272,6 +1484,9 @@ def _weighted_avg(values: List[float], weights: List[float], default: float = 0.
         return float(default)
     return float(s / w)
 
+def _gb_between(wins_a: int, losses_a: int, wins_b: int, losses_b: int) -> float:
+    """Games-behind for team A relative to team B (positive means A is behind B)."""
+    return ((wins_b - wins_a) + (losses_a - losses_b)) / 2.0
 
 def _lerp(a: float, b: float, t: float) -> float:
     tt = _clamp(t, 0.0, 1.0)
@@ -1320,6 +1535,29 @@ def _deadline_pressure(today: date, trade_deadline: Any) -> float:
     if days <= 10:
         pressure = _clamp(pressure + 0.20, 0.0, 1.0)
     return float(pressure)
+
+
+def _cooldown_active(trade_market: Mapping[str, Any], team_id: str) -> bool:
+    """Return True if this team is under a trade-market cooldown.
+
+    Expected structure: workflow_state["trade_market"]["cooldowns"] is a dict keyed by TEAM_ID.
+    We treat presence as active (expiry handling can be added later if cooldown values store dates).
+    """
+    try:
+        tm = trade_market or {}
+        cooldowns = tm.get("cooldowns") if isinstance(tm, dict) else None
+        if not isinstance(cooldowns, dict):
+            return False
+        tid = str(team_id).upper()
+        if tid in cooldowns:
+            return True
+        # defensive: tolerate case mismatches
+        for k in cooldowns.keys():
+            if str(k).upper() == tid:
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _role_to_need_tag(role: str) -> Tuple[str, str]:
@@ -1524,6 +1762,172 @@ def _merge_and_clip_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
     return out[:10]
 
 
+def _boost_needs_by_efficiency_percentiles(needs: List[TeamNeed], sig: TeamSituationSignals) -> List[TeamNeed]:
+    """Boost need weights based on ORtg/DRtg percentiles and inject directional needs when missing.
+
+    - If offense percentile is low, boost offensive creation/spacing/rim pressure needs.
+    - If defense percentile is low, boost guard/wing/big depth (defense-capable slots) and add DEFENSE_UPGRADE if absent.
+    """
+    if not needs:
+        needs = []
+
+    ortg_pct = _clamp(_safe_float(getattr(sig, "ortg_pct", 0.5), 0.5), 0.0, 1.0)
+    def_pct = _clamp(_safe_float(getattr(sig, "def_pct", 0.5), 0.5), 0.0, 1.0)
+
+    # Weakness in 0..1 (bottom half ramps up; bottom ~20% is strong signal).
+    off_weak = _clamp((0.50 - ortg_pct) / 0.50, 0.0, 1.0)
+    def_weak = _clamp((0.50 - def_pct) / 0.50, 0.0, 1.0)
+
+    offense_tags = {
+        "PRIMARY_INITIATOR", "SECONDARY_CREATOR", "TRANSITION_ENGINE", "SHOT_CREATION",
+        "RIM_PRESSURE", "SPACING", "MOVEMENT_SHOOTING", "CONNECTOR_PLAY",
+        "ROLL_THREAT", "SHORT_ROLL_PLAY", "POP_BIG", "POST_HUB",
+        "BALL_SECURITY", "PNR_ENGINE",
+    }
+    defense_tags = {
+        "DEFENSE", "GUARD_DEPTH", "WING_DEPTH", "BIG_DEPTH",
+    }
+
+    def _bump(w: float, weak: float) -> float:
+        # Add up to +0.20 when weakness is max, but with diminishing returns near 1.0
+        add = 0.20 * weak
+        return _clamp(w + add * (1.0 - w), 0.0, 1.0)
+
+    out: List[TeamNeed] = []
+    for n in needs:
+        w = float(n.weight)
+        ev = dict(n.evidence or {})
+        # Always attach percentile evidence (useful for debugging/explanations).
+        ev.setdefault("ortg", float(getattr(sig, "ortg", 0.0)))
+        ev.setdefault("drtg", float(getattr(sig, "drtg", 0.0)))
+        ev.setdefault("ortg_pct", float(ortg_pct))
+        ev.setdefault("def_pct", float(def_pct))
+        ev.setdefault("net_pct", float(_clamp(_safe_float(getattr(sig, "net_pct", 0.5), 0.5), 0.0, 1.0)))
+
+        if n.tag in offense_tags and off_weak > 0.0:
+            w2 = _bump(w, off_weak)
+            out.append(TeamNeed(tag=n.tag, weight=w2, reason=n.reason, evidence=ev))
+            continue
+        if n.tag in defense_tags and def_weak > 0.0:
+            w2 = _bump(w, def_weak)
+            out.append(TeamNeed(tag=n.tag, weight=w2, reason=n.reason, evidence=ev))
+            continue
+
+        out.append(TeamNeed(tag=n.tag, weight=w, reason=n.reason, evidence=ev))
+
+    # Inject directional needs if a side is clearly bottom-tier but no strong needs exist.
+    strong_off_need = any((n.tag in offense_tags and n.weight >= 0.45) for n in out)
+    strong_def_need = any((n.tag in defense_tags and n.weight >= 0.45) for n in out)
+
+    if off_weak >= 0.60 and not strong_off_need:
+        out.append(
+            TeamNeed(
+                tag="OFFENSE_UPGRADE",
+                weight=_clamp(0.55 + 0.25 * off_weak, 0.55, 0.85),
+                reason=f"공격 효율이 리그 하위권(ORtg {sig.ortg:.1f}, {ortg_pct:.0%}p) → 즉전 창출/슈팅 보강이 최우선.",
+                evidence={"ortg": sig.ortg, "ortg_pct": ortg_pct, "net_pct": getattr(sig, 'net_pct', 0.5)},
+            )
+        )
+
+    if def_weak >= 0.60 and not strong_def_need:
+        out.append(
+            TeamNeed(
+                tag="DEFENSE_UPGRADE",
+                weight=_clamp(0.55 + 0.25 * def_weak, 0.55, 0.85),
+                reason=f"수비 효율이 리그 하위권(DRtg {sig.drtg:.1f}, {def_pct:.0%}p) → 수비수/림프로텍션 보강이 최우선.",
+                evidence={"drtg": sig.drtg, "def_pct": def_pct, "net_pct": getattr(sig, 'net_pct', 0.5)},
+            )
+        )
+
+    return out
+
+
+def _build_team_ratings_index(
+    *,
+    team_stats: Dict[str, Any],
+    records_index: Dict[str, Dict[str, Any]],
+    standings: Dict[str, Any],
+) -> Dict[str, Dict[str, float]]:
+    """Build per-team ORtg/DRtg/Net and league percentiles (0..1, higher is better).
+
+    We prefer Possessions from workflow_state["team_stats"][tid]["totals"]["Possessions"].
+    If missing, we fallback to ~100 possessions per game.
+    """
+    # Collect team ids from multiple sources for robustness.
+    team_ids = set()
+    team_ids.update([str(k).upper() for k in (team_stats or {}).keys()])
+    team_ids.update([str(k).upper() for k in (records_index or {}).keys()])
+    for row in (standings.get("east", []) + standings.get("west", [])):
+        if isinstance(row, dict) and row.get("team_id"):
+            team_ids.add(str(row.get("team_id")).upper())
+
+    ortg_by: Dict[str, float] = {}
+    defq_by: Dict[str, float] = {}   # -DRtg (higher is better)
+    net_by: Dict[str, float] = {}
+    drtg_by: Dict[str, float] = {}
+
+    for tid in team_ids:
+        rec = (records_index.get(tid, {}) or {})
+        wins = int(rec.get("wins", 0) or 0)
+        losses = int(rec.get("losses", 0) or 0)
+        gp = wins + losses
+        pf = float(rec.get("pf", 0) or 0)
+        pa = float(rec.get("pa", 0) or 0)
+
+        ts = (team_stats.get(tid, {}) or {})
+        totals = (ts.get("totals", {}) or {}) if isinstance(ts, dict) else {}
+        poss = _safe_float(totals.get("Possessions"), 0.0)
+        pts = _safe_float(totals.get("PTS"), pf)
+        if poss <= 1e-6 and gp > 0:
+            poss = float(gp) * 100.0
+        if poss <= 1e-6:
+            continue
+
+        ortg = (pts / poss) * 100.0
+        drtg = (pa / poss) * 100.0
+        net = ortg - drtg
+
+        ortg_by[tid] = float(ortg)
+        drtg_by[tid] = float(drtg)
+        defq_by[tid] = float(-drtg)
+        net_by[tid] = float(net)
+
+    ortg_pct = _percentile_map(ortg_by)
+    def_pct = _percentile_map(defq_by)
+    net_pct = _percentile_map(net_by)
+
+    out: Dict[str, Dict[str, float]] = {}
+    for tid in team_ids:
+        if tid not in ortg_by:
+            continue
+        out[tid] = {
+            "ortg": float(ortg_by.get(tid, 0.0)),
+            "drtg": float(drtg_by.get(tid, 0.0)),
+            "net": float(net_by.get(tid, 0.0)),
+            "ortg_pct": float(ortg_pct.get(tid, 0.5)),
+            "def_pct": float(def_pct.get(tid, 0.5)),
+            "net_pct": float(net_pct.get(tid, 0.5)),
+        }
+    return out
+
+
+def _percentile_map(values_by_team: Dict[str, float]) -> Dict[str, float]:
+    """Return percentile (0..1) by team where higher value => higher percentile.
+    For ties, ordering is stable but acceptable for AI logic.
+    """
+    items = [(k, float(v)) for k, v in (values_by_team or {}).items()]
+    if not items:
+        return {}
+    items.sort(key=lambda kv: kv[1])
+    n = len(items)
+    if n == 1:
+        return {items[0][0]: 0.5}
+    out: Dict[str, float] = {}
+    for i, (k, _) in enumerate(items):
+        out[k] = float(i / (n - 1))
+    return out
+
+
 def _compute_preferences(
     tier: CompetitiveTier,
     horizon: TimeHorizon,
@@ -1598,6 +2002,8 @@ def _compute_urgency(
     trend: float,
     need_intensity: float,
     apron_status: str,
+    re_sign_pressure: float = 0.0,
+    bubble_pressure: float = 0.0,
 ) -> float:
     dp = _clamp(deadline_pressure, 0.0, 1.0)
     patience = _clamp(patience, 0.0, 1.0)
@@ -1617,6 +2023,8 @@ def _compute_urgency(
     patience_weight = 0.18
     trend_weight = 0.12
     apron_weight = 0.10
+    contract_weight = 0.18
+    bubble_weight = 0.16 if tier in ("FRINGE", "RESET") else 0.10
 
     tr = _clamp(trend, -0.25, 0.25)
     trend_push = 0.0
@@ -1632,12 +2040,21 @@ def _compute_urgency(
     elif apron_status == "ABOVE_1ST_APRON":
         apron_push = 0.10
 
+    # Contract timing: expiring top-rotation players create action pressure.
+    # We keep it modest for contenders (they may re-sign), stronger for non-contenders.
+    rp = _clamp(_safe_float(re_sign_pressure, 0.0), 0.0, 1.0)
+    contract_mult = 0.75 if tier in ("CONTENDER", "PLAYOFF_BUYER") else 1.00
+    contract_push = rp * contract_mult
+    bp = _clamp(_safe_float(bubble_pressure, 0.0), 0.0, 1.0)
+
     u = tier_base
     u += deadline_weight * dp
     u += need_weight * _clamp(need_intensity, 0.0, 1.0)
     u += patience_weight * (1.0 - patience)
     u += trend_weight * trend_push
     u += apron_weight * apron_push
+    u += contract_weight * contract_push
+    u += bubble_weight * bp
 
     # Horizon adjustments
     if horizon == "WIN_NOW":
@@ -1711,6 +2128,12 @@ def _build_reasons(
             r.append(f"현재 컨퍼런스 {rank}위(승률 {sig.win_pct:.3f}, GB {gb:.1f}), 최근 10경기 승률 {sig.last10_win_pct:.0%}.")
         else:
             r.append(f"현재 컨퍼런스 {rank}위(승률 {sig.win_pct:.3f}), 최근 10경기 승률 {sig.last10_win_pct:.0%}.")
+        gb6 = getattr(sig, "gb_to_6th", None)
+        gb10 = getattr(sig, "gb_to_10th", None)
+        if gb6 is not None or gb10 is not None:
+            s6 = f"{float(gb6):.1f}GB" if gb6 is not None else "N/A"
+            s10 = f"{float(gb10):.1f}GB" if gb10 is not None else "N/A"
+            r.append(f"버블 지표: 6위까지 {s6}, 10위까지 {s10}.")
     else:
         r.append(f"현재 승률 {sig.win_pct:.3f}, 최근 10경기 승률 {sig.last10_win_pct:.0%}.")
 
@@ -1725,6 +2148,15 @@ def _build_reasons(
     if sig.core_age > 0:
         r.append(f"코어 평균 나이 {sig.core_age:.1f}세, 유망주/젊은코어 지표 {sig.young_core:.2f}.")
 
+    # contract timing pressure
+    if getattr(sig, "expiring_top8_count", 0) and (_safe_float(getattr(sig, "re_sign_pressure", 0.0), 0.0) >= 0.15):
+        cnt = int(getattr(sig, "expiring_top8_count", 0) or 0)
+        ovr_sum = _safe_float(getattr(sig, "expiring_top8_ovr_sum", 0.0), 0.0)
+        rp = _safe_float(getattr(sig, "re_sign_pressure", 0.0), 0.0)
+        r.append(
+            f"탑8 로테이션 중 만기 임박(잔여 1년 이하) 계약 {cnt}명(OVR 합 {ovr_sum:.0f}) → 재계약/트레이드 결단 압박 {rp:.2f}."
+        )
+
     # cap / apron
     cap_m = constraints.cap_space / 1_000_000.0
     pay_m = constraints.payroll / 1_000_000.0
@@ -1734,6 +2166,8 @@ def _build_reasons(
         r.append(f"룰/제약 플래그: {keys} → 트레이드 설계가 까다로울 수 있음.")
     if constraints.locks_count > 0:
         r.append(f"현재 협상/락 걸린 자산이 {constraints.locks_count}개 있어 선택지가 일부 제한됨.")
+    if getattr(constraints, "cooldown_active", False):
+        r.append("현재 트레이드 시장 쿨다운 상태: 당분간 적극적인 제안/협상 빈도를 낮춤.")
 
     # assets
     r.append(
@@ -1742,6 +2176,12 @@ def _build_reasons(
 
     # style
     r.append(f"공격 성향: 3점 비중 {sig.style_3_rate:.0%}, 림 공격 비중 {sig.style_rim_rate:.0%}.")
+
+    # efficiency percentile context
+    r.append(
+        f"효율 지표: ORtg {sig.ortg:.1f} (리그 {sig.ortg_pct:.0%}p), "
+        f"DRtg {sig.drtg:.1f} (수비 {sig.def_pct:.0%}p), Net {sig.net_rating:.1f} (리그 {sig.net_pct:.0%}p)."
+    )
 
     # headline decision
     r.append(f"상황 평가: {tier} / {horizon} / 트레이드 스탠스 {posture}.")
