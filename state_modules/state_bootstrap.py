@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from config import ALL_TEAM_IDS
+import json
+
+from config import ALL_TEAM_IDS, GM_PROFILES_SEED_PATH
 from .state_cap import _apply_cap_model_for_season
 
 
@@ -12,6 +14,40 @@ def _require_db_path(league: dict) -> str:
     if not db_path:
         raise ValueError("league.db_path is required")
     return str(db_path)
+
+def _load_gm_profiles_seed(seed_path: str) -> dict[str, dict]:
+    """Load gm_profiles seed file and return {team_id: profile_json}.
+
+    Seed format: a JSON list of objects where each object contains 'Team' and trait fields.
+    - 'Team' is used as team_id (uppercased/stripped).
+    - Stored profile_json excludes 'Team'.
+    Fail-fast on any invalid format/content (development stage).
+    """
+    with open(seed_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("gm_profiles seed must be a JSON list")
+
+    allowed = set(ALL_TEAM_IDS)
+    out: dict[str, dict] = {}
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"gm_profiles seed item[{i}] must be an object")
+        team = item.get("Team")
+        if not team:
+            raise ValueError(f"gm_profiles seed item[{i}] missing 'Team'")
+        team_id = str(team).strip().upper()
+        if team_id not in allowed:
+            raise ValueError(f"gm_profiles seed item[{i}] has unknown Team '{team_id}'")
+        profile = dict(item)
+        profile.pop("Team", None)
+        out[team_id] = profile
+
+    missing = [t for t in ALL_TEAM_IDS if t not in out]
+    if missing:
+        raise ValueError(f"gm_profiles seed missing teams: {missing}")
+    return out
 
 
 def ensure_db_initialized_and_seeded(state: dict) -> None:
@@ -29,6 +65,12 @@ def ensure_db_initialized_and_seeded(state: dict) -> None:
 
     with LeagueRepo(db_path) as repo:
         repo.init_db()
+        # Auto-seed GM profiles on a fresh dev DB (or when only empty {} rows exist).
+        existing = repo.get_all_gm_profiles() or {}
+        has_any_non_empty = any(isinstance(v, dict) and len(v) > 0 for v in existing.values())
+        if not has_any_non_empty:
+            seed_mapping = _load_gm_profiles_seed(GM_PROFILES_SEED_PATH)
+            repo.upsert_gm_profiles(seed_mapping)
         # Keep rows ready for all teams (idempotent).
         repo.ensure_gm_profiles_seeded(ALL_TEAM_IDS)
 
