@@ -37,25 +37,35 @@ def ensure_db_initialized_and_seeded(state: dict) -> None:
 
 
 def ensure_cap_model_populated_if_needed(state: dict) -> None:
-    """Populate cap/aprons in league.trade_rules if season_year is known and unset/zero."""
+    """Apply season-specific cap/apron values when cap_auto_update is enabled.
+
+    Notes:
+    - This is safe to call on startup *and* at every season transition.
+    - If league.trade_rules.cap_auto_update is False, this does nothing (manual cap mode).
+    """
     league = state["league"]
     if not isinstance(league, dict):
         raise ValueError("league must be a dict")
-    trade_rules = league.get("trade_rules") or {}
+        
+    # Ensure trade_rules is a dict (robustness against malformed state).
+    trade_rules = league.get("trade_rules")
+    if not isinstance(trade_rules, dict):
+        trade_rules = {}
+        league["trade_rules"] = trade_rules
+
+    # Respect manual cap mode.
+    if trade_rules.get("cap_auto_update") is False:
+        return
+
     season_year = league.get("season_year")
-    salary_cap = trade_rules.get("salary_cap") if isinstance(trade_rules, dict) else None
     if not season_year:
         return
     try:
         season_year_int = int(season_year)
     except (TypeError, ValueError):
         return
-    try:
-        salary_cap_value = float(salary_cap or 0)
-    except (TypeError, ValueError):
-        salary_cap_value = 0.0
-    if salary_cap_value <= 0:
-        _apply_cap_model_for_season(league, season_year_int)
+    # 핵심: salary_cap 값이 이미 존재하더라도, 현재 시즌 기준으로 항상 재계산/적용한다.
+    _apply_cap_model_for_season(league, season_year_int)
 
 
 def ensure_contracts_bootstrapped_after_schedule_creation_once(state: dict) -> None:
