@@ -285,8 +285,6 @@ class DecisionContext:
     knobs: ValuationKnobs
     need_map: Dict[str, float]
 
-    # Structured policies (grouped view over knobs)
-    policies: Optional[Policies] = None
 
     # Hard constraints + context pass-through
     apron_status: ApronStatus
@@ -298,6 +296,9 @@ class DecisionContext:
 
     # Debug / explainability
     debug: Dict[str, Any] = field(default_factory=dict)
+
+    # Structured policies (grouped view over knobs)
+    policies: Optional[Policies] = None
 
 
 # ---------------------------------------------------------------------
@@ -369,9 +370,13 @@ def build_decision_context(
             f"provided={provided_tid!r} (norm={tid!r})",
             stacklevel=2,
         )
-    posture = getattr(team_situation, "trade_posture", "STAND_PAT")
-    horizon = getattr(team_situation, "time_horizon", "RE_TOOL")
-    tier = getattr(team_situation, "competitive_tier", "FRINGE")
+    # Normalize tokens defensively (supports Enum-like objects via .name)
+    _raw_posture = getattr(team_situation, "trade_posture", "STAND_PAT")
+    posture = str(getattr(_raw_posture, "name", _raw_posture) or "STAND_PAT").upper()
+    _raw_horizon = getattr(team_situation, "time_horizon", "RE_TOOL")
+    horizon = str(getattr(_raw_horizon, "name", _raw_horizon) or "RE_TOOL").upper()
+    _raw_tier = getattr(team_situation, "competitive_tier", "FRINGE")
+    tier = str(getattr(_raw_tier, "name", _raw_tier) or "FRINGE").upper()
     urgency = clamp01(getattr(team_situation, "urgency", 0.5))
 
     preferences = getattr(team_situation, "preferences", {}) or {}
@@ -389,7 +394,8 @@ def build_decision_context(
     cooldown_throttle = 1.0
     deadline_pressure = 0.0
     if constraints is not None:
-        apron_status = getattr(constraints, "apron_status", apron_status)
+        _raw_apron = getattr(constraints, "apron_status", apron_status)
+        apron_status = str(getattr(_raw_apron, "name", _raw_apron) or apron_status).upper()
         hard_flags = dict(getattr(constraints, "hard_flags", {}) or {})
         locks_count = int(getattr(constraints, "locks_count", 0) or 0)
         cooldown_active = bool(getattr(constraints, "cooldown_active", False))
