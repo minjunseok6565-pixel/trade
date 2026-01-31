@@ -1339,9 +1339,16 @@ class TeamSituationEvaluator:
 
         season_year = _safe_int(self.ctx.league_ctx.get("season_year"), None)
         if season_year is None:
-            # Project convention: season_year is "NBA season start year" (e.g., 2025 season spans into early 2026).
+            # Project convention: season_year is "NBA season start year" based on config.SEASON_START_MONTH.
+            # (e.g., season starting in Oct 2025 spans into early 2026)
             cd = self.ctx.current_date
-            season_year = int(cd.year if cd.month >= 7 else (cd.year - 1))
+            try:
+                from config import SEASON_START_MONTH
+                start_month = int(SEASON_START_MONTH or 10)
+            except Exception:
+                start_month = 10
+            season_year = int(cd.year if int(cd.month) >= start_month else (cd.year - 1))
+
 
         def salary_for_year(sby: Any, year: int) -> Optional[float]:
             if not isinstance(sby, dict):
