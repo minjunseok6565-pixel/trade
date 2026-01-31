@@ -995,6 +995,11 @@ def set_active_season_id(next_season_id: str) -> None:
         state["league"]["season_year"] = int(next_year)
         state["league"]["draft_year"] = int(next_year) + 1
 
+        # Re-apply cap/apron model on season transition when cap_auto_update is enabled.
+        # This keeps trade_rules.salary_cap/first_apron/second_apron aligned with the new season_year.
+        from state_modules import state_bootstrap
+        state_bootstrap.ensure_cap_model_populated_if_needed(state)
+
         _clear_master_schedule(state["league"])
 
     _mutate_state("set_active_season_id", _impl)
