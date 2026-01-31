@@ -346,6 +346,93 @@ async def api_playoffs_auto_advance_round(req: EmptyRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+ # -------------------------------------------------------------------------
+# 시즌 전환 (오프시즌 진입 / 정규시즌 시작)
+# -------------------------------------------------------------------------
+
+
+@app.post("/api/season/enter-offseason")
+async def api_enter_offseason(req: EmptyRequest):
+    """플레이오프 우승 확정 이후, 다음 시즌으로 전환하고 오프시즌(날짜 구간)으로 진입한다.
+
+    Design notes:
+    - SSOT 시즌 전환은 state.start_new_season(...) 하나로만 수행한다.
+    - 별도의 state.phase 키를 추가하지 않고, current_date를 오프시즌 날짜(예: 7/1)로 이동해
+      UI에서 '오프시즌 상태'를 표현할 수 있게 한다.
+    - 이후 오프시즌 세부 기능(드래프트/FA/재계약 등)은 이 구간에 엔드포인트를 추가하면 된다.
+    """
+    post = state.get_postseason_snapshot() or {}
+    champion = post.get("champion")
+    if not champion:
+        raise HTTPException(status_code=400, detail="Champion not decided yet.")
+
+    league_ctx = state.get_league_context_snapshot() or {}
+    try:
+        season_year = int(league_ctx.get("season_year") or 0)
+    except Exception:
+        season_year = 0
+    if season_year <= 0:
+        raise HTTPException(status_code=500, detail="Invalid season_year in state.")
+
+    next_year = season_year + 1
+
+    # SSOT season transition: contracts/cap/schedule/indices/postseason reset.
+    transition = state.start_new_season(
+        next_year,
+        rebuild_schedule=True,
+        run_offseason=True,
+    )
+
+    # Skeleton offseason: move to an offseason date window where there are no scheduled games.
+    offseason_start = f"{next_year}-07-01"
+    state.set_current_date(offseason_start)
+
+    # Best-effort UI cache rebuild (derived, non-authoritative).
+    try:
+        ui_cache_rebuild_all()
+    except Exception:
+        pass
+
+    # Re-read league context after transition.
+    league_after = state.get_league_context_snapshot() or {}
+    return {
+        "ok": True,
+        "prev_champion": champion,
+        "transition": transition,
+        "offseason_start": offseason_start,
+        "season_start": league_after.get("season_start"),
+        "season_year": league_after.get("season_year"),
+    }
+
+
+@app.post("/api/season/start-regular-season")
+async def api_start_regular_season(req: EmptyRequest):
+    """오프시즌(또는 임의 시점)에서 정규시즌 시작 직전으로 날짜를 이동한다.
+
+    IMPORTANT:
+    - advance_league_until()은 current_date+1부터 진행하므로, 개막일 게임을 스킵하지 않게
+      season_start '전날'로 세팅한다.
+    """
+    league_ctx = state.get_league_context_snapshot() or {}
+    season_start = league_ctx.get("season_start")
+    if not season_start:
+        raise HTTPException(status_code=500, detail="season_start is missing. Schedule not initialized?")
+
+    try:
+        ss = date.fromisoformat(str(season_start))
+    except ValueError:
+        raise HTTPException(status_code=500, detail=f"Invalid season_start format: {season_start}")
+
+    start_day_minus_1 = (ss - timedelta(days=1)).isoformat()
+    state.set_current_date(start_day_minus_1)
+
+    return {
+        "ok": True,
+        "current_date": state.get_current_date(),
+        "season_start": str(season_start),
+    }
+
+
 # -------------------------------------------------------------------------
 # 주간 뉴스 (LLM 요약)
 # -------------------------------------------------------------------------
@@ -820,6 +907,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
