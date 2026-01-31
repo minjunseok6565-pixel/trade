@@ -23,7 +23,9 @@ Design goals
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Mapping, Literal, List, Tuple
+from typing import Any, Dict, Optional, Mapping, Literal, List, Tuple, Callable
+
+import warnings
 
 
 # ---------------------------------------------------------------------
@@ -33,6 +35,27 @@ CompetitiveTier = Literal["CONTENDER", "PLAYOFF_BUYER", "FRINGE", "RESET", "REBU
 TradePosture = Literal["AGGRESSIVE_BUY", "SOFT_BUY", "STAND_PAT", "SOFT_SELL", "SELL"]
 TimeHorizon = Literal["WIN_NOW", "RE_TOOL", "REBUILD"]
 ApronStatus = Literal["BELOW_CAP", "OVER_CAP", "ABOVE_1ST_APRON", "ABOVE_2ND_APRON"]
+
+# ---------------------------------------------------------------------
+# "Reality vs philosophy" elasticity (borrowed from decision_context.py C)
+# ---------------------------------------------------------------------
+ELASTICITY_BY_TIER: Dict[str, float] = {
+    # Reality dominates on the extremes; philosophy dominates in the middle.
+    "CONTENDER": 0.25,
+    "PLAYOFF_BUYER": 0.35,
+    "FRINGE": 0.55,
+    "RESET": 0.65,
+    "REBUILD": 0.45,
+    "TANK": 0.25,
+}
+
+POSTURE_BUY_FACTOR: Dict[str, float] = {
+    "AGGRESSIVE_BUY": 1.00,
+    "SOFT_BUY": 0.65,
+    "STAND_PAT": 0.25,
+    "SOFT_SELL": 0.10,
+    "SELL": 0.00,
+}
 
 
 # ---------------------------------------------------------------------
@@ -44,6 +67,13 @@ def clamp01(x: float) -> float:
     except Exception:
         return 0.0
     return 0.0 if xf < 0.0 else 1.0 if xf > 1.0 else xf
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        xf = float(x)
+    except Exception:
+        return float(lo)
+    return float(lo) if xf < lo else float(hi) if xf > hi else xf
 
 def lerp(a: float, b: float, t: float) -> float:
     return float(a) + (float(b) - float(a)) * clamp01(t)
@@ -61,6 +91,35 @@ def _avg(vals: List[float]) -> float:
     if not vals:
         return 0.0
     return sum(vals) / max(1, len(vals))
+
+def normalize_team_id(team_id: str) -> str:
+    """Best-effort team id normalization.
+
+    - Tries to use schema.normalize_team_id if your project provides it.
+    - Falls back to upper-casing a stripped string.
+
+    This is intentionally conservative; keep any richer alias mapping in your
+    canonical schema layer if you have one.
+    """
+    raw = str(team_id or "").strip()
+    if not raw:
+        return ""
+
+    # Prefer project canonical normalizer if available.
+    try:
+        from schema import normalize_team_id as _normalize  # type: ignore
+    except Exception:
+        _normalize = None
+
+    if _normalize is not None:
+        try:
+            out = _normalize(raw)
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+        except Exception:
+            pass
+
+    return raw.upper()
 
 
 # ---------------------------------------------------------------------
@@ -131,6 +190,7 @@ class ValuationKnobs:
 
     # Fit / needs
     fit_scale: float
+    min_fit_threshold: float  # below this, apply strong penalty / veto candidate
 
     # Discounts / penalties
     risk_discount_scale: float
@@ -138,9 +198,67 @@ class ValuationKnobs:
 
     # Negotiation / acceptance
     min_surplus_required: float  # required net surplus for "accept" (positive means stricter)
+    overpay_budget: float        # allow up to -X (relative) for urgent win-now buys
+    counter_rate: float          # probability to counter instead of accept/reject
 
     # Relationship scaling
     relationship_scale: float
+
+
+# ---------------------------------------------------------------------
+# Output policies: a structured "view" over knobs for readability/maintenance.
+# (These are simple groupings; they do not add new behavior.)
+# ---------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class WeightsPolicy:
+    # Now vs future weighting + preference for future assets
+    w_now: float
+    w_future: float
+    pick_multiplier: float
+    youth_multiplier: float
+
+
+@dataclass(frozen=True, slots=True)
+class StarPolicy:
+    star_premium_exponent: float
+    consolidation_bias: float
+
+
+@dataclass(frozen=True, slots=True)
+class FitPolicy:
+    fit_scale: float
+    need_map: Dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class RiskPolicy:
+    risk_discount_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class FinancePolicy:
+    finance_penalty_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class NegotiationPolicy:
+    min_surplus_required: float
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipPolicy:
+    relationship_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class Policies:
+    weights: WeightsPolicy
+    star: StarPolicy
+    fit: FitPolicy
+    risk: RiskPolicy
+    finance: FinancePolicy
+    negotiation: NegotiationPolicy
+    relationship: RelationshipPolicy
 
 
 # ---------------------------------------------------------------------
@@ -167,11 +285,15 @@ class DecisionContext:
     knobs: ValuationKnobs
     need_map: Dict[str, float]
 
+    # Structured policies (grouped view over knobs)
+    policies: Optional[Policies] = None
+
     # Hard constraints + context pass-through
     apron_status: ApronStatus
     hard_flags: Dict[str, bool]
     locks_count: int
     cooldown_active: bool
+    cooldown_throttle: float
     deadline_pressure: float
 
     # Debug / explainability
@@ -186,6 +308,9 @@ def build_decision_context(
     team_situation: Any,
     gm_traits: GMTradeTraits,
     strength: Optional[Mapping[str, float]] = None,
+    team_id: Optional[str] = None,
+    warn_on_team_id_mismatch: bool = True,
+    team_id_normalizer: Optional[Callable[[str], str]] = None,
 ) -> DecisionContext:
     """
     Parameters
@@ -198,6 +323,14 @@ def build_decision_context(
     strength:
         Optional per-axis override for bias strength. Keys:
           win_now, pick, youth, star, fit, risk, fin, neg, rel
+
+    team_id:
+        Optional explicit team id. If provided, it is normalized and compared
+        against team_situation.team_id to catch wiring bugs.
+    warn_on_team_id_mismatch:
+        If True, emits a warning when normalized ids do not match.
+    team_id_normalizer:
+        Optional callable to normalize team ids (defaults to normalize_team_id).
 
     Returns
     -------
@@ -224,7 +357,18 @@ def build_decision_context(
                     pass
 
     # Pull required fields safely.
-    tid = str(getattr(team_situation, "team_id", ""))
+    raw_tid = str(getattr(team_situation, "team_id", "") or "")
+    provided_tid = str(team_id or raw_tid or "")
+    _norm = team_id_normalizer or normalize_team_id
+    tid = _norm(provided_tid)
+    raw_tid_norm = _norm(raw_tid) if raw_tid else ""
+
+    if warn_on_team_id_mismatch and raw_tid_norm and tid and raw_tid_norm != tid:
+        warnings.warn(
+            f"[decision_context] team_id mismatch: situation={raw_tid!r} (norm={raw_tid_norm!r}) vs "
+            f"provided={provided_tid!r} (norm={tid!r})",
+            stacklevel=2,
+        )
     posture = getattr(team_situation, "trade_posture", "STAND_PAT")
     horizon = getattr(team_situation, "time_horizon", "RE_TOOL")
     tier = getattr(team_situation, "competitive_tier", "FRINGE")
@@ -242,6 +386,7 @@ def build_decision_context(
     hard_flags: Dict[str, bool] = {}
     locks_count = 0
     cooldown_active = False
+    cooldown_throttle = 1.0
     deadline_pressure = 0.0
     if constraints is not None:
         apron_status = getattr(constraints, "apron_status", apron_status)
@@ -249,6 +394,34 @@ def build_decision_context(
         locks_count = int(getattr(constraints, "locks_count", 0) or 0)
         cooldown_active = bool(getattr(constraints, "cooldown_active", False))
         deadline_pressure = clamp01(float(getattr(constraints, "deadline_pressure", 0.0) or 0.0))
+
+    cooldown_throttle = 0.55 if cooldown_active else 1.0
+
+    # -----------------------------------------------------------------
+    # Elasticity: shrink/expand how much GM traits can tilt reality.
+    # - Extremes (CONTENDER/TANK) -> reality dominates (lower e)
+    # - Middle tiers -> GM philosophy shows more (higher e)
+    # - Urgency/deadline -> reality dominates more (traits matter less)
+    # -----------------------------------------------------------------
+    e0 = float(ELASTICITY_BY_TIER.get(tier, 0.55))
+    e = e0 * (0.92 - 0.35 * urgency) * (0.95 - 0.25 * deadline_pressure)
+    e = clamp(e, 0.15, 0.70)
+
+    # Axis-specific multipliers (borrowed from C) to keep behavior sane:
+    # - star is more "philosophy" (slightly less situational)
+    # - finance tends to be more rigid (slightly more situational)
+    axis_mul = {
+        "win_now": 1.00,
+        "pick": 0.85,
+        "youth": 0.85,
+        "star": 0.70,
+        "fit": 0.85,
+        "risk": 0.75,
+        "fin": 0.90,
+        "neg": 0.70,
+        "rel": 0.70,
+    }
+    s_eff = {k: float(s[k]) * e * float(axis_mul.get(k, 1.0)) for k in s}
 
     signals = getattr(team_situation, "signals", None)
     star_power = 0.5
@@ -298,7 +471,7 @@ def build_decision_context(
         win_now_base -= 0.08
     win_now_base += 0.10 * urgency
     win_now_base = clamp01(win_now_base)
-    eff_win_now = apply_bias(win_now_base, gm_traits.competitive_window, strength=s["win_now"])
+    eff_win_now = apply_bias(win_now_base, gm_traits.competitive_window, strength=s_eff["win_now"])
 
     # 2) Pick preference effective
     pick_base = p_picks
@@ -307,7 +480,7 @@ def build_decision_context(
     if eff_win_now > 0.75:
         pick_base -= 0.10
     pick_base = clamp01(pick_base)
-    eff_pick_pref = apply_bias(pick_base, gm_traits.pick_preference, strength=s["pick"])
+    eff_pick_pref = apply_bias(pick_base, gm_traits.pick_preference, strength=s_eff["pick"])
 
     # 3) Youth bias effective
     age_youth = clamp01((29.0 - float(core_age)) / 8.0)  # ~21..29
@@ -315,23 +488,23 @@ def build_decision_context(
     youth_base = 0.40 * age_youth + 0.35 * young_core + 0.25 * horizon_boost
     youth_base -= 0.15 * eff_win_now
     youth_base = clamp01(youth_base)
-    eff_youth_bias = apply_bias(youth_base, gm_traits.youth_core_preference, strength=s["youth"])
+    eff_youth_bias = apply_bias(youth_base, gm_traits.youth_core_preference, strength=s_eff["youth"])
 
     # 4) Star focus effective
     star_need = clamp01(0.85 - star_power)  # lack of star -> higher need
     star_base = 0.35 * star_need + 0.35 * eff_win_now + 0.15 * (1.0 if posture in ("AGGRESSIVE_BUY", "SOFT_BUY") else 0.0) + 0.15 * urgency
     star_base = clamp01(star_base)
-    eff_star_focus = apply_bias(star_base, gm_traits.star_focus, strength=s["star"])
+    eff_star_focus = apply_bias(star_base, gm_traits.star_focus, strength=s_eff["star"])
 
     # 5) Fit strictness effective
     fit_base = 0.55 * need_intensity + 0.25 * (1.0 - role_fit_health) + 0.20 * (1.0 if posture in ("AGGRESSIVE_BUY", "SOFT_BUY") else 0.0)
     fit_base = clamp01(fit_base)
-    eff_fit_strict = apply_bias(fit_base, gm_traits.system_fit_priority, strength=s["fit"])
+    eff_fit_strict = apply_bias(fit_base, gm_traits.system_fit_priority, strength=s_eff["fit"])
 
     # 6) Risk tolerance effective (more rebuild -> more tolerant, more urgent -> less tolerant)
     risk_base = 0.55 * (1.0 - eff_win_now) + 0.25 * (1.0 if horizon == "REBUILD" else 0.0) - 0.20 * urgency
     risk_base = clamp01(risk_base)
-    eff_risk_tol = apply_bias(risk_base, gm_traits.risk_tolerance, strength=s["risk"])
+    eff_risk_tol = apply_bias(risk_base, gm_traits.risk_tolerance, strength=s_eff["risk"])
 
     # 7) Financial conservatism effective
     apron_severity = 0.10
@@ -349,7 +522,7 @@ def build_decision_context(
         cap_pressure = 0.0
     fin_base = 0.45 * p_cap_flex + 0.35 * apron_severity + 0.20 * cap_pressure
     fin_base = clamp01(fin_base)
-    eff_fin_cons = apply_bias(fin_base, gm_traits.financial_conservatism, strength=s["fin"])
+    eff_fin_cons = apply_bias(fin_base, gm_traits.financial_conservatism, strength=s_eff["fin"])
     if apron_status == "ABOVE_2ND_APRON":
         eff_fin_cons = max(eff_fin_cons, 0.75)  # guardrail
 
@@ -364,12 +537,12 @@ def build_decision_context(
     # If key expirings exist, re-sign pressure tends to reduce toughness (need to decide soon).
     neg_base -= 0.10 * re_sign_pressure
     neg_base = clamp01(neg_base)
-    eff_neg_tough = apply_bias(neg_base, gm_traits.negotiation_toughness, strength=s["neg"])
+    eff_neg_tough = apply_bias(neg_base, gm_traits.negotiation_toughness, strength=s_eff["neg"])
 
     # 9) Relationship sensitivity effective
     rel_base = 0.50 + (0.15 if cooldown_active else 0.0)
     rel_base = clamp01(rel_base)
-    eff_rel_sens = apply_bias(rel_base, gm_traits.relationship_sensitivity, strength=s["rel"])
+    eff_rel_sens = apply_bias(rel_base, gm_traits.relationship_sensitivity, strength=s_eff["rel"])
 
     effective = EffectiveTraits(
         eff_win_now=eff_win_now,
@@ -397,6 +570,8 @@ def build_decision_context(
     consolidation_bias = eff_star_focus
 
     fit_scale = lerp(0.60, 1.80, eff_fit_strict)
+    # Fit gate threshold: stricter fit => higher minimum threshold
+    min_fit_threshold = lerp(0.45, 0.70, eff_fit_strict)
 
     # Higher risk tolerance -> smaller discount
     risk_discount_scale = lerp(0.35, 0.08, eff_risk_tol)
@@ -412,6 +587,14 @@ def build_decision_context(
         min_surplus_required -= 0.02
     min_surplus_required = float(min_surplus_required)
 
+    # Overpay budget / counter rate (from C, adapted to dc2)
+    buy_factor = float(POSTURE_BUY_FACTOR.get(posture, 0.25))
+    overpay_budget = 0.18 * eff_win_now * urgency * buy_factor * (1.0 - 0.45 * eff_neg_tough)
+    overpay_budget = clamp(overpay_budget, 0.0, 0.22)
+
+    counter_rate = lerp(0.35, 0.80, eff_neg_tough) * lerp(1.0, 0.70, urgency)
+    counter_rate = clamp(counter_rate, 0.10, 0.95)
+
     relationship_scale = lerp(0.0, 1.5, eff_rel_sens)
 
     knobs = ValuationKnobs(
@@ -422,13 +605,46 @@ def build_decision_context(
         star_premium_exponent=star_premium_exponent,
         consolidation_bias=consolidation_bias,
         fit_scale=fit_scale,
+        min_fit_threshold=min_fit_threshold,
         risk_discount_scale=risk_discount_scale,
         finance_penalty_scale=finance_penalty_scale,
         min_surplus_required=min_surplus_required,
+        overpay_budget=float(overpay_budget),
+        counter_rate=float(counter_rate),
         relationship_scale=relationship_scale,
     )
 
+    policies = Policies(
+        weights=WeightsPolicy(
+            w_now=w_now,
+            w_future=w_future,
+            pick_multiplier=pick_multiplier,
+            youth_multiplier=youth_multiplier,
+        ),
+        star=StarPolicy(
+            star_premium_exponent=star_premium_exponent,
+            consolidation_bias=consolidation_bias,
+        ),
+        fit=FitPolicy(
+            fit_scale=fit_scale,
+            need_map=dict(need_map),
+        ),
+        risk=RiskPolicy(
+            risk_discount_scale=risk_discount_scale,
+        ),
+        finance=FinancePolicy(
+            finance_penalty_scale=finance_penalty_scale,
+        ),
+        negotiation=NegotiationPolicy(
+            min_surplus_required=min_surplus_required,
+        ),
+        relationship=RelationshipPolicy(
+            relationship_scale=relationship_scale,
+        ),
+    )
+
     debug: Dict[str, Any] = {
+        "team_id": {"situation": raw_tid, "provided": provided_tid, "normalized": tid},
         "base_preferences": {"WIN_NOW": p_win_now, "PICKS": p_picks, "CAP_FLEX": p_cap_flex},
         "need_intensity": need_intensity,
         "star_power": star_power,
@@ -443,6 +659,10 @@ def build_decision_context(
         "payroll": payroll,
         "cap_pressure": cap_pressure,
         "strength": dict(s),
+        "elasticity": {"base": e0, "final": e, "tier": tier},
+        "strength_effective": dict(s_eff),
+        "overpay_budget": overpay_budget,
+        "counter_rate": counter_rate,
     }
 
     return DecisionContext(
@@ -456,10 +676,12 @@ def build_decision_context(
         effective_traits=effective,
         knobs=knobs,
         need_map=need_map,
+        policies=policies,
         apron_status=apron_status,
         hard_flags=hard_flags,
         locks_count=locks_count,
         cooldown_active=cooldown_active,
+        cooldown_throttle=float(cooldown_throttle),
         deadline_pressure=deadline_pressure,
         debug=debug,
     )
