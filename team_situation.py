@@ -776,8 +776,14 @@ class TeamSituationEvaluator:
         expiring = 0
         matchable = 0
         if season_year is not None:
-            for pid in self._team_player_ids_from_contracts(team_id):
-                rem = self._remaining_years_for_player(pid, season_year)
+            # Count expiring deals among *current roster players* only.
+            for p in self._get_roster(team_id, roster)[:15]:
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("player_id")
+                if not pid:
+                    continue
+                rem = self._remaining_years_for_player(str(pid), int(season_year))
                 if rem == 1:
                     expiring += 1
         # from roster salaries if DB accessible
@@ -1205,17 +1211,29 @@ class TeamSituationEvaluator:
     # ------------------------
 
     def _team_player_ids_from_contracts(self, team_id: str) -> List[str]:
+        
+        """Return current-team player ids using the active contract index.
+
+        The contract ledger includes inactive/history rows, so we must not scan all contracts by team_id.
+        """
+
+        team_id = str(team_id).upper()
         ledger = self.ctx.contract_ledger or {}
+        active_by_player = ledger.get("active_contract_id_by_player", {}) or {}
         contracts = ledger.get("contracts", {}) or {}
         out: List[str] = []
-        for c in contracts.values():
+
+        if not isinstance(active_by_player, dict) or not isinstance(contracts, dict):
+            return out
+
+        for pid_s, cid in active_by_player.items():
+            c = contracts.get(str(cid))
             if not isinstance(c, dict):
                 continue
             if str(c.get("team_id", "")).upper() != team_id:
                 continue
-            pid = c.get("player_id")
-            if pid:
-                out.append(str(pid))
+            if pid_s:
+                out.append(str(pid_s))
         return out
 
     def _remaining_years_for_player(self, player_id: str, season_year: int) -> Optional[int]:
@@ -1303,43 +1321,78 @@ class TeamSituationEvaluator:
         }
 
     def _compute_payroll_from_contracts_or_roster(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> float:
-        # Prefer contract ledger if available (SSOT)
+        """Compute current-team payroll safely.
+
+        Invariants:
+          - Only count *current roster players*.
+          - Only use each player's *active contract* (if available).
+          - Never fall back to "max of any year" salary (can inflate payroll when old/inactive contracts remain).
+        """
+        team_id = str(team_id).upper()
+
+        # Ensure we have current roster (SSOT for team membership).
+        roster_rows = self._get_roster(team_id, roster)
+
         ledger = self.ctx.contract_ledger or {}
         contracts = ledger.get("contracts", {}) or {}
-        if isinstance(contracts, dict) and contracts:
-            season_year = _safe_int(self.ctx.league_ctx.get("season_year"), None)
-            total = 0.0
-            for c in contracts.values():
+        active_by_player = ledger.get("active_contract_id_by_player", {}) or {}
+
+        season_year = _safe_int(self.ctx.league_ctx.get("season_year"), None)
+        if season_year is None:
+            # Project convention: season_year is "NBA season start year" (e.g., 2025 season spans into early 2026).
+            cd = self.ctx.current_date
+            season_year = int(cd.year if cd.month >= 7 else (cd.year - 1))
+
+        def salary_for_year(sby: Any, year: int) -> Optional[float]:
+            if not isinstance(sby, dict):
+                return None
+            val = None
+            if str(year) in sby:
+                val = sby.get(str(year))
+            elif year in sby:
+                val = sby.get(year)
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        total = 0.0
+
+        # Primary path: roster players -> their active contract salary for this season.
+        for p in roster_rows:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("player_id")
+            if not pid:
+                continue
+            pid_s = str(pid)
+            sal = None
+            cid = active_by_player.get(pid_s) if isinstance(active_by_player, dict) else None
+            if cid and isinstance(contracts, dict):
+                c = contracts.get(str(cid))
+                if isinstance(c, dict) and str(c.get("team_id", "")).upper() == team_id:
+                    sal = salary_for_year(c.get("salary_by_year") or {}, int(season_year))
+
+            if sal is None:
+                # Safe fallback: roster salary_amount reflects current-team salary in this project.
+                sal = _safe_float(p.get("salary"), 0.0)
+
+            total += _safe_float(sal, 0.0)
+
+        # If roster is empty (DB unavailable), fall back to active contracts by team (still avoids inactive-history inflation).
+        if not roster_rows and isinstance(contracts, dict) and isinstance(active_by_player, dict) and contracts:
+            for _pid_s, cid in active_by_player.items():
+                c = contracts.get(str(cid))
                 if not isinstance(c, dict):
                     continue
                 if str(c.get("team_id", "")).upper() != team_id:
                     continue
-                # pick current season salary
-                sal = None
-                sby = c.get("salary_by_year") or {}
-                if season_year is not None and isinstance(sby, dict):
-                    if str(season_year) in sby:
-                        sal = sby.get(str(season_year))
-                    elif season_year in sby:
-                        sal = sby.get(season_year)
-                if sal is None:
-                    # fallback: try any numeric, take max
-                    try:
-                        sal = max(float(v) for v in sby.values() if v is not None)
-                    except Exception:
-                        sal = 0.0
+                sal = salary_for_year(c.get("salary_by_year") or {}, int(season_year))
                 total += _safe_float(sal, 0.0)
-            return float(total)
 
-        # Fallback: roster salaries
-        if roster is None:
-            roster = []
-            try:
-                roster = self._get_roster(team_id)
-            except Exception:
-                roster = []
-        return float(sum(_safe_float(p.get("salary"), 0.0) for p in roster if isinstance(p, dict)))
-
+        return float(total)
 
     def _count_team_related_locks(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> int:
         locks = self.ctx.asset_locks or {}
