@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Literal
 
 import logging
 import math
+from role_need_tags import role_to_need_tag
 
 from schema import normalize_team_id, normalize_player_id
 import state
@@ -987,7 +988,7 @@ class TeamSituationEvaluator:
 
             # needs for weak roles
             if g in ("C", "D"):
-                tag, label = _role_to_need_tag(role)
+                tag, label = role_to_need_tag(role)
                 weight = _clamp((62.0 - best_fit) / 25.0, 0.15, 1.0) if best_fit < 62.0 else 0.15
                 needs.append(
                     TeamNeed(
@@ -1705,51 +1706,6 @@ def _cooldown_active(trade_market: Mapping[str, Any], team_id: str) -> bool:
         return False
     except Exception:
         return False
-
-
-def _role_to_need_tag(role: str) -> Tuple[str, str]:
-    """Map internal role-fit role names to stable need tags and Korean labels.
-
-    role_fit_data.ROLE_FIT_WEIGHTS defines the canonical 12 roles:
-      - Connector_Playmaker, Initiator_Primary, Initiator_Secondary, Pop_Spacer_Big,
-        Post_Hub, Rim_Attacker, Roller_Finisher, ShortRoll_Playmaker, Shot_Creator,
-        Spacer_CatchShoot, Spacer_Movement, Transition_Handler
-
-    We keep a few legacy aliases too (for safety).
-    """
-    mapping = {
-        # Canonical 12 roles (match role_fit_data.py)
-        "Initiator_Primary": ("PRIMARY_INITIATOR", "1옵션 볼핸들러"),
-        "Initiator_Secondary": ("SECONDARY_CREATOR", "세컨더리 크리에이터"),
-        "Transition_Handler": ("TRANSITION_ENGINE", "트랜지션 핸들러"),
-        "Shot_Creator": ("SHOT_CREATION", "샷 크리에이터"),
-        "Rim_Attacker": ("RIM_PRESSURE", "림 어택/드라이브 자원"),
-        "Spacer_CatchShoot": ("SPACING", "캐치&슛 스페이서"),
-        "Spacer_Movement": ("MOVEMENT_SHOOTING", "무브먼트 슈터"),
-        "Connector_Playmaker": ("CONNECTOR_PLAY", "커넥터 플레이메이커"),
-        "Roller_Finisher": ("ROLL_THREAT", "롤/림런 피니셔"),
-        "ShortRoll_Playmaker": ("SHORT_ROLL_PLAY", "숏롤 플레이메이커"),
-        "Pop_Spacer_Big": ("POP_BIG", "팝 스페이서 빅"),
-        "Post_Hub": ("POST_HUB", "포스트 허브"),
-
-        # Legacy/alias safety
-        "Spotup_Shooter": ("SPACING", "스팟업 슈터"),
-        "Movement_Shooter": ("MOVEMENT_SHOOTING", "오프볼 슈터"),
-        "Cutter_Slasher": ("RIM_PRESSURE", "림 어택/컷터"),
-        "Roller": ("ROLL_THREAT", "롤 위협"),
-        "ShortRoll": ("SHORT_ROLL_PLAY", "숏롤"),
-        "Post_Anchor": ("POST_HUB", "포스트 옵션"),
-    }
-    if role in mapping:
-        return mapping[role]
-    # fallback heuristic
-    if "Def" in role or "def" in role:
-        return ("DEFENSE", "수비 자원")
-    if "Shooter" in role:
-        return ("SPACING", "슈팅")
-    if "Rim" in role or "Roll" in role:
-        return ("RIM_PRESSURE", "림 근처 위협")
-    return ("ROLE_GAP", "역할")
 
 
 def _dedupe_needs(needs: List[TeamNeed]) -> List[TeamNeed]:
