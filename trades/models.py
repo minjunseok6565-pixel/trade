@@ -63,6 +63,35 @@ def asset_key(asset: Asset) -> str:
     return f"fixed_asset:{asset.asset_id}"
 
 
+def resolve_asset_receiver(deal: Deal, sender_team: str, asset: Asset) -> str:
+    """Resolve which team receives an asset in a Deal.
+
+    Rules:
+      - If asset.to_team is set, use it.
+      - If the deal has exactly 2 teams, the receiver is the other team.
+      - Otherwise (multi-team deal), to_team must be present.
+
+    Notes:
+      - This is intentionally kept in trades.models as a shared utility so that
+        agreements/apply/valuation can agree on a single resolution rule.
+      - Hard validation for missing to_team in multi-team deals is already enforced
+        by parse_deal(), but this function is defensive for callers that may operate
+        on older/constructed Deal objects.
+    """
+    to_team = getattr(asset, "to_team", None)
+    if to_team:
+        return str(to_team)
+    if len(deal.teams) == 2:
+        other_team = [team for team in deal.teams if team != sender_team]
+        if other_team:
+            return str(other_team[0])
+    raise TradeError(
+        MISSING_TO_TEAM,
+        "Missing to_team for multi-team deal asset",
+        {"sender_team": sender_team, "asset": asset_key(asset)},
+    )
+
+
 def _normalize_protection(raw: Dict[str, Any]) -> Dict[str, Any]:
     protection_type = raw.get("type", raw.get("rule"))
     if not isinstance(protection_type, str):
