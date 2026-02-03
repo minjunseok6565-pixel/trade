@@ -26,21 +26,12 @@ from .models import (
     PlayerAsset,
     SwapAsset,
     asset_key,
+    resolve_asset_receiver,
     canonicalize_deal,
     parse_deal,
     serialize_deal,
 )
 from .validator import validate_deal
-
-
-def _resolve_receiver(deal: Deal, sender_team: str, asset: PlayerAsset) -> str:
-    if asset.to_team:
-        return asset.to_team
-    if len(deal.teams) == 2:
-        other_team = [team for team in deal.teams if team != sender_team]
-        if other_team:
-            return other_team[0]
-    raise ValueError("Missing to_team for multi-team deal asset")
 
 
 def _compute_assets_hash(deal: Deal) -> str:
@@ -71,7 +62,7 @@ def _compute_assets_hash(deal: Deal) -> str:
                         raise ValueError(
                             f"Player {asset.player_id} not owned by {from_team_id} (current: {current_team_id})"
                         )
-                    to_team_id = str(normalize_team_id(_resolve_receiver(deal, team_id, asset), strict=True))
+                    to_team_id = str(normalize_team_id(resolve_asset_receiver(deal, team_id, asset), strict=True))
                     salary_amount = repo.get_salary_amount(pid)
                     player_snapshots.append(
                         {
