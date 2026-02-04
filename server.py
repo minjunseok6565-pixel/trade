@@ -155,6 +155,11 @@ class TradeNegotiationCommitRequest(BaseModel):
     session_id: str
     deal: Dict[str, Any]
 
+class TradeEvaluateRequest(BaseModel):
+    deal: Dict[str, Any]
+    team_id: str
+    include_breakdown: bool = True
+
 
 # -------------------------------------------------------------------------
 # Contracts / Roster Write API models
@@ -736,7 +741,7 @@ async def api_trade_negotiation_start(req: TradeNegotiationStartRequest):
 async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
     try:
         in_game_date = state.get_current_date_as_date()
-        state.get_db_path()
+        db_path = state.get_db_path()
         session = negotiation_store.get_session(req.session_id)
         deal = canonicalize_deal(parse_deal(req.deal))
         team_ids = {session["user_team_id"].upper(), session["other_team_id"].upper()}
@@ -747,21 +752,159 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
                 {"session_id": req.session_id, "teams": deal.teams},
             )
         validate_deal(deal, current_date=in_game_date)
-        committed = agreements.create_committed_deal(
-            deal,
-            valid_days=2,
-            current_date=in_game_date,
-        )
+        
+        # Always persist the latest valid offer payload
         negotiation_store.set_draft_deal(req.session_id, serialize_deal(deal))
-        negotiation_store.set_committed(req.session_id, committed["deal_id"])
+
+        # ------------------------------------------------------------------
+        # AI evaluation (other team perspective)
+        # NOTE:
+        # - legality is already checked by validate_deal above
+        # - valuation service will build DecisionContext internally (team_situation + gm profile)
+        # ------------------------------------------------------------------
+        other_team_id = session["other_team_id"].upper()
+
+        # Local imports to keep integration flexible.
+        from trades.valuation.service import evaluate_deal_for_team as eval_service  # type: ignore
+        from trades.valuation.types import to_jsonable, DealVerdict  # type: ignore
+
+        decision, evaluation = eval_service(
+            deal=deal,
+            team_id=other_team_id,
+            current_date=in_game_date,
+            db_path=db_path,
+            include_breakdown=False,   # keep negotiation response light
+            include_package_effects=True,
+            allow_counter=True,
+            validate=False,            # already validated above
+        )
+
+        eval_summary = {
+            "team_id": other_team_id,
+            "incoming_total": float(evaluation.incoming_total),
+            "outgoing_total": float(evaluation.outgoing_total),
+            "net_surplus": float(evaluation.net_surplus),
+            "surplus_ratio": float(evaluation.surplus_ratio),
+        }
+
+        # Record AI response in-session for debugging / UI explanations
+        try:
+            negotiation_store.set_last_counter(
+                req.session_id,
+                {
+                    "verdict": to_jsonable(decision.verdict),
+                    "decision": to_jsonable(decision),
+                    "evaluation": eval_summary,
+                },
+            )
+        except Exception:
+            # Session logging failure should not crash commit flow
+            pass
+
+        # Decide action
+        verdict = decision.verdict
+
+        if verdict == DealVerdict.ACCEPT:
+            committed = agreements.create_committed_deal(
+                deal,
+                valid_days=2,
+                current_date=in_game_date,
+            )
+            negotiation_store.set_committed(req.session_id, committed["deal_id"])
+            return {
+                "ok": True,
+                "accepted": True,
+                "deal_id": committed["deal_id"],
+                "expires_at": committed["expires_at"],
+                "deal": serialize_deal(deal),
+                "ai_verdict": to_jsonable(decision.verdict),
+                "ai_decision": to_jsonable(decision),
+                "ai_evaluation": eval_summary,
+            }
+
+        # COUNTER is not implemented yet -> treat as reject (or return explicit marker)
+        counter_unimplemented = (verdict == DealVerdict.COUNTER)
+
+        # Build a short reason string for UI
+        try:
+            reason_lines = []
+            for r in (decision.reasons or [])[:4]:
+                if isinstance(r, dict):
+                    msg = r.get("message") or r.get("code") or ""
+                else:
+                    msg = getattr(r, "message", None) or getattr(r, "code", None) or ""
+                if msg:
+                    reason_lines.append(str(msg))
+            reason_text = " | ".join(reason_lines) if reason_lines else "AI rejected the offer."
+        except Exception:
+            reason_text = "AI rejected the offer."
+
+        # Record rejection in session (message + phase)
+        try:
+            negotiation_store.append_message(
+                req.session_id,
+                speaker="OTHER_GM",
+                text=f"[{other_team_id}] {verdict}: {reason_text}",
+            )
+            negotiation_store.set_phase(req.session_id, "REJECTED" if not counter_unimplemented else "COUNTER_PENDING")
+        except Exception:
+            pass
+
         return {
             "ok": True,
-            "deal_id": committed["deal_id"],
-            "expires_at": committed["expires_at"],
+            "accepted": False,
+            "counter_unimplemented": bool(counter_unimplemented),
             "deal": serialize_deal(deal),
+            "ai_verdict": to_jsonable(decision.verdict),
+            "ai_decision": to_jsonable(decision),
+            "ai_evaluation": eval_summary,
         }
     except TradeError as exc:
         return _trade_error_response(exc)
+
+
+@app.post("/api/trade/evaluate")
+async def api_trade_evaluate(req: TradeEvaluateRequest):
+    """
+    Debug endpoint: evaluate a proposed deal from a single team's perspective.
+    Flow:
+      deal = canonicalize_deal(parse_deal(req.deal))
+      validate_deal(deal, current_date=in_game_date)
+      trades.valuation.service.evaluate_deal_for_team(...)
+      return decision + breakdown
+    """
+    try:
+        in_game_date = state.get_current_date_as_date()
+        db_path = state.get_db_path()
+
+        deal = canonicalize_deal(parse_deal(req.deal))
+        validate_deal(deal, current_date=in_game_date)
+
+        # Local import to avoid hard dependency during incremental integration.
+        from trades.valuation.service import evaluate_deal_for_team as eval_service  # type: ignore
+        from trades.valuation.types import to_jsonable  # type: ignore
+
+        decision, evaluation = eval_service(
+            deal=deal,
+            team_id=req.team_id,
+            current_date=in_game_date,
+            db_path=db_path,
+            include_breakdown=bool(req.include_breakdown),
+            # We already validated above; avoid duplicate validate_deal in service.
+            validate=False,
+        )
+
+        return {
+            "ok": True,
+            "team_id": str(req.team_id).upper(),
+            "deal": serialize_deal(deal),
+            "decision": to_jsonable(decision),
+            "evaluation": to_jsonable(evaluation),
+        }
+    except TradeError as exc:
+        return _trade_error_response(exc)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trade evaluation failed: {exc}")
 
 
 # -------------------------------------------------------------------------
@@ -908,6 +1051,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
