@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from schema import normalize_team_id
 
-from ...errors import MISSING_TO_TEAM, ROSTER_LIMIT, TradeError
-from ...models import PlayerAsset
+from ...errors import ROSTER_LIMIT, TradeError
+from ...models import PlayerAsset, resolve_asset_receiver
 from ..base import TradeContext
 
 
@@ -24,7 +24,7 @@ class RosterLimitRule:
                 if not isinstance(asset, PlayerAsset):
                     continue
                 players_out[team_id] += 1
-                receiver = self._resolve_receiver(deal, team_id, asset)
+                receiver = resolve_asset_receiver(deal, team_id, asset)
                 players_in[receiver] += 1
 
         for team_id in deal.teams:
@@ -37,17 +37,3 @@ class RosterLimitRule:
                     "Roster limit exceeded",
                     {"team_id": team_id, "count": new_count},
                 )
-
-    @staticmethod
-    def _resolve_receiver(deal, sender_team: str, asset: PlayerAsset) -> str:
-        if asset.to_team:
-            return asset.to_team
-        if len(deal.teams) == 2:
-            other_team = [team for team in deal.teams if team != sender_team]
-            if other_team:
-                return other_team[0]
-        raise TradeError(
-            MISSING_TO_TEAM,
-            "Missing to_team for multi-team deal asset",
-            {"team_id": sender_team, "asset": asset},
-        )
