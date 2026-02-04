@@ -27,7 +27,9 @@ class Rule(Protocol):
 
 
 def build_player_moves(deal: Any) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    from ..models import PlayerAsset
+    # SSOT for receiver resolution lives in trades.models.resolve_asset_receiver
+    # (Do not duplicate receiver inference logic in rules.)
+    from ..models import PlayerAsset, resolve_asset_receiver
 
     players_out: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
     players_in: dict[str, list[str]] = {team_id: [] for team_id in deal.teams}
@@ -38,7 +40,7 @@ def build_player_moves(deal: Any) -> tuple[dict[str, list[str]], dict[str, list[
                 continue
             player_id = _normalize_player_id(asset.player_id)
             players_out[team_id].append(player_id)
-            receiver = _resolve_receiver(deal, team_id, asset)
+            receiver = resolve_asset_receiver(deal, team_id, asset)
             players_in[receiver].append(player_id)
 
     return players_out, players_in
@@ -104,22 +106,6 @@ def build_team_payrolls(
         }
 
     return payrolls
-
-
-def _resolve_receiver(deal: Any, sender_team: str, asset: Any) -> str:
-    if getattr(asset, "to_team", None):
-        return asset.to_team
-    if len(deal.teams) == 2:
-        other_team = [team for team in deal.teams if team != sender_team]
-        if other_team:
-            return other_team[0]
-    from ..errors import MISSING_TO_TEAM, TradeError
-
-    raise TradeError(
-        MISSING_TO_TEAM,
-        "Missing to_team for multi-team deal asset",
-        {"team_id": sender_team, "asset": asset},
-    )
 
 
 def build_trade_context(
