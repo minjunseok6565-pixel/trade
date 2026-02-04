@@ -7,7 +7,7 @@ from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
 
 from .errors import APPLY_FAILED, TradeError
-from .models import Deal, PlayerAsset
+from .models import Deal, PlayerAsset, resolve_asset_receiver
 
 
 @dataclass(frozen=True)
@@ -15,16 +15,6 @@ class _PlayerMove:
     player_id: str
     from_team: str
     to_team: str
-
-
-def _resolve_receiver(deal: Deal, sender_team: str, asset: Any) -> str:
-    if asset.to_team:
-        return asset.to_team
-    if len(deal.teams) == 2:
-        other_team = [team for team in deal.teams if team != sender_team]
-        if other_team:
-            return other_team[0]
-    raise TradeError(APPLY_FAILED, "Missing to_team for multi-team deal asset")
 
 
 def _normalize_player_id_str(value: Any) -> str:
@@ -47,7 +37,20 @@ def _collect_player_moves(deal: Deal) -> list[_PlayerMove]:
             if player_id in seen:
                 raise ValueError(f"duplicate player in trade assets: {player_id}")
             seen.add(player_id)
-            to_team = _resolve_receiver(deal, normalized_from_team, asset)
+            try:
+                to_team = resolve_asset_receiver(deal, normalized_from_team, asset)
+            except TradeError as exc:
+                # Preserve apply-layer error semantics.
+                raise TradeError(
+                    APPLY_FAILED,
+                    "Failed to resolve asset receiver",
+                    {
+                        "sender_team": normalized_from_team,
+                        "player_id": player_id,
+                        "asset_to_team": getattr(asset, "to_team", None),
+                        "cause_code": getattr(exc, "code", None),
+                    },
+                ) from exc
             normalized_to_team = _normalize_team_id_str(to_team)
             moves.append(
                 _PlayerMove(
