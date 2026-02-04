@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from ...errors import DEAL_INVALIDATED, MISSING_TO_TEAM, TradeError
-from ...models import PickAsset
+from ...errors import DEAL_INVALIDATED, TradeError
+from ...models import PickAsset, resolve_asset_receiver
 from ..base import TradeContext
 
 
@@ -94,7 +94,7 @@ class PickRulesRule:
             for asset in assets:
                 if not isinstance(asset, PickAsset):
                     continue
-                receiver = _resolve_receiver(deal, team_id, asset)
+                receiver = resolve_asset_receiver(deal, team_id, asset)
                 owner_after[asset.pick_id] = _norm_team_id(receiver)
 
         if stepien_lookahead <= 0:
@@ -131,20 +131,6 @@ class PickRulesRule:
                             "data_max_first_round_year": max_first_round_year_in_data,
                         },
                     )
-
-
-def _resolve_receiver(deal, team_id: str, asset: PickAsset) -> str:
-    if asset.to_team:
-        return asset.to_team
-    if len(deal.teams) == 2:
-        other_team = [team for team in deal.teams if team != team_id]
-        if other_team:
-            return other_team[0]
-    raise TradeError(
-        MISSING_TO_TEAM,
-        "Missing to_team for multi-team deal asset",
-        {"team_id": team_id, "asset": asset},
-    )
 
 
 def _count_first_round_picks_for_year(
