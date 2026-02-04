@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from schema import normalize_player_id
 
-from ...errors import DEAL_INVALIDATED, MISSING_TO_TEAM, TradeError
-from ...models import PlayerAsset
+from ...errors import DEAL_INVALIDATED, TradeError
+from ...models import PlayerAsset, resolve_asset_receiver
 from ..base import TradeContext
 
 
@@ -25,7 +25,7 @@ class ReturnToTradingTeamRule:
             for asset in assets:
                 if not isinstance(asset, PlayerAsset):
                     continue
-                to_team = _resolve_receiver(deal, from_team, asset)
+                to_team = resolve_asset_receiver(deal, from_team, asset)
                 to_team_u = str(to_team).upper()
                 pid = _canonical_player_id(asset.player_id)
                 if pid not in players:
@@ -96,16 +96,3 @@ def _require_season_year(ctx: TradeContext) -> int:
 def _canonical_player_id(value: object) -> str:
     return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
 
-
-def _resolve_receiver(deal, team_id: str, asset: PlayerAsset) -> str:
-    if asset.to_team:
-        return asset.to_team
-    if len(deal.teams) == 2:
-        other_team = [team for team in deal.teams if team != team_id]
-        if other_team:
-            return other_team[0]
-    raise TradeError(
-        MISSING_TO_TEAM,
-        "Missing to_team for multi-team deal asset",
-        {"team_id": team_id, "asset": asset},
-    )
