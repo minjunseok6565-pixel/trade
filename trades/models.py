@@ -62,6 +62,74 @@ def asset_key(asset: Asset) -> str:
         return f"swap:{asset.swap_id}"
     return f"fixed_asset:{asset.asset_id}"
 
+def resolve_asset_receiver(deal: Deal, sender_team: str, asset: Asset) -> str:
+    """
+    Resolve the receiver team for ``asset`` sent from ``sender_team`` in ``deal``.
+
+    This is SSOT for "who receives this asset" logic and must be shared by:
+      - trade apply (DB mutations)
+      - agreements / locks (commit/execute)
+      - valuation (incoming/outgoing split)
+
+    Rules:
+      1) If ``asset.to_team`` is present, return it (validated/canonicalized).
+      2) If missing and the deal has exactly 2 teams, infer the opposite team.
+      3) Otherwise (multi-team without to_team), raise TradeError(MISSING_TO_TEAM).
+    """
+    # Normalize sender for robustness (many callers pass already-canonical IDs).
+    try:
+        sender = _normalize_team_id(sender_team, context="resolve_asset_receiver.sender_team")
+    except ValueError as exc:
+        raise TradeError(
+            DEAL_INVALIDATED,
+            "Invalid sender_team",
+            {"sender_team": sender_team},
+        ) from exc
+
+    if sender not in deal.teams:
+        raise TradeError(
+            DEAL_INVALIDATED,
+            "Sender team not in deal",
+            {"sender_team": sender, "teams": list(deal.teams)},
+        )
+
+    to_team = getattr(asset, "to_team", None)
+    if to_team:
+        try:
+            receiver = _normalize_team_id(to_team, context="resolve_asset_receiver.asset.to_team")
+        except ValueError as exc:
+            raise TradeError(
+                DEAL_INVALIDATED,
+                "Invalid asset.to_team",
+                {"to_team": to_team, "asset": asset_key(asset)},
+            ) from exc
+
+        if receiver not in deal.teams:
+            raise TradeError(
+                DEAL_INVALIDATED,
+                "Receiver team not in deal",
+                {"sender_team": sender, "to_team": receiver, "teams": list(deal.teams)},
+            )
+        if receiver == sender:
+            raise TradeError(
+                DEAL_INVALIDATED,
+                "Receiver team cannot match sender",
+                {"sender_team": sender, "to_team": receiver},
+            )
+        return receiver
+
+    # Two-team deals may omit to_team; infer the counterparty.
+    if len(deal.teams) == 2:
+        a, b = deal.teams[0], deal.teams[1]
+        return b if sender == a else a
+
+    # Multi-team deals must specify to_team (validator/team_legs_rule also enforces this).
+    raise TradeError(
+        MISSING_TO_TEAM,
+        "Missing to_team for multi-team deal asset",
+        {"team_id": sender, "asset": asset_key(asset)},
+    )
+
 
 def resolve_asset_receiver(deal: Deal, sender_team: str, asset: Asset) -> str:
     """Resolve which team receives an asset in a Deal.
