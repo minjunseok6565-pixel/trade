@@ -886,6 +886,7 @@ class LeagueService:
                 PickAsset,
                 SwapAsset,
                 FixedAsset,
+                resolve_asset_receiver,
                 canonicalize_deal,
                 parse_deal,
                 serialize_deal,
@@ -901,7 +902,6 @@ class LeagueService:
                 SWAP_INVALID,
                 FIXED_ASSET_NOT_FOUND,
                 FIXED_ASSET_NOT_OWNED,
-                MISSING_TO_TEAM,
             )
         except Exception as exc:  # pragma: no cover
             raise ImportError("trades package is required for execute_trade") from exc
@@ -975,17 +975,6 @@ class LeagueService:
         # SSOT: season_year must come from league context snapshot (state["league"]["season_year"])
         season_year_i = _current_season_year_ssot()
 
-        # Helpers
-        def _resolve_receiver(sender_team: str, asset: Any) -> str:
-            to_team = getattr(asset, "to_team", None)
-            if to_team:
-                return str(to_team).upper()
-            if len(getattr(deal_obj, "teams", []) or []) == 2:
-                other = [t for t in deal_obj.teams if str(t).upper() != str(sender_team).upper()]
-                if other:
-                    return str(other[0]).upper()
-            raise TradeError(MISSING_TO_TEAM, "Missing to_team for multi-team deal asset", {"team_id": sender_team})
-
         # Collect assets by type with duplicate guard
         seen_assets: set[str] = set()
         player_moves: list[tuple[str, str, str]] = []
@@ -1002,7 +991,7 @@ class LeagueService:
                     raise TradeError("DUPLICATE_ASSET", "Duplicate asset in deal", {"asset_key": key})
                 seen_assets.add(key)
 
-                to_team_u = _resolve_receiver(from_team_u, asset)
+                to_team_u = str(resolve_asset_receiver(deal_obj, from_team_u, asset)).upper()
 
                 if isinstance(asset, PlayerAsset):
                     player_moves.append((str(asset.player_id), from_team_u, to_team_u))
