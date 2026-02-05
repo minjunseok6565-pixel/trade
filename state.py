@@ -606,7 +606,7 @@ def set_cached_playoff_news_snapshot(cache: dict) -> None:
     _mutate_state("set_cached_playoff_news_snapshot", _impl)
 
 
-def export_trade_context_snapshot() -> dict:
+def export_trade_context_snapshot(db_path: Optional[str] = None) -> dict:
     def _impl(v: Mapping[str, Any]) -> dict:
         # Include GM/team profiles (e.g., patience/attitude) in the trade context.
         # Source of truth: SQLite gm_profiles table via LeagueRepo.
@@ -614,7 +614,9 @@ def export_trade_context_snapshot() -> dict:
         try:
             from league_repo import LeagueRepo
 
-            with LeagueRepo(get_db_path()) as repo:
+            resolved_db_path = db_path or get_db_path()
+
+            with LeagueRepo(resolved_db_path) as repo:
                 teams = repo.get_all_gm_profiles() or {}
             teams = _to_plain(teams)
         except Exception:
@@ -631,10 +633,12 @@ def export_trade_context_snapshot() -> dict:
     return _read_state(_impl)
 
 
-def export_trade_assets_snapshot() -> dict:
+def export_trade_assets_snapshot(db_path: Optional[str] = None) -> dict:
     from league_repo import LeagueRepo
 
-    with LeagueRepo(get_db_path()) as repo:
+    resolved_db_path = db_path or get_db_path()
+
+    with LeagueRepo(resolved_db_path) as repo:
         return deepcopy(repo.get_trade_assets_snapshot() or {})
 
 
