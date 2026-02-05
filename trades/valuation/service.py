@@ -160,42 +160,6 @@ def _build_standings_order_worst_to_best(team_situation_ctx: Any) -> Optional[Se
     return [r[0] for r in rows_sorted]
 
 
-class _TempStateDbPath:
-    """
-    validate_deal() currently pulls db_path from state.get_db_path().
-    If service callers provide db_path explicitly (e.g., in tests), we temporarily
-    set it in state for the duration of validation + evaluation.
-
-    In normal server flow, state already points to the active db_path, so this is a no-op.
-    """
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._old: Optional[str] = None
-
-    def __enter__(self) -> None:
-        if state is None:
-            return
-        try:
-            self._old = str(state.get_db_path())
-        except Exception:
-            self._old = None
-        try:
-            state.set_db_path(self.db_path)
-        except Exception:
-            # If state is unavailable/malformed, we just do nothing.
-            pass
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if state is None:
-            return
-        if self._old is None:
-            return
-        try:
-            state.set_db_path(self._old)
-        except Exception:
-            pass
-
-
 def _strip_breakdown(side: TeamSideValuation, evaluation: TeamDealEvaluation) -> Tuple[TeamSideValuation, TeamDealEvaluation]:
     """
     Remove step-by-step breakdown tuples to reduce payload size when requested.
@@ -277,10 +241,13 @@ def evaluate_deal_for_team(
         rng = random.Random(rng_seed) if rng_seed is not None else random.Random(0)
 
     # 1) Hard rule validation (salary matching, Stepien, apron, locks, etc.)
-    # validate_deal currently pulls db_path from state; keep it consistent if db_path is injected.
     if validate:
-        with _TempStateDbPath(dbp):
-            validate_deal(deal, current_date=cd, allow_locked_by_deal_id=allow_locked_by_deal_id)
+        validate_deal(
+            deal,
+            current_date=cd,
+            allow_locked_by_deal_id=allow_locked_by_deal_id,
+            db_path=dbp,
+        )
 
     # 2) TeamSituation snapshot + per-team evaluation
     ts_ctx = build_team_situation_context(db_path=dbp, current_date=cd)
