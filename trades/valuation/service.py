@@ -182,6 +182,7 @@ def evaluate_deal_for_team(
     deal: Deal,
     team_id: str,
     *,
+    tick_ctx: Optional[Any] = None,
     current_date: Optional[date] = None,
     db_path: Optional[str] = None,
     current_season_year: Optional[int] = None,
@@ -232,9 +233,40 @@ def evaluate_deal_for_team(
     """
     tid = normalize_team_id(team_id, strict=False)
 
-    cd = _safe_date(current_date)
-    dbp = _safe_db_path(db_path)
-    season_year = _resolve_current_season_year(current_season_year, current_date=cd)
+    # ------------------------------------------------------------------
+    # Tick context fast-path (generation/orchestration can inject caches)
+    # ------------------------------------------------------------------
+    if tick_ctx is not None:
+        # Normalize / validate invariants vs explicit args (fail-fast on mismatch)
+        t_dbp = getattr(tick_ctx, "db_path", None)
+        t_cd = getattr(tick_ctx, "current_date", None)
+        t_sy = getattr(tick_ctx, "season_year", None)
+
+        if db_path is not None and t_dbp is not None and str(db_path) != str(t_dbp):
+            raise TradeError(code="TICK_CTX_MISMATCH", message=f"db_path mismatch (arg={db_path!r}, tick_ctx={t_dbp!r})")
+        if current_date is not None and t_cd is not None and _safe_date(current_date) != _safe_date(t_cd):
+            raise TradeError(code="TICK_CTX_MISMATCH", message=f"current_date mismatch (arg={current_date!r}, tick_ctx={t_cd!r})")
+        if current_season_year is not None and t_sy is not None:
+            try:
+                if int(current_season_year) != int(t_sy):
+                    raise TradeError(
+                        code="TICK_CTX_MISMATCH",
+                        message=f"current_season_year mismatch (arg={current_season_year!r}, tick_ctx={t_sy!r})",
+                    )
+            except Exception:
+                pass
+
+        # Use tick_ctx invariants as SSOT for this call
+        cd = _safe_date(t_cd)
+        dbp = _safe_db_path(str(t_dbp))
+        try:
+            season_year = int(t_sy)
+        except Exception:
+            season_year = _resolve_current_season_year(current_season_year, current_date=cd)
+    else:
+        cd = _safe_date(current_date)
+        dbp = _safe_db_path(db_path)
+        season_year = _resolve_current_season_year(current_season_year, current_date=cd)
 
     # RNG setup: default deterministic if no rng supplied.
     if rng is None:
@@ -242,42 +274,109 @@ def evaluate_deal_for_team(
 
     # 1) Hard rule validation (salary matching, Stepien, apron, locks, etc.)
     if validate:
-        validate_deal(
-            deal,
-            current_date=cd,
-            allow_locked_by_deal_id=allow_locked_by_deal_id,
-            db_path=dbp,
-        )
+        if tick_ctx is not None:
+            rule_tick_ctx = getattr(tick_ctx, "rule_tick_ctx", None)
+            validate_deal(
+                deal,
+                current_date=cd,
+                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                db_path=dbp,
+                tick_ctx=rule_tick_ctx,
+            )
+        else:
+            validate_deal(
+                deal,
+                current_date=cd,
+                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                db_path=dbp,
+            )
 
     # 2) TeamSituation snapshot + per-team evaluation
-    ts_ctx = build_team_situation_context(db_path=dbp, current_date=cd)
-    ts_eval = TeamSituationEvaluator(ctx=ts_ctx, db_path=dbp).evaluate_team(tid)
+    if tick_ctx is not None:
+        ts_ctx = getattr(tick_ctx, "team_situation_ctx", None)
+        team_situations = getattr(tick_ctx, "team_situations", None)
+        if ts_ctx is None:
+            # Fallback: behave like legacy path (shouldn't happen when tick_ctx is well-formed)
+            ts_ctx = build_team_situation_context(db_path=dbp, current_date=cd)
+        if isinstance(team_situations, dict) and tid in team_situations:
+            ts_eval = team_situations[tid]
+        else:
+            # Fallback: evaluate only this team (still uses tick snapshots)
+            repo_obj = getattr(tick_ctx, "repo", None)
+            ts_eval = TeamSituationEvaluator(ctx=ts_ctx, db_path=dbp, repo=repo_obj).evaluate_team(tid)
+    else:
+        ts_ctx = build_team_situation_context(db_path=dbp, current_date=cd)
+        ts_eval = TeamSituationEvaluator(ctx=ts_ctx, db_path=dbp).evaluate_team(tid)
 
     # 3) GM profile -> GMTradeTraits -> DecisionContext
-    gm_profile: Dict[str, Any] = {}
-    if LeagueRepo is None:  # pragma: no cover
-        raise TradeError(code="LEAGUE_REPO_IMPORT_FAILED", message="LeagueRepo import failed; cannot read gm profile")
+    if tick_ctx is not None:
+        decision_contexts = getattr(tick_ctx, "decision_contexts", None)
+        if isinstance(decision_contexts, dict) and tid in decision_contexts:
+            ctx = decision_contexts[tid]
+        else:
+            # Fallback: derive traits/profile if not cached
+            gm_profile: Dict[str, Any] = {}
+            if LeagueRepo is None:  # pragma: no cover
+                raise TradeError(code="LEAGUE_REPO_IMPORT_FAILED", message="LeagueRepo import failed; cannot read gm profile")
 
-    try:
-        with LeagueRepo(dbp) as repo:
-            gp = repo.get_gm_profile(tid) or {}
-            gm_profile = dict(gp) if isinstance(gp, dict) else {"value": gp}
-    except Exception as exc:
-        # Fallback to default mid traits when profile missing or read fails.
-        gm_profile = {}
+            repo_obj = getattr(tick_ctx, "repo", None)
+            try:
+                if repo_obj is not None:
+                    gp = repo_obj.get_gm_profile(tid) or {}
+                    gm_profile = dict(gp) if isinstance(gp, dict) else {"value": gp}
+                else:
+                    with LeagueRepo(dbp) as repo2:
+                        gp = repo2.get_gm_profile(tid) or {}
+                        gm_profile = dict(gp) if isinstance(gp, dict) else {"value": gp}
+            except Exception:
+                gm_profile = {}
+            gm_traits: GMTradeTraits = gm_traits_from_profile_json(gm_profile, default=GMTradeTraits())
+            ctx = build_decision_context(team_situation=ts_eval, gm_traits=gm_traits, team_id=tid)
+    else:
+        gm_profile: Dict[str, Any] = {}
+        if LeagueRepo is None:  # pragma: no cover
+            raise TradeError(code="LEAGUE_REPO_IMPORT_FAILED", message="LeagueRepo import failed; cannot read gm profile")
 
-    gm_traits: GMTradeTraits = gm_traits_from_profile_json(gm_profile, default=GMTradeTraits())
-    ctx: DecisionContext = build_decision_context(team_situation=ts_eval, gm_traits=gm_traits, team_id=tid)
+        try:
+            with LeagueRepo(dbp) as repo:
+                gp = repo.get_gm_profile(tid) or {}
+                gm_profile = dict(gp) if isinstance(gp, dict) else {"value": gp}
+        except Exception:
+            # Fallback to default mid traits when profile missing or read fails.
+            gm_profile = {}
+
+        gm_traits = gm_traits_from_profile_json(gm_profile, default=GMTradeTraits())
+        ctx = build_decision_context(team_situation=ts_eval, gm_traits=gm_traits, team_id=tid)
 
     # 4) Build valuation provider (trade assets + contract ledger + pick expectations)
-    order = standings_order_worst_to_best or _build_standings_order_worst_to_best(ts_ctx)
-    provider: RepoValuationDataContext = build_repo_valuation_data_context(
-        db_path=dbp,
-        current_season_year=season_year,
-        current_date_iso=cd.isoformat(),
-        standings_order_worst_to_best=order,
-        pick_expectations=pick_expectations,
-    )
+    if tick_ctx is not None:
+        provider = getattr(tick_ctx, "provider", None)
+        # Optional override path (debug/experiments): if caller provides expectations/order explicitly,
+        # build a one-off provider using tick snapshots (still avoids new DB reads).
+        if provider is None or pick_expectations is not None or standings_order_worst_to_best is not None:
+            order = standings_order_worst_to_best or getattr(tick_ctx, "standings_order_worst_to_best", None) or _build_standings_order_worst_to_best(ts_ctx)
+            repo_obj = getattr(tick_ctx, "repo", None)
+            assets_snap = getattr(ts_ctx, "assets_snapshot", None)
+            ledger_snap = getattr(ts_ctx, "contract_ledger", None)
+            provider = build_repo_valuation_data_context(
+                db_path=dbp,
+                current_season_year=season_year,
+                current_date_iso=cd.isoformat(),
+                standings_order_worst_to_best=order,
+                pick_expectations=pick_expectations,
+                repo=repo_obj,
+                assets_snapshot=(assets_snap if isinstance(assets_snap, dict) else None),
+                contract_ledger=(ledger_snap if isinstance(ledger_snap, dict) else None),
+            )
+    else:
+        order = standings_order_worst_to_best or _build_standings_order_worst_to_best(ts_ctx)
+        provider = build_repo_valuation_data_context(
+            db_path=dbp,
+            current_season_year=season_year,
+            current_date_iso=cd.isoformat(),
+            standings_order_worst_to_best=order,
+            pick_expectations=pick_expectations,
+        )
 
     # 5) Pure valuation (market -> team utility -> package effects)
     side, evaluation = _evaluate_deal_for_team(
