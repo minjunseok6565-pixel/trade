@@ -47,7 +47,9 @@ class AssetLockRule:
                             )
 
                 if expires_at_date is not None and ctx.current_date > expires_at_date:
-                    asset_locks.pop(asset_key_value, None)
+                    # Expired locks are treated as non-existent during validation.
+                    # Cleanup is handled by tick-level maintenance (e.g., gc_expired_agreements),
+                    # keeping rule evaluation pure and order-independent.
                     continue
 
                 if allow_locked_by_deal_id and locked_deal_id == allow_locked_by_deal_id:
