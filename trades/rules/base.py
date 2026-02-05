@@ -133,14 +133,6 @@ def build_trade_context(
         current_date = state.get_current_date_as_date()
 
     resolved_extra = dict(extra) if extra else {}
-    if "allow_locked_by_deal_id" not in resolved_extra:
-        import inspect
-
-        frame = inspect.currentframe()
-        caller = frame.f_back if frame else None
-        allow_locked_by_deal_id = caller.f_locals.get("allow_locked_by_deal_id") if caller else None
-        if allow_locked_by_deal_id is not None:
-            resolved_extra["allow_locked_by_deal_id"] = allow_locked_by_deal_id
 
     if tick_ctx is not None:
         resolved_db_path = tick_ctx.db_path
