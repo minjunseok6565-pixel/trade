@@ -11,11 +11,14 @@ Developer checks:
 """
 
 from .base import TradeContext, build_trade_context
+from .tick_context import TradeRuleTickContext, build_trade_rule_tick_context
 from .registry import RuleRegistry, get_default_registry, validate_all
 
 __all__ = [
     "TradeContext",
     "build_trade_context",
+    "TradeRuleTickContext",
+    "build_trade_rule_tick_context",
     "RuleRegistry",
     "get_default_registry",
     "validate_all",
