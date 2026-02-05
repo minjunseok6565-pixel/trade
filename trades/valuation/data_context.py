@@ -203,6 +203,10 @@ class RepoValuationDataContext(ValuationDataProvider):
     current_season_year: int
     current_date_iso: str
 
+    # optional shared repo (tick-level context can keep one repo open)
+    # NOTE: caller owns lifecycle; provider must not close it.
+    repo: Optional["LeagueRepo"] = field(default=None, repr=False)
+
     # snapshot maps (SSOT: repo.get_trade_assets_snapshot())
     draft_picks_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     swap_rights_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -230,19 +234,34 @@ class RepoValuationDataContext(ValuationDataProvider):
         if LeagueRepo is None:  # pragma: no cover
             raise ImportError("LeagueRepo import failed; cannot build player snapshot")
 
-        with LeagueRepo(self.db_path) as repo:
-            p = repo.get_player(pid)
+        if self.repo is not None:
+            repo_obj = self.repo
+            p = repo_obj.get_player(pid)
             # roster team & salary may not exist for FAs
             team_id: Optional[str]
             try:
-                team_id = repo.get_team_id_by_player(pid)
+                team_id = repo_obj.get_team_id_by_player(pid)
             except Exception:
                 team_id = None
 
             try:
-                salary_amount = repo.get_salary_amount(pid)
+                salary_amount = repo_obj.get_salary_amount(pid)
             except Exception:
                 salary_amount = None
+        else:
+            with LeagueRepo(self.db_path) as repo_obj:
+                p = repo_obj.get_player(pid)
+                # roster team & salary may not exist for FAs
+                team_id: Optional[str]
+                try:
+                    team_id = repo_obj.get_team_id_by_player(pid)
+                except Exception:
+                    team_id = None
+
+                try:
+                    salary_amount = repo_obj.get_salary_amount(pid)
+                except Exception:
+                    salary_amount = None
 
         attrs = p.get("attrs") if isinstance(p, dict) else {}
         if not isinstance(attrs, dict):
@@ -357,16 +376,17 @@ class RepoValuationDataContext(ValuationDataProvider):
         if LeagueRepo is None:  # pragma: no cover
             return
 
-        with LeagueRepo(self.db_path) as repo:
+        if self.repo is not None:
+            repo_obj = self.repo
             for pid in missing:
                 try:
-                    p = repo.get_player(pid)
+                    p = repo_obj.get_player(pid)
                     try:
-                        team_id = repo.get_team_id_by_player(pid)
+                        team_id = repo_obj.get_team_id_by_player(pid)
                     except Exception:
                         team_id = None
                     try:
-                        salary_amount = repo.get_salary_amount(pid)
+                        salary_amount = repo_obj.get_salary_amount(pid)
                     except Exception:
                         salary_amount = None
 
@@ -400,6 +420,51 @@ class RepoValuationDataContext(ValuationDataProvider):
                     )
                 except Exception:
                     continue
+        else:
+            with LeagueRepo(self.db_path) as repo_obj:
+                for pid in missing:
+                    try:
+                        p = repo_obj.get_player(pid)
+                        try:
+                            team_id = repo_obj.get_team_id_by_player(pid)
+                        except Exception:
+                            team_id = None
+                        try:
+                            salary_amount = repo_obj.get_salary_amount(pid)
+                        except Exception:
+                            salary_amount = None
+
+                        attrs = p.get("attrs") if isinstance(p, dict) else {}
+                        if not isinstance(attrs, dict):
+                            attrs = {}
+
+                        contract = None
+                        cid = self.active_contract_id_by_player.get(pid)
+                        if cid and cid in self.contracts_map:
+                            try:
+                                contract = contract_snapshot_from_dict(
+                                    self.contracts_map[cid],
+                                    current_season_year=self.current_season_year,
+                                )
+                            except Exception:
+                                contract = None
+
+                        self._player_cache[pid] = PlayerSnapshot(
+                            kind="player",
+                            player_id=pid,
+                            name=(str(p.get("name")) if p.get("name") is not None else None),
+                            pos=(str(p.get("pos")) if p.get("pos") is not None else None),
+                            age=_safe_float(p.get("age"), None),
+                            ovr=_safe_float(p.get("ovr"), None),
+                            team_id=_as_upper_team_id(team_id),
+                            salary_amount=_safe_float(salary_amount, None),
+                            attrs=attrs,
+                            contract=contract,
+                            meta={},
+                        )
+                    except Exception:
+                        continue
+
 
 
 # -----------------------------------------------------------------------------
@@ -415,6 +480,9 @@ def build_repo_valuation_data_context(
     pick_expectations: Optional[PickExpectationMap] = None,
     expectation_confidence: float = 0.65,
     expectation_year_filter: Optional[int] = None,
+    repo: Optional["LeagueRepo"] = None,
+    assets_snapshot: Optional[Dict[str, Any]] = None,
+    contract_ledger: Optional[Dict[str, Any]] = None,
 ) -> RepoValuationDataContext:
     """Build RepoValuationDataContext from sqlite snapshot.
 
@@ -430,9 +498,26 @@ def build_repo_valuation_data_context(
     if LeagueRepo is None:  # pragma: no cover
         raise ImportError("LeagueRepo import failed; cannot build valuation data context")
 
-    with LeagueRepo(db_path) as repo:
-        assets = repo.get_trade_assets_snapshot()
-        ledger = repo.get_contract_ledger_snapshot()
+    # Snapshot inputs can be injected by a tick-level context to avoid repeated IO.
+    assets: Dict[str, Any]
+    ledger: Dict[str, Any]
+    if assets_snapshot is not None:
+        assets = dict(assets_snapshot)
+    else:
+        if repo is not None:
+            assets = repo.get_trade_assets_snapshot() or {}
+        else:
+            with LeagueRepo(db_path) as repo_obj:
+                assets = repo_obj.get_trade_assets_snapshot() or {}
+
+    if contract_ledger is not None:
+        ledger = dict(contract_ledger)
+    else:
+        if repo is not None:
+            ledger = repo.get_contract_ledger_snapshot() or {}
+        else:
+            with LeagueRepo(db_path) as repo_obj:
+                ledger = repo_obj.get_contract_ledger_snapshot() or {}
 
     draft_picks_map = dict(assets.get("draft_picks") or {})
     swap_rights_map = dict(assets.get("swap_rights") or {})
@@ -456,6 +541,7 @@ def build_repo_valuation_data_context(
         db_path=str(db_path),
         current_season_year=int(current_season_year),
         current_date_iso=str(current_date_iso),
+        repo=repo,
         draft_picks_map=draft_picks_map,
         swap_rights_map=swap_rights_map,
         fixed_assets_map=fixed_assets_map,
