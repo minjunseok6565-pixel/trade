@@ -193,8 +193,20 @@ def build_trade_context(
             "Trade rule evaluation requires SSOT-backed player meta; "
             f"missing meta for player_ids={missing}"
         )
-    # Always present a players dict for rules; may be empty for pick-only deals.
+        
+    # -----------------------------------------------------------------
+    # Per-deal rule context MUST NOT mutate tick-level snapshot state.
+    # Copy known-mutable submaps so rule evaluation stays order-independent.
+    # -----------------------------------------------------------------
     ctx_state = dict(ctx_state_base)
+    try:
+        asset_locks = ctx_state.get("asset_locks")
+        if isinstance(asset_locks, dict):
+            ctx_state["asset_locks"] = dict(asset_locks)
+        elif asset_locks is None:
+            ctx_state["asset_locks"] = {}
+    except Exception:
+        ctx_state["asset_locks"] = {}
     ctx_state["players"] = players_meta
     
     return TradeContext(
