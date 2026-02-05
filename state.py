@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import date
+import os
 import logging
 from threading import RLock
 from typing import Any, Callable, Optional, TypeVar
@@ -606,40 +607,103 @@ def set_cached_playoff_news_snapshot(cache: dict) -> None:
     _mutate_state("set_cached_playoff_news_snapshot", _impl)
 
 
-def export_trade_context_snapshot(db_path: Optional[str] = None) -> dict:
-    def _impl(v: Mapping[str, Any]) -> dict:
-        # Include GM/team profiles (e.g., patience/attitude) in the trade context.
-        # Source of truth: SQLite gm_profiles table via LeagueRepo.
-        teams = {}
-        try:
-            from league_repo import LeagueRepo
+def export_trade_context_snapshot(
+    db_path: Optional[str] = None,
+    repo: Optional["LeagueRepo"] = None,
+) -> dict:
+    """
+    Export a snapshot needed for trade validation/evaluation.
 
-            resolved_db_path = db_path or get_db_path()
-
-            with LeagueRepo(resolved_db_path) as repo:
-                teams = repo.get_all_gm_profiles() or {}
-            teams = _to_plain(teams)
-        except Exception:
-            # If DB isn't ready or profiles are missing/malformed, fail closed with empty dict.
-            teams = {}
+    Notes:
+    - State fields are read under the state read view (fast, coherent).
+    - DB fields (gm_profiles) are fetched outside the state read view to avoid
+      holding state locks during DB I/O.
+    - When `repo` is provided, it is used as the DB source of truth.
+    """
+    # Phase 1: state snapshot (no DB I/O while holding state view)
+    def _read_impl(v: Mapping[str, Any]) -> dict:
+        league = v["league"]
+        trade_rules = league.get("trade_rules") if hasattr(league, "get") else {}
+        league_ctx = {
+            "season_year": league["season_year"],
+            "trade_rules": _to_plain(trade_rules),
+            "current_date": league["current_date"],
+            "season_start": league["season_start"],
+        }
             
         return {
             "asset_locks": _to_plain(v.get("asset_locks") or {}),
-            "league": get_league_context_snapshot(),
+            "league": league_ctx,
             "my_team_id": v["postseason"]["my_team_id"],
-            "teams": teams,
         }
 
-    return _read_state(_impl)
+    snapshot = _read_state(_read_impl)
 
+    # Phase 2: DB snapshot (gm_profiles)
+    teams: dict = {}
+    try:
+        from league_repo import LeagueRepo
 
-def export_trade_assets_snapshot(db_path: Optional[str] = None) -> dict:
+        if repo is not None:
+            repo_db_path = getattr(repo, "db_path", None)
+            if db_path is not None and repo_db_path is not None:
+                try:
+                    if os.path.abspath(str(db_path)) != os.path.abspath(str(repo_db_path)):
+                        logger.warning(
+                            "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                            db_path,
+                            repo_db_path,
+                        )
+                except Exception:
+                    if str(db_path) != str(repo_db_path):
+                        logger.warning(
+                            "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                            db_path,
+                            repo_db_path,
+                        )
+            teams = repo.get_all_gm_profiles() or {}
+        else:
+            resolved_db_path = db_path or get_db_path()
+            with LeagueRepo(resolved_db_path) as _repo:
+                teams = _repo.get_all_gm_profiles() or {}
+
+        teams = _to_plain(teams)
+    except Exception:
+        # If DB isn't ready or profiles are missing/malformed, fail closed with empty dict.
+        teams = {}
+
+    snapshot["teams"] = teams
+    return snapshot
+
+def export_trade_assets_snapshot(
+    db_path: Optional[str] = None,
+    repo: Optional["LeagueRepo"] = None,
+) -> dict:
     from league_repo import LeagueRepo
 
-    resolved_db_path = db_path or get_db_path()
+    if repo is not None:
+        repo_db_path = getattr(repo, "db_path", None)
+        if db_path is not None and repo_db_path is not None:
+            try:
+                if os.path.abspath(str(db_path)) != os.path.abspath(str(repo_db_path)):
+                    logger.warning(
+                        "export_trade_assets_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                        db_path,
+                        repo_db_path,
+                    )
+            except Exception:
+                if str(db_path) != str(repo_db_path):
+                    logger.warning(
+                        "export_trade_assets_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                        db_path,
+                        repo_db_path,
+                    )
 
-    with LeagueRepo(resolved_db_path) as repo:
         return deepcopy(repo.get_trade_assets_snapshot() or {})
+
+    resolved_db_path = db_path or get_db_path()
+    with LeagueRepo(resolved_db_path) as _repo:
+        return deepcopy(_repo.get_trade_assets_snapshot() or {})
 
 
 def ensure_cap_model_populated_if_needed() -> None:
