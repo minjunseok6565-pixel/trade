@@ -155,10 +155,18 @@ def build_team_situation_context(
     *,
     db_path: Optional[str] = None,
     current_date: Optional[date] = None,
+    repo: Optional[LeagueRepo] = None,
+    trade_state_snapshot: Optional[Dict[str, Any]] = None,
+    assets_snapshot: Optional[Dict[str, Any]] = None,
+    contract_ledger: Optional[Dict[str, Any]] = None,
 ) -> TeamSituationContext:
     """Build a reusable snapshot for many team evaluations.
 
     It reads state + DB once, so evaluating 30 teams is cheap.
+
+    Advanced: callers may inject `repo` and/or precomputed snapshots
+    (`trade_state_snapshot`, `assets_snapshot`, `contract_ledger`) to avoid
+    redundant I/O when running many evaluations within a single tick.
     """
 
     if current_date is None:
@@ -177,25 +185,42 @@ def build_team_situation_context(
     # In integrated server mode, workflow_state already contains the league context snapshot.
     league_ctx = (workflow_state.get("league", {}) or {}) if isinstance(workflow_state, dict) else {}
 
-    resolved_db_path = db_path or _safe_get_db_path()
+    if repo is not None and db_path is not None and str(db_path) != str(getattr(repo, "db_path", "")):
+        raise ValueError(
+            f"build_team_situation_context: db_path mismatch (db_path={db_path!r}, repo.db_path={getattr(repo, 'db_path', None)!r})"
+        )
+
+    resolved_db_path = (
+        db_path
+        or (str(getattr(repo, "db_path", "")) if repo is not None else None)
+        or _safe_get_db_path()
+    )
     
     trade_state = {}
-    try:
-        trade_state = state.export_trade_context_snapshot(db_path=resolved_db_path) or {}
-    except Exception:
-        _warn_limited("TRADE_CTX_SNAPSHOT_FAILED", "export_trade_context_snapshot failed")
-        trade_state = {}
+    if trade_state_snapshot is not None:
+        trade_state = trade_state_snapshot if isinstance(trade_state_snapshot, dict) else {}
+    else:
+        try:
+            trade_state = state.export_trade_context_snapshot(db_path=resolved_db_path) or {}
+        except Exception:
+            _warn_limited("TRADE_CTX_SNAPSHOT_FAILED", "export_trade_context_snapshot failed")
+            trade_state = {}
 
-
-    assets_snapshot: Dict[str, Any] = {}
-    contract_ledger: Dict[str, Any] = {}
+    assets_snapshot_data: Dict[str, Any] = dict(assets_snapshot or {})
+    contract_ledger_data: Dict[str, Any] = dict(contract_ledger or {})
     team_ban_index: Dict[str, Dict[str, Any]] = {}
 
-    if resolved_db_path:
+    if repo is not None or resolved_db_path:
         try:
-            with LeagueRepo(resolved_db_path) as repo:
-                assets_snapshot = repo.get_trade_assets_snapshot() or {}
-                contract_ledger = repo.get_contract_ledger_snapshot() or {}
+            import contextlib
+
+            repo_cm = contextlib.nullcontext(repo) if repo is not None else LeagueRepo(resolved_db_path)
+            with repo_cm as repo_obj:
+                if not assets_snapshot_data:
+                    assets_snapshot_data = repo_obj.get_trade_assets_snapshot() or {}
+                if not contract_ledger_data:
+                    contract_ledger_data = repo_obj.get_contract_ledger_snapshot() or {}
+ 
 
                 # Build a league-wide "ban index" once (SSOT-backed) so evaluating 30 teams stays cheap.
                 try:
@@ -214,12 +239,12 @@ def build_team_situation_context(
                     all_pids: set[str] = set()
                     for raw_tid in ALL_TEAM_IDS:
                         tid = str(normalize_team_id(raw_tid, strict=True))
-                        pids = repo.get_roster_player_ids(tid) or set()
+                        pids = repo_obj.get_roster_player_ids(tid) or set()
                         roster_pids_by_team[tid] = {str(x) for x in pids if x}
                         all_pids.update(roster_pids_by_team[tid])
 
                     players_meta = build_rule_players_meta(
-                        repo,
+                        repo_obj,
                         all_pids,
                         season_year=season_year,
                         as_of_date=current_date,
@@ -288,8 +313,6 @@ def build_team_situation_context(
                     _warn_limited("BAN_INDEX_BUILD_FAILED", f"db_path={resolved_db_path!r}")
         except Exception:
             _warn_limited("DB_SNAPSHOT_FAILED", f"db_path={resolved_db_path!r}")
-            assets_snapshot = {}
-            contract_ledger = {}
             team_ban_index = {}
 
     try:
@@ -315,8 +338,8 @@ def build_team_situation_context(
         league_ctx=_to_plain(league_ctx),
         workflow_state=_to_plain(workflow_state),
         trade_state=_to_plain(trade_state),
-        assets_snapshot=_to_plain(assets_snapshot),
-        contract_ledger=_to_plain(contract_ledger),
+        assets_snapshot=_to_plain(assets_snapshot_data),
+        contract_ledger=_to_plain(contract_ledger_data),
         standings=_to_plain(standings),
         records_index=records_index,
         team_stats=team_stats_plain,
@@ -352,9 +375,18 @@ def _to_plain(v: Any) -> Any:
 
 
 class TeamSituationEvaluator:
-    def __init__(self, *, ctx: TeamSituationContext, db_path: Optional[str] = None):
+    def __init__(self, *, ctx: TeamSituationContext, db_path: Optional[str] = None, repo: Optional[LeagueRepo] = None):
         self.ctx = ctx
-        self.db_path = db_path or _safe_get_db_path()
+        self.repo = repo
+        if repo is not None and db_path is not None and str(db_path) != str(getattr(repo, "db_path", "")):
+            raise ValueError(
+                f"TeamSituationEvaluator: db_path mismatch (db_path={db_path!r}, repo.db_path={getattr(repo, 'db_path', None)!r})"
+            )
+        self.db_path = (
+            db_path
+            or (str(getattr(repo, "db_path", "")) if repo is not None else None)
+            or _safe_get_db_path()
+        )
 
     def _get_roster(self, team_id: str, roster: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """Single roster access gate.
@@ -556,40 +588,43 @@ class TeamSituationEvaluator:
 
         Do NOT call this directly from evaluation logic. Use `_get_roster()` instead.
         """
-        if not self.db_path:
+        if self.repo is None and not self.db_path:
             return []
         out: List[Dict[str, Any]] = []
         try:
-            with LeagueRepo(self.db_path) as repo:
-                rows = repo.get_team_roster(team_id) or []
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    pid_raw = row.get("player_id")
-                    if not pid_raw:
-                        continue
-                    pid = str(normalize_player_id(pid_raw, strict=False, allow_legacy_numeric=True))
-                    attrs = row.get("attrs") or {}
-                    if not isinstance(attrs, dict):
-                        attrs = {}
-                    try:
-                        derived = compute_derived(attrs)
-                    except Exception:
-                        _warn_limited("DERIVED_COMPUTE_FAILED", f"team_id={team_id} player_id={pid}")
-                        derived = {}
-                    out.append(
-                        {
-                            "player_id": pid,
-                            "name": row.get("name") or attrs.get("Name") or "",
-                            "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
-                            "age": int(row.get("age") or attrs.get("Age") or 0),
-                            "ovr": float(row.get("ovr") or attrs.get("OVR") or 0.0),
-                            "salary": float(row.get("salary_amount") or 0.0),
-                            "potential": _parse_potential(attrs.get("Potential")),
-                            "attrs": attrs,
-                            "derived": derived,
-                        }
-                    )
+            if self.repo is not None:
+                rows = self.repo.get_team_roster(team_id) or []
+            else:
+                with LeagueRepo(self.db_path) as repo:
+                    rows = repo.get_team_roster(team_id) or []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                pid_raw = row.get("player_id")
+                if not pid_raw:
+                    continue
+                pid = str(normalize_player_id(pid_raw, strict=False, allow_legacy_numeric=True))
+                attrs = row.get("attrs") or {}
+                if not isinstance(attrs, dict):
+                    attrs = {}
+                try:
+                    derived = compute_derived(attrs)
+                except Exception:
+                    _warn_limited("DERIVED_COMPUTE_FAILED", f"team_id={team_id} player_id={pid}")
+                    derived = {}
+                out.append(
+                    {
+                        "player_id": pid,
+                        "name": row.get("name") or attrs.get("Name") or "",
+                        "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
+                        "age": int(row.get("age") or attrs.get("Age") or 0),
+                        "ovr": float(row.get("ovr") or attrs.get("OVR") or 0.0),
+                        "salary": float(row.get("salary_amount") or 0.0),
+                        "potential": _parse_potential(attrs.get("Potential")),
+                        "attrs": attrs,
+                        "derived": derived,
+                    }
+                )
         except Exception:
             _warn_limited("LOAD_ROSTER_FAILED", f"team_id={team_id!r}")
             return []
