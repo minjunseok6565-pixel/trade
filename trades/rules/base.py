@@ -134,8 +134,8 @@ def build_trade_context(
     repo = LeagueRepo(resolved_db_path)
     # DB schema is guaranteed during server startup (state.startup_init_state()).
 
-    ctx_state = state.export_trade_context_snapshot()
-    assets_snap = state.export_trade_assets_snapshot()
+    ctx_state = state.export_trade_context_snapshot(db_path=resolved_db_path)
+    assets_snap = state.export_trade_assets_snapshot(db_path=resolved_db_path)
     resolved_extra.setdefault("assets_snapshot", assets_snap)
     season_year = int(ctx_state["league"]["season_year"])
 
