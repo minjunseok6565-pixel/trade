@@ -22,6 +22,7 @@ class TradeRuleTickContext:
     db_path: str
     current_date: date
     repo: LeagueRepo
+    owns_repo: bool = True
     ctx_state_base: dict
     assets_snapshot: dict
     season_year: int
@@ -63,6 +64,8 @@ class TradeRuleTickContext:
         return {pid: self.players_meta_cache[pid] for pid in canonical if pid in self.players_meta_cache}
 
     def close(self) -> None:
+        if not self.owns_repo:
+            return
         try:
             self.repo.close()
         except Exception:
@@ -80,15 +83,27 @@ def build_trade_rule_tick_context(
     current_date: Optional[date] = None,
     db_path: Optional[str] = None,
     validate_integrity: bool = True,
+    repo: Optional[LeagueRepo] = None,
 ) -> TradeRuleTickContext:
     import state
 
     from .registry import get_default_registry
 
-    resolved_db_path = db_path or state.get_db_path()
     resolved_current_date = current_date or state.get_current_date_as_date()
 
-    repo = LeagueRepo(resolved_db_path)
+    owns_repo = True
+    if repo is not None:
+        if db_path is not None and str(db_path) != str(getattr(repo, "db_path", "")):
+            raise ValueError(
+                f"build_trade_rule_tick_context: db_path mismatch (db_path={db_path!r}, repo.db_path={getattr(repo, 'db_path', None)!r})"
+            )
+        resolved_db_path = str(getattr(repo, "db_path", ""))
+        owns_repo = False
+    else:
+        resolved_db_path = db_path or state.get_db_path()
+        repo = LeagueRepo(resolved_db_path)
+        owns_repo = True
+
     integrity_validated = False
     if validate_integrity:
         repo.validate_integrity()
@@ -99,18 +114,21 @@ def build_trade_rule_tick_context(
 
     league = (ctx_state_base or {}).get("league")
     if not isinstance(league, dict):
-        repo.close()
+        if owns_repo:
+            repo.close()
         raise RuntimeError("Invalid trade context snapshot: missing league dict")
 
     y = league.get("season_year")
     if y is None:
-        repo.close()
+        if owns_repo:
+            repo.close()
         raise RuntimeError("Invalid trade context snapshot: league.season_year missing")
 
     try:
         season_year = int(y)
     except (TypeError, ValueError) as exc:
-        repo.close()
+        if owns_repo:
+            repo.close()
         raise RuntimeError(f"Invalid trade context snapshot: league.season_year invalid: {y!r}") from exc
 
     # Prepare sorted enabled rules once (avoid per-deal registry build + sort)
@@ -123,6 +141,7 @@ def build_trade_rule_tick_context(
         db_path=str(resolved_db_path),
         current_date=resolved_current_date,
         repo=repo,
+        owns_repo=owns_repo,
         ctx_state_base=ctx_state_base or {},
         assets_snapshot=assets_snapshot or {},
         season_year=season_year,
