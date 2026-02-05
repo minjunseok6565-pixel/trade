@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, TYPE_CHECKING
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id
 
 from . import rule_player_meta
+
+if TYPE_CHECKING:
+    from .base import Rule
 
 
 def _canonical_player_id(value: object) -> str:
@@ -25,6 +28,8 @@ class TradeRuleTickContext:
 
     players_meta_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     integrity_validated: bool = False
+    # Prepared once per tick: enabled rules sorted by (priority, rule_id)
+    prepared_rules: list["Rule"] = field(default_factory=list)
 
     def ensure_players_meta(self, player_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
         canonical: list[str] = []
@@ -78,6 +83,8 @@ def build_trade_rule_tick_context(
 ) -> TradeRuleTickContext:
     import state
 
+    from .registry import get_default_registry
+
     resolved_db_path = db_path or state.get_db_path()
     resolved_current_date = current_date or state.get_current_date_as_date()
 
@@ -106,6 +113,12 @@ def build_trade_rule_tick_context(
         repo.close()
         raise RuntimeError(f"Invalid trade context snapshot: league.season_year invalid: {y!r}") from exc
 
+    # Prepare sorted enabled rules once (avoid per-deal registry build + sort)
+    registry = get_default_registry()
+    enabled = [r for r in registry.list_rules() if getattr(r, "enabled", False)]
+    prepared_rules = sorted(enabled, key=lambda r: (getattr(r, "priority", 0), getattr(r, "rule_id", "")))
+
+    
     return TradeRuleTickContext(
         db_path=str(resolved_db_path),
         current_date=resolved_current_date,
@@ -115,4 +128,5 @@ def build_trade_rule_tick_context(
         season_year=season_year,
         players_meta_cache={},
         integrity_validated=integrity_validated,
+        prepared_rules=prepared_rules,
     )
