@@ -249,9 +249,13 @@ def build_trade_generation_tick_context(
     """
 
     import state
+    from ..maintenance import maintain_trade_state
 
     resolved_current_date = current_date or state.get_current_date_as_date()
     resolved_db_path = str(db_path or state.get_db_path())
+
+    # Tick maintenance: ensure expired agreements/locks are cleaned before snapshotting.
+    maintain_trade_state(current_date=resolved_current_date, db_path=resolved_db_path)
 
     # Shared repo for the tick.
     repo = LeagueRepo(resolved_db_path)
