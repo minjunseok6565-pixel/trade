@@ -620,7 +620,39 @@ def export_trade_context_snapshot(
       holding state locks during DB I/O.
     - When `repo` is provided, it is used as the DB source of truth.
     """
-    # Phase 1: state snapshot (no DB I/O while holding state view)
+    # If no shared repo is provided, preserve the original "atomic snapshot" behavior:
+    # build the full snapshot (including DB-backed gm_profiles) within a single _read_state call.
+    if repo is None:
+        def _impl(v: Mapping[str, Any]) -> dict:
+            league = v["league"]
+            trade_rules = league.get("trade_rules") if hasattr(league, "get") else {}
+            league_ctx = {
+                "season_year": league["season_year"],
+                "trade_rules": _to_plain(trade_rules),
+                "current_date": league["current_date"],
+                "season_start": league["season_start"],
+            }
+
+            teams: dict = {}
+            try:
+                from league_repo import LeagueRepo
+                resolved_db_path = db_path or get_db_path()
+                with LeagueRepo(resolved_db_path) as _repo:
+                    teams = _repo.get_all_gm_profiles() or {}
+                teams = _to_plain(teams)
+            except Exception:
+                teams = {}
+
+            return {
+                "asset_locks": _to_plain(v.get("asset_locks") or {}),
+                "league": league_ctx,
+                "my_team_id": v["postseason"]["my_team_id"],
+                "teams": teams,
+            }
+
+        return _read_state(_impl)
+
+    # Shared repo path: keep state read fast (no DB I/O while holding state view).
     def _read_impl(v: Mapping[str, Any]) -> dict:
         league = v["league"]
         trade_rules = league.get("trade_rules") if hasattr(league, "get") else {}
@@ -630,7 +662,6 @@ def export_trade_context_snapshot(
             "current_date": league["current_date"],
             "season_start": league["season_start"],
         }
-            
         return {
             "asset_locks": _to_plain(v.get("asset_locks") or {}),
             "league": league_ctx,
@@ -639,41 +670,33 @@ def export_trade_context_snapshot(
 
     snapshot = _read_state(_read_impl)
 
-    # Phase 2: DB snapshot (gm_profiles)
+    # DB snapshot (gm_profiles) via provided shared repo
     teams: dict = {}
     try:
-        from league_repo import LeagueRepo
-
-        if repo is not None:
-            repo_db_path = getattr(repo, "db_path", None)
-            if db_path is not None and repo_db_path is not None:
-                try:
-                    if os.path.abspath(str(db_path)) != os.path.abspath(str(repo_db_path)):
-                        logger.warning(
-                            "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
-                            db_path,
-                            repo_db_path,
-                        )
-                except Exception:
-                    if str(db_path) != str(repo_db_path):
-                        logger.warning(
-                            "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
-                            db_path,
-                            repo_db_path,
-                        )
-            teams = repo.get_all_gm_profiles() or {}
-        else:
-            resolved_db_path = db_path or get_db_path()
-            with LeagueRepo(resolved_db_path) as _repo:
-                teams = _repo.get_all_gm_profiles() or {}
-
+        repo_db_path = getattr(repo, "db_path", None)
+        if db_path is not None and repo_db_path is not None:
+            try:
+                if os.path.abspath(str(db_path)) != os.path.abspath(str(repo_db_path)):
+                    logger.warning(
+                        "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                        db_path,
+                        repo_db_path,
+                    )
+            except Exception:
+                if str(db_path) != str(repo_db_path):
+                    logger.warning(
+                        "export_trade_context_snapshot: db_path mismatch (db_path=%r, repo.db_path=%r)",
+                        db_path,
+                        repo_db_path,
+                    )
+        teams = repo.get_all_gm_profiles() or {}
         teams = _to_plain(teams)
     except Exception:
-        # If DB isn't ready or profiles are missing/malformed, fail closed with empty dict.
         teams = {}
 
     snapshot["teams"] = teams
     return snapshot
+
 
 def export_trade_assets_snapshot(
     db_path: Optional[str] = None,
