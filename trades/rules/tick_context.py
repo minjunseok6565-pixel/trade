@@ -12,6 +12,17 @@ from . import rule_player_meta
 if TYPE_CHECKING:
     from .base import Rule
 
+class _ReadOnlyDict(dict):
+    """
+    A dict subtype that raises on mutation.
+    Used to enforce tick snapshot immutability while preserving isinstance(x, dict) checks.
+    """
+
+    def _ro(self, *a, **k):
+        raise TypeError("TradeRuleTickContext snapshot is read-only")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _ro
+
 
 def _canonical_player_id(value: object) -> str:
     return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
@@ -22,7 +33,7 @@ class TradeRuleTickContext:
     db_path: str
     current_date: date
     repo: LeagueRepo
-    owns_repo: bool = True
+    owns_repo: bool
     ctx_state_base: dict
     assets_snapshot: dict
     season_year: int
@@ -109,8 +120,18 @@ def build_trade_rule_tick_context(
         repo.validate_integrity()
         integrity_validated = True
 
-    ctx_state_base = state.export_trade_context_snapshot(db_path=resolved_db_path)
-    assets_snapshot = state.export_trade_assets_snapshot(db_path=resolved_db_path)
+    # Use the shared repo for tick snapshots to avoid reopening connections.
+    ctx_state_base = state.export_trade_context_snapshot(repo=repo) or {}
+    assets_snapshot = state.export_trade_assets_snapshot(repo=repo) or {}
+
+    # Enforce immutability for known-mutable submaps to avoid cross-deal contamination.
+    # (Rules should be pure; maintenance/cleanup happens at tick boundaries.)
+    try:
+        al = ctx_state_base.get("asset_locks")
+        if isinstance(al, dict) and not isinstance(al, _ReadOnlyDict):
+            ctx_state_base["asset_locks"] = _ReadOnlyDict(al)
+    except Exception:
+        pass
 
     league = (ctx_state_base or {}).get("league")
     if not isinstance(league, dict):
@@ -142,8 +163,8 @@ def build_trade_rule_tick_context(
         current_date=resolved_current_date,
         repo=repo,
         owns_repo=owns_repo,
-        ctx_state_base=ctx_state_base or {},
-        assets_snapshot=assets_snapshot or {},
+        ctx_state_base=ctx_state_base,
+        assets_snapshot=assets_snapshot,
         season_year=season_year,
         players_meta_cache={},
         integrity_validated=integrity_validated,
