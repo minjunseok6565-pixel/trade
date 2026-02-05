@@ -499,25 +499,37 @@ def build_repo_valuation_data_context(
         raise ImportError("LeagueRepo import failed; cannot build valuation data context")
 
     # Snapshot inputs can be injected by a tick-level context to avoid repeated IO.
-    assets: Dict[str, Any]
-    ledger: Dict[str, Any]
-    if assets_snapshot is not None:
-        assets = dict(assets_snapshot)
-    else:
-        if repo is not None:
-            assets = repo.get_trade_assets_snapshot() or {}
-        else:
-            with LeagueRepo(db_path) as repo_obj:
-                assets = repo_obj.get_trade_assets_snapshot() or {}
+    # Also support sharing a single open repo (caller owns lifecycle; provider must not close it).
+    if repo is not None:
+        # Fail-fast if caller accidentally passes a repo connected to a different DB.
+        repo_db_path = getattr(repo, "db_path", None)
+        if repo_db_path is not None and str(repo_db_path) and str(repo_db_path) != str(db_path):
+            raise ValueError(
+                f"build_repo_valuation_data_context: db_path mismatch (db_path={db_path!r}, repo.db_path={repo_db_path!r})"
+            )
 
-    if contract_ledger is not None:
-        ledger = dict(contract_ledger)
-    else:
-        if repo is not None:
+    assets: Optional[Dict[str, Any]] = dict(assets_snapshot) if assets_snapshot is not None else None
+    ledger: Optional[Dict[str, Any]] = dict(contract_ledger) if contract_ledger is not None else None
+
+    if repo is not None:
+        # Use shared repo without opening/closing.
+        if assets is None:
+            assets = repo.get_trade_assets_snapshot() or {}
+        if ledger is None:
             ledger = repo.get_contract_ledger_snapshot() or {}
-        else:
+    else:
+        # Avoid opening the DB twice: open once if either snapshot is missing.
+        if assets is None or ledger is None:
             with LeagueRepo(db_path) as repo_obj:
-                ledger = repo_obj.get_contract_ledger_snapshot() or {}
+                if assets is None:
+                    assets = repo_obj.get_trade_assets_snapshot() or {}
+                if ledger is None:
+                    ledger = repo_obj.get_contract_ledger_snapshot() or {}
+
+    if assets is None:  # pragma: no cover
+        assets = {}
+    if ledger is None:  # pragma: no cover
+        ledger = {}
 
     draft_picks_map = dict(assets.get("draft_picks") or {})
     swap_rights_map = dict(assets.get("swap_rights") or {})
