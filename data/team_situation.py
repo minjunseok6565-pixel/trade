@@ -176,15 +176,16 @@ def build_team_situation_context(
 
     # In integrated server mode, workflow_state already contains the league context snapshot.
     league_ctx = (workflow_state.get("league", {}) or {}) if isinstance(workflow_state, dict) else {}
+
+    resolved_db_path = db_path or _safe_get_db_path()
     
     trade_state = {}
     try:
-        trade_state = state.export_trade_context_snapshot() or {}
+        trade_state = state.export_trade_context_snapshot(db_path=resolved_db_path) or {}
     except Exception:
         _warn_limited("TRADE_CTX_SNAPSHOT_FAILED", "export_trade_context_snapshot failed")
         trade_state = {}
 
-    resolved_db_path = db_path or _safe_get_db_path()
 
     assets_snapshot: Dict[str, Any] = {}
     contract_ledger: Dict[str, Any] = {}
