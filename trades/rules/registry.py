@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from .base import Rule, TradeContext
 
@@ -27,7 +27,16 @@ class RuleRegistry:
         return list(self._rules.values())
 
 
-def validate_all(deal, ctx: TradeContext, registry: Optional[RuleRegistry] = None) -> None:
+def validate_all(
+    deal,
+    ctx: TradeContext,
+    registry: Optional[RuleRegistry] = None,
+    prepared_rules: Optional[Sequence[Rule]] = None,
+) -> None:
+    if prepared_rules is not None:
+        for rule in prepared_rules:
+            rule.validate(deal, ctx)
+        return
     registry = registry or get_default_registry()
     enabled_rules = [rule for rule in registry.list_rules() if rule.enabled]
     for rule in sorted(enabled_rules, key=lambda rule: (rule.priority, rule.rule_id)):
