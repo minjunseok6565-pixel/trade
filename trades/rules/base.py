@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, TYPE_CHECKING
 
 from league_repo import LeagueRepo
 from schema import normalize_player_id, normalize_team_id
+
+
+if TYPE_CHECKING:
+    from .tick_context import TradeRuleTickContext
 
 
 @dataclass
@@ -15,6 +19,7 @@ class TradeContext:
     db_path: Optional[str]
     current_date: date
     extra: dict[str, Any] = field(default_factory=dict)
+    owns_repo: bool = True
 
 
 class Rule(Protocol):
@@ -113,9 +118,16 @@ def build_trade_context(
     current_date: Optional[date] = None,
     extra: Optional[dict[str, Any]] = None,
     db_path: Optional[str] = None,
+    tick_ctx: Optional["TradeRuleTickContext"] = None,
 ) -> TradeContext:
     import state
     from . import rule_player_meta
+
+    if tick_ctx is not None:
+        if current_date is None:
+            current_date = tick_ctx.current_date
+        elif current_date != tick_ctx.current_date:
+            raise ValueError("build_trade_context: current_date conflicts with tick_ctx.current_date")
 
     if current_date is None:
         current_date = state.get_current_date_as_date()
@@ -130,14 +142,27 @@ def build_trade_context(
         if allow_locked_by_deal_id is not None:
             resolved_extra["allow_locked_by_deal_id"] = allow_locked_by_deal_id
 
-    resolved_db_path = db_path or state.get_db_path()
-    repo = LeagueRepo(resolved_db_path)
+    if tick_ctx is not None:
+        resolved_db_path = tick_ctx.db_path
+        if db_path is not None and str(db_path) != str(resolved_db_path):
+            raise ValueError("build_trade_context: db_path conflicts with tick_ctx.db_path")
+        repo = tick_ctx.repo
+        owns_repo = False
+    else:
+        resolved_db_path = db_path or state.get_db_path()
+        repo = LeagueRepo(resolved_db_path)
+        owns_repo = True
     # DB schema is guaranteed during server startup (state.startup_init_state()).
 
-    ctx_state = state.export_trade_context_snapshot(db_path=resolved_db_path)
-    assets_snap = state.export_trade_assets_snapshot(db_path=resolved_db_path)
+    if tick_ctx is not None:
+        ctx_state_base = tick_ctx.ctx_state_base
+        assets_snap = tick_ctx.assets_snapshot
+        season_year = tick_ctx.season_year
+    else:
+        ctx_state_base = state.export_trade_context_snapshot(db_path=resolved_db_path)
+        assets_snap = state.export_trade_assets_snapshot(db_path=resolved_db_path)
+        season_year = int(ctx_state_base["league"]["season_year"])
     resolved_extra.setdefault("assets_snapshot", assets_snap)
-    season_year = int(ctx_state["league"]["season_year"])
 
     # -----------------------------------------------------------------
     # Inject rule-only player metadata derived from SSOT (DB).
@@ -164,9 +189,12 @@ def build_trade_context(
 
     # Fail-fast if season_year is missing or current_date format is inconsistent.
     # season_year SSOT is ctx_state["league"]["season_year"] (from league context snapshot).
-    players_meta = rule_player_meta.build_rule_players_meta(
-        repo, deal_player_ids, season_year=season_year, as_of_date=current_date
-    )
+    if tick_ctx is not None:
+        players_meta = tick_ctx.ensure_players_meta(deal_player_ids)
+    else:
+        players_meta = rule_player_meta.build_rule_players_meta(
+            repo, deal_player_ids, season_year=season_year, as_of_date=current_date
+        )
     missing = sorted(set(deal_player_ids) - set(players_meta.keys()))
     if missing:
         raise RuntimeError(
@@ -174,6 +202,7 @@ def build_trade_context(
             f"missing meta for player_ids={missing}"
         )
     # Always present a players dict for rules; may be empty for pick-only deals.
+    ctx_state = dict(ctx_state_base)
     ctx_state["players"] = players_meta
     
     return TradeContext(
@@ -182,4 +211,5 @@ def build_trade_context(
         db_path=resolved_db_path,
         current_date=current_date,
         extra=resolved_extra,
+        owns_repo=owns_repo,
     )
