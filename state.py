@@ -628,6 +628,7 @@ def export_trade_context_snapshot(
             trade_rules = league.get("trade_rules") if hasattr(league, "get") else {}
             league_ctx = {
                 "season_year": league["season_year"],
+                "draft_year": league["draft_year"],
                 "trade_rules": _to_plain(trade_rules),
                 "current_date": league["current_date"],
                 "season_start": league["season_start"],
@@ -658,6 +659,7 @@ def export_trade_context_snapshot(
         trade_rules = league.get("trade_rules") if hasattr(league, "get") else {}
         league_ctx = {
             "season_year": league["season_year"],
+            "draft_year": league["draft_year"],
             "trade_rules": _to_plain(trade_rules),
             "current_date": league["current_date"],
             "season_start": league["season_start"],
