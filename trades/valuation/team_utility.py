@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple, List, Callable
-
-import math
+from typing import Any, Dict, Optional, Tuple, List
 
 from decision_context import DecisionContext
-from role_need_tags import ROLE_TO_NEED_TAG as ROLE_TO_NEED_TAG_SSOT, role_to_need_tag_only
+
+from .fit_engine import FitEngine, FitEngineConfig
 
 from .types import (
     AssetKind,
@@ -96,12 +95,6 @@ def _normalize_0_1(value: float, *, lo: float, hi: float) -> float:
     return _clamp((value - lo) / (hi - lo), 0.0, 1.0)
 
 
-# fit 계산에서 “측정 가능한(=공급 벡터로 정의된)” 태그만 반영한다.
-# - depth/upgrade/cap-flex 같은 구조적 니즈 태그는 여기서 0점으로 끌어내리지 않도록 제외.
-# - custom supply extractor가 추가 태그를 제공하는 경우(supply.keys)에는 그 태그도 자동 지원.
-FIT_SUPPORTED_TAGS_BASE = frozenset(set(ROLE_TO_NEED_TAG_SSOT.values()) | {"DEFENSE"})
-
-
 # =============================================================================
 # Config (tunable, deterministic)
 # =============================================================================
@@ -134,12 +127,8 @@ class TeamUtilityConfig:
     star_factor_floor: float = 0.80
     star_factor_cap: float = 1.80
 
-    # --- Fit scoring
-    fit_neutral_score: float = 0.50
-    fit_factor_floor: float = 0.70
-    fit_factor_cap: float = 1.35
-    fit_below_threshold_floor: float = 0.35
-    fit_below_threshold_strength: float = 2.0  # threshold 아래면 더 빠르게 할인
+    # --- Fit / supply (SSOT delegated to FitEngine)
+    fit: FitEngineConfig = field(default_factory=FitEngineConfig)
 
     # --- Risk discount (team preference)
     risk_factor_floor: float = 0.60
@@ -156,31 +145,7 @@ class TeamUtilityConfig:
     finance_salary_hi: float = 40_000_000.0
     finance_term_weight: float = 0.35  # 긴 계약일수록 재정 부담 가중
 
-    # --- Supply extraction hooks (확장성)
-    # 프로젝트에서 실제 attrs_json 키가 확정되면 여기를 SSOT로 튜닝.
-    attr_keys_spacing: Tuple[str, ...] = (
-        "ThreePoint", "Three-Point Shot", "3PT", "CatchShoot", "SpotUp",
-    )
-    attr_keys_rim_pressure: Tuple[str, ...] = (
-        "DrivingLayup", "CloseShot", "Finishing", "RimAttack", "DrawFoul",
-    )
-    attr_keys_primary_initiator: Tuple[str, ...] = (
-        "BallHandle", "PassAccuracy", "Playmaking", "SpeedWithBall",
-    )
-    attr_keys_shot_creation: Tuple[str, ...] = (
-        "ShotIQ", "ShotCreating", "PullUp", "Isolation", "MidRange",
-    )
-    attr_keys_defense: Tuple[str, ...] = (
-        "PerimeterDefense", "InteriorDefense", "Steal", "Block", "DefIQ",
-    )
-
-    # attrs scale handling
-    attr_scale_max: float = 99.0  # 2K-like scale fallback
-    eps: float = 1e-9
-
-    # Custom extractor override (원하면 외부에서 주입)
-    custom_player_supply_extractor: Optional[Callable[[PlayerSnapshot], Dict[str, float]]] = None
-
+    # NOTE: eps is used across fit/star/finance computations and is owned by FitEngineConfig
 
 # =============================================================================
 # Engine
@@ -193,8 +158,14 @@ class TeamUtilityAdjuster:
     """
     config: TeamUtilityConfig = field(default_factory=TeamUtilityConfig)
 
+    _fit_engine: FitEngine = field(init=False, repr=False)
+
     # team-specific cache: (team_id, asset_key) -> TeamValuation
     _cache: Dict[Tuple[str, str], TeamValuation] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        # Single Source of Truth for fit evaluation.
+        self._fit_engine = FitEngine(config=self.config.fit)
 
     # -------------------------------------------------------------------------
     # Public API
@@ -363,8 +334,8 @@ class TeamUtilityAdjuster:
         exp = _safe_float(ctx.knobs.star_premium_exponent, 1.0)
         exp = _clamp(exp, 0.75, 1.60)
 
-        ref = max(cfg.star_reference_total, cfg.eps)
-        x = max(market.value.total, cfg.eps) / ref
+        ref = max(cfg.star_reference_total, cfg.fit.eps)
+        x = max(market.value.total, cfg.fit.eps) / ref
 
         # exp=1 -> 1.0
         # exp>1 -> big assets get factor up
@@ -394,131 +365,10 @@ class TeamUtilityAdjuster:
         ctx: DecisionContext,
         steps: List[ValuationStep],
     ) -> Tuple[ValueComponents, FitAssessment]:
-        cfg = self.config
-
-        need_map = dict(ctx.need_map or {})
-        if not need_map and ctx.policies is not None:
-            # 정책 뷰가 붙어 있다면 거기에서 보강
-            try:
-                need_map = dict(ctx.policies.fit.need_map or {})
-            except Exception:
-                need_map = {}
-
-        threshold = _safe_float(ctx.knobs.min_fit_threshold, 0.0)
-        threshold = _clamp(threshold, 0.0, 1.0)
-        fit_scale = _safe_float(ctx.knobs.fit_scale, 0.0)
-        fit_scale = _clamp(fit_scale, 0.0, 3.0)
-
-        supply = self._player_supply_vector(snap)
-        fit_score, matched = self._fit_score(need_map, supply, neutral=cfg.fit_neutral_score)
-
-        passed = bool(fit_score >= threshold)
-
-        fit_assessment = FitAssessment(
-            fit_score=fit_score,
-            threshold=threshold,
-            passed=passed,
-            matched_needs=matched,
-            meta={"need_map_size": len(need_map), "supply_size": len(supply)},
-        )
-
-        # Fit factor around neutral:
-        # neutral -> 1.0, above -> up, below -> down
-        centered = (fit_score - cfg.fit_neutral_score) * 2.0  # -1..+1 scale
-        raw_factor = 1.0 + fit_scale * centered
-        factor = _clamp(raw_factor, cfg.fit_factor_floor, cfg.fit_factor_cap)
-
-        steps.append(
-            ValuationStep(
-                stage=ValuationStage.TEAM,
-                mode=StepMode.MUL,
-                code="FIT_FACTOR",
-                label="팀 니즈 적합도 배율",
-                factor=factor,
-                meta={"fit_score": fit_score, "neutral": cfg.fit_neutral_score, "fit_scale": fit_scale},
-            )
-        )
-        v2 = v.scale(factor)
-
-        # Below-threshold penalty (soft gate)
-        if fit_score < threshold and threshold > cfg.eps:
-            severity = (threshold - fit_score) / max(threshold, cfg.eps)  # 0..1+
-            penalty = 1.0 / (1.0 + cfg.fit_below_threshold_strength * severity)
-            penalty = _clamp(penalty, cfg.fit_below_threshold_floor, 1.0)
-
-            steps.append(
-                ValuationStep(
-                    stage=ValuationStage.TEAM,
-                    mode=StepMode.MUL,
-                    code="FIT_BELOW_THRESHOLD_PENALTY",
-                    label="적합도 임계치 미달 페널티",
-                    factor=penalty,
-                    meta={"threshold": threshold, "fit_score": fit_score, "severity": severity},
-                )
-            )
-            v2 = v2.scale(penalty)
-
-        return v2, fit_assessment
-
-    def _fit_supported_tags(self, supply: Mapping[str, float]) -> set[str]:
-        # base(역할/휴리스틱) + custom extractor가 실제로 제공하는 태그 확장
-        s = set(FIT_SUPPORTED_TAGS_BASE)
-        s.update(str(k) for k in supply.keys())
-        return s
-
-    def _fit_score(
-        self,
-        need_map: Mapping[str, float],
-        supply: Mapping[str, float],
-        *,
-        neutral: float,
-    ) -> Tuple[float, Dict[str, float]]:
-        """
-        need_map은 "수요", supply는 "공급".
-        - 니즈 생성/재평가는 여기서 하지 않는다.
-        - 매칭 결과는 explainability를 위해 tag별로 남긴다.
-        """
-        # (옵션 1) unknown need 태그는 fit 계산에서 제외한다.
-        # - "선수가 못 채움"과 "평가 불가(정의되지 않은 태그)"를 구분하기 위함.
-        supported_tags = self._fit_supported_tags(supply)
-        
-        total_w = 0.0
-        acc = 0.0
-        matched: Dict[str, float] = {}
-
-        for tag, w in need_map.items():
-            if str(tag) not in supported_tags:
-                continue
-            ww = _clamp(_safe_float(w, 0.0), 0.0, 1.0)
-            if ww <= 0.0:
-                continue
-            s = _clamp(_safe_float(supply.get(tag, 0.0), 0.0), 0.0, 1.0)
-            total_w += ww
-            acc += ww * s
-            if s > 0.0:
-                matched[str(tag)] = s
-
-        if total_w <= 0.0:
-            # 니즈가 없거나(또는 전부 unsupported): fit은 중립으로 반환
-            return _clamp(neutral, 0.0, 1.0), {}
-
-        score = acc / total_w
-        return _clamp(score, 0.0, 1.0), matched
-
-    def _player_supply_vector(self, snap: PlayerSnapshot) -> Dict[str, float]:
-        """
-        공급 벡터는 팀과 무관하게 선수에게서 읽는다.
-        - ctx.need_map을 만들지 않는다.
-        - attrs_json / meta / role_fit 등 다양한 입력을 방어적으로 해석한다.
-        """
-        cfg = self.config
-
-        if cfg.custom_player_supply_extractor is not None:
-            try:
-                out = cfg.custom_player_supply_extractor(snap) or {}
-                return {str(k): _clamp(_safe_float(v, 0.0), 0.0, 1.0) for k, v in out.items()}
-            except Exception:
-                pass
+        res = self._fit_engine.assess_player_fit(snap, ctx)
+        for st in res.steps:
+            steps.append(st)
+        return v.scale(res.multiplier), res.fit
 
         supply: Dict[str, float] = {}
 
@@ -635,7 +485,7 @@ class TeamUtilityAdjuster:
         scale = _clamp(scale, 0.0, 2.0)
 
         salary = _safe_float(snap.salary_amount, 0.0)
-        if salary <= cfg.eps and snap.contract is not None and isinstance(snap.contract.salary_by_year, dict):
+        if salary <= cfg.fit.eps and snap.contract is not None and isinstance(snap.contract.salary_by_year, dict):
             # fallback: known salary proxy
             vals = [ _safe_float(x, 0.0) for x in snap.contract.salary_by_year.values() ]
             vals = [ x for x in vals if x > 0.0 ]
