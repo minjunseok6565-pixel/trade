@@ -30,19 +30,43 @@ import inspect
 
 from league_repo import LeagueRepo
 
-from ...config import ALL_TEAM_IDS
-from ...decision_context import (
-    DecisionContext,
-    GMTradeTraits,
-    build_decision_context,
-    gm_traits_from_profile_json,
-)
-from ...data.team_situation import (
-    TeamSituation,
-    TeamSituationContext,
-    TeamSituationEvaluator,
-    build_team_situation_context,
-)
+# --- Project-level modules live outside trades/ in the current project layout.
+# Keep imports flexible so this file survives future package refactors.
+try:
+    from config import ALL_TEAM_IDS  # type: ignore
+except Exception:  # pragma: no cover
+    from trade.config import ALL_TEAM_IDS  # type: ignore
+
+try:
+    from decision_context import (  # type: ignore
+        DecisionContext,
+        GMTradeTraits,
+        build_decision_context,
+        gm_traits_from_profile_json,
+    )
+except Exception:  # pragma: no cover
+    from trade.decision_context import (  # type: ignore
+        DecisionContext,
+        GMTradeTraits,
+        build_decision_context,
+        gm_traits_from_profile_json,
+    )
+
+# team_situation historically lived at data/team_situation.py in this project.
+try:
+    from team_situation import (  # type: ignore
+        TeamSituation,
+        TeamSituationContext,
+        TeamSituationEvaluator,
+        build_team_situation_context,
+    )
+except Exception:  # pragma: no cover
+    from data.team_situation import (  # type: ignore
+        TeamSituation,
+        TeamSituationContext,
+        TeamSituationEvaluator,
+        build_team_situation_context,
+    )
 from ..models import Deal
 from ..validator import validate_deal as _validate_deal
 from ..rules.tick_context import TradeRuleTickContext, build_trade_rule_tick_context
