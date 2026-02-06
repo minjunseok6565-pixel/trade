@@ -33,10 +33,10 @@ class TradeRuleTickContext:
     db_path: str
     current_date: date
     repo: LeagueRepo
-    owns_repo: bool = True
     ctx_state_base: dict
     assets_snapshot: dict
     season_year: int
+    owns_repo: bool = True
 
     players_meta_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     integrity_validated: bool = False
