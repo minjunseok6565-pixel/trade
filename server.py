@@ -752,6 +752,11 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
                 {"session_id": req.session_id, "teams": deal.teams},
             )
         validate_deal(deal, current_date=in_game_date)
+
+        # Hot path: negotiation UI calls this endpoint repeatedly.
+        # DB integrity is already guaranteed at startup and after any write APIs.
+        # Avoid running full repo integrity check on every offer update.
+        validate_deal(deal, current_date=in_game_date, db_path=db_path, integrity_check=False)
         
         # Always persist the latest valid offer payload
         negotiation_store.set_draft_deal(req.session_id, serialize_deal(deal))
@@ -809,6 +814,8 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
                 deal,
                 valid_days=2,
                 current_date=in_game_date,
+                validate=False,   # already validated above
+                db_path=db_path,  # keep hash/locking based on the same db snapshot
             )
             negotiation_store.set_committed(req.session_id, committed["deal_id"])
             return {
@@ -878,7 +885,9 @@ async def api_trade_evaluate(req: TradeEvaluateRequest):
         db_path = state.get_db_path()
 
         deal = canonicalize_deal(parse_deal(req.deal))
-        validate_deal(deal, current_date=in_game_date)
+        # Hot path: debug / UI-driven repeated calls.
+        # Integrity is checked at startup and after any DB writes.
+        validate_deal(deal, current_date=in_game_date, db_path=db_path, integrity_check=False)
 
         # Local import to avoid hard dependency during incremental integration.
         from trades.valuation.service import evaluate_deal_for_team as eval_service  # type: ignore
@@ -1051,6 +1060,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
