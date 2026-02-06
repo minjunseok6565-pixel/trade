@@ -370,58 +370,6 @@ class TeamUtilityAdjuster:
             steps.append(st)
         return v.scale(res.multiplier), res.fit
 
-        supply: Dict[str, float] = {}
-
-        # (A) role_fit 기반 공급 (있다면 가장 신뢰)
-        # 기대 형태: snap.meta["role_fit"] = {"Initiator_Primary": 0.72, ...}
-        role_fit = None
-        if isinstance(snap.meta, dict):
-            role_fit = snap.meta.get("role_fit")
-        if role_fit is None and isinstance(snap.attrs, dict):
-            role_fit = snap.attrs.get("role_fit")
-
-        if isinstance(role_fit, dict):
-            for role, score in role_fit.items():
-                tag = role_to_need_tag_only(str(role))
-                # ROLE_GAP은 "정의되지 않은 역할"이므로 공급 태그로 쓰지 않는다.
-                if tag == "ROLE_GAP":
-                    continue
-                s = _clamp(_safe_float(score, 0.0), 0.0, 1.0)
-                supply[tag] = max(supply.get(tag, 0.0), s)
-
-        # (B) attrs 기반 휴리스틱 공급 (role_fit이 부족할 때 보강)
-        if isinstance(snap.attrs, dict):
-            def attr_norm(keys: Tuple[str, ...]) -> float:
-                # 여러 키 중 가장 큰 신호를 사용 (키가 섞여도 안정적)
-                best = 0.0
-                for k in keys:
-                    if k in snap.attrs:
-                        v = _safe_float(snap.attrs.get(k), 0.0)
-                        # 0..99 또는 0..1 형태 모두 방어 처리
-                        if v > 1.5:
-                            v = v / max(cfg.attr_scale_max, cfg.eps)
-                        best = max(best, _clamp(v, 0.0, 1.0))
-                return best
-
-            spacing = attr_norm(cfg.attr_keys_spacing)
-            rim = attr_norm(cfg.attr_keys_rim_pressure)
-            init = attr_norm(cfg.attr_keys_primary_initiator)
-            create = attr_norm(cfg.attr_keys_shot_creation)
-            defense = attr_norm(cfg.attr_keys_defense)
-
-            if spacing > 0.0:
-                supply["SPACING"] = max(supply.get("SPACING", 0.0), spacing)
-            if rim > 0.0:
-                supply["RIM_PRESSURE"] = max(supply.get("RIM_PRESSURE", 0.0), rim)
-            if init > 0.0:
-                supply["PRIMARY_INITIATOR"] = max(supply.get("PRIMARY_INITIATOR", 0.0), init)
-            if create > 0.0:
-                supply["SHOT_CREATION"] = max(supply.get("SHOT_CREATION", 0.0), create)
-            if defense > 0.0:
-                supply["DEFENSE"] = max(supply.get("DEFENSE", 0.0), defense)
-
-        return supply
-
     # -------------------------------------------------------------------------
     # 4) Risk discount (players)
     # -------------------------------------------------------------------------
