@@ -751,8 +751,6 @@ async def api_trade_negotiation_commit(req: TradeNegotiationCommitRequest):
                 "Deal teams must match negotiation session",
                 {"session_id": req.session_id, "teams": deal.teams},
             )
-        validate_deal(deal, current_date=in_game_date)
-
         # Hot path: negotiation UI calls this endpoint repeatedly.
         # DB integrity is already guaranteed at startup and after any write APIs.
         # Avoid running full repo integrity check on every offer update.
@@ -1060,6 +1058,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
