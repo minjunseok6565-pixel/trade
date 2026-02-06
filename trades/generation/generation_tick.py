@@ -75,6 +75,7 @@ from ..valuation.data_context import (
     RepoValuationDataContext,
     build_repo_valuation_data_context,
 )
+from .asset_catalog import TradeAssetCatalog, build_trade_asset_catalog
 
 
 def _canon_team_id(team_id: Any) -> str:
@@ -188,6 +189,9 @@ class TradeGenerationTickContext:
     # valuation provider (snapshots + caches 유지)
     provider: RepoValuationDataContext
 
+    # tradable asset catalog (outgoing buckets / incoming indices / picks/swaps)
+    asset_catalog: Optional[TradeAssetCatalog] = None
+
     standings_order_worst_to_best: Optional[Sequence[str]] = None
 
     def get_team_situation(self, team_id: str) -> TeamSituation:
@@ -195,7 +199,14 @@ class TradeGenerationTickContext:
         if tid in self.team_situations:
             return self.team_situations[tid]
         # Fallback: evaluate on-demand (should be rare)
-        evaluator = TeamSituationEvaluator(ctx=self.team_situation_ctx, db_path=self.db_path)
+        evaluator_kwargs: Dict[str, Any] = {"ctx": self.team_situation_ctx, "db_path": self.db_path}
+        try:
+            init_sig = inspect.signature(TeamSituationEvaluator.__init__)
+            if "repo" in init_sig.parameters:
+                evaluator_kwargs["repo"] = self.repo
+        except Exception:
+            pass
+        evaluator = TeamSituationEvaluator(**evaluator_kwargs)  # type: ignore[arg-type]
         ts = evaluator.evaluate_team(tid)
         self.team_situations[tid] = ts
         return ts
@@ -374,7 +385,7 @@ def build_trade_generation_tick_context(
 
         season_year = int(getattr(rule_tick_ctx, "season_year", 0) or 0)
 
-        return TradeGenerationTickContext(
+        tick = TradeGenerationTickContext(
             db_path=resolved_db_path,
             current_date=resolved_current_date,
             season_year=season_year,
@@ -389,6 +400,22 @@ def build_trade_generation_tick_context(
             provider=provider,
             standings_order_worst_to_best=standings,
         )
+
+        # Build tradable asset catalog once per tick.
+        # This is intentionally constructed after the tick object so the catalog
+        # builder can reuse its caches (rule_tick_ctx / provider / team situations).
+        tick.asset_catalog = build_trade_asset_catalog(tick_ctx=tick)
+        return tick
+
+     except Exception:
+         # Ensure rule tick ctx is closed on build failures.
+         try:
+             rule_tick_ctx.close()  # type: ignore[name-defined]
+         except Exception:
+             pass
+         # Ensure repo is closed on build failures.
+         try:
+             repo.close()
 
     except Exception:
         # Ensure repo is closed on build failures.
