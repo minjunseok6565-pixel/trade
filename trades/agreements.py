@@ -34,10 +34,10 @@ from .models import (
 from .validator import validate_deal
 
 
-def _compute_assets_hash(deal: Deal) -> str:
+def _compute_assets_hash(deal: Deal, db_path: Optional[str] = None) -> str:
     ownership_snapshot: Dict[str, Any] = {}
     player_snapshots: list[dict[str, Any]] = []
-    db_path = state.get_db_path()
+    db_path = db_path or state.get_db_path()
 
     # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in state.
     # Use one DB transaction snapshot and ensure repo is closed to avoid connection leaks.
@@ -102,11 +102,21 @@ def create_committed_deal(
     deal: Deal,
     valid_days: int = 2,
     current_date: Optional[date] = None,
+    *,
+    validate: bool = True,
+    db_path: Optional[str] = None,
+    integrity_check: Optional[bool] = None,
 ) -> Dict[str, Any]:
     canonical = canonicalize_deal(deal)
-    validate_deal(canonical, current_date=current_date or get_current_date_as_date())
+    if validate:
+        validate_deal(
+            canonical,
+            current_date=current_date or get_current_date_as_date(),
+            db_path=db_path,
+            integrity_check=integrity_check,
+        )
     deal_id = str(uuid4())
-    assets_hash = _compute_assets_hash(canonical)
+    assets_hash = _compute_assets_hash(canonical, db_path=db_path)
     today = current_date or get_current_date_as_date()
     expires_at = today + timedelta(days=valid_days)
 
