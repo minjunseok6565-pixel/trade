@@ -298,6 +298,7 @@ def build_trade_generation_tick_context(
     # Shared repo for the tick.
     repo = LeagueRepo(resolved_db_path)
     owns_repo = True
+    rule_tick_ctx: Optional[TradeRuleTickContext] = None
 
     try:
         # Build rule tick ctx using shared repo.
@@ -407,18 +408,14 @@ def build_trade_generation_tick_context(
         tick.asset_catalog = build_trade_asset_catalog(tick_ctx=tick)
         return tick
 
-     except Exception:
-         # Ensure rule tick ctx is closed on build failures.
-         try:
-             rule_tick_ctx.close()  # type: ignore[name-defined]
-         except Exception:
-             pass
-         # Ensure repo is closed on build failures.
-         try:
-             repo.close()
 
     except Exception:
-        # Ensure repo is closed on build failures.
+        # On build failure, close the rule context (if created) and the shared repo.
+        try:
+            if rule_tick_ctx is not None:
+                rule_tick_ctx.close()
+        except Exception:
+            pass
         try:
             repo.close()
         except Exception:
