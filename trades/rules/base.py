@@ -151,8 +151,8 @@ def build_trade_context(
         assets_snap = tick_ctx.assets_snapshot
         season_year = tick_ctx.season_year
     else:
-        ctx_state_base = state.export_trade_context_snapshot(db_path=resolved_db_path)
-        assets_snap = state.export_trade_assets_snapshot(db_path=resolved_db_path)
+        ctx_state_base = state.export_trade_context_snapshot(db_path=resolved_db_path, repo=repo)
+        assets_snap = state.export_trade_assets_snapshot(db_path=resolved_db_path, repo=repo)
         season_year = int(ctx_state_base["league"]["season_year"])
     resolved_extra.setdefault("assets_snapshot", assets_snap)
 
