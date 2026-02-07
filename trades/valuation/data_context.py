@@ -20,7 +20,7 @@ market_pricing can use PickExpectation (expected pick number) if available.
 This module provides simple helpers to build expectations from standings order.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .types import (
@@ -548,6 +548,29 @@ def build_repo_valuation_data_context(
             confidence=float(expectation_confidence),
             year_filter=expectation_year_filter,
         )
+
+    # Normalize PickExpectations: ensure meta carries current_season_year so
+    # market_pricing can apply pick year discount consistently.
+    if pe:
+        pe_norm: PickExpectationMap = {}
+        for pick_id, exp in pe.items():
+            # Do not mutate exp.meta in-place; it might be shared/reused across contexts.
+            try:
+                meta = dict(exp.meta) if isinstance(exp.meta, dict) else {}
+            except Exception:
+                meta = {}
+
+            # market_pricing expects this key to exist (not just be truthy).
+            if meta.get("current_season_year") is None or meta.get("current_season_year") == "":
+                meta["current_season_year"] = int(current_season_year)
+
+            key = str(getattr(exp, "pick_id", None) or pick_id)
+            try:
+                pe_norm[key] = replace(exp, pick_id=key, meta=meta)
+            except Exception:
+                # Fallback: preserve original expectation if replace fails.
+                pe_norm[key] = exp
+        pe = pe_norm
 
     return RepoValuationDataContext(
         db_path=str(db_path),
