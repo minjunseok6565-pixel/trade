@@ -3,6 +3,12 @@ from typing import Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 프로젝트 내 정적 데이터(시드/리소스) 디렉토리
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
+# GM 프로필 시드 파일 기본 경로 (부트스트랩 자동 시딩에서 사용)
+GM_PROFILES_SEED_PATH = os.path.join(DATA_DIR, "gm_profiles.json")
+
 
 class _LegacyRosterDF:
     """Legacy roster DataFrame placeholder.
@@ -57,6 +63,7 @@ for conf, divs in DIVISIONS.items():
 MISSING_DIVISION_TEAMS = [t for t in ALL_TEAM_IDS if t not in TEAM_TO_CONF_DIV]
 if MISSING_DIVISION_TEAMS:
     print("[WARN] DIVISIONS 매핑에 없는 팀:", MISSING_DIVISION_TEAMS)
+
 
 # 시즌 기본 설정
 SEASON_START_MONTH = 10  # 10월

@@ -13,15 +13,14 @@ This file intentionally starts with a small, safe subset of write APIs. More com
 commands (trade commit, draft settlement, contract lifecycle) can be added incrementally.
 """
 
-import contextlib
 import datetime as _dt
 import hashlib
 import json
 import logging
 import sqlite3
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -69,6 +68,35 @@ def _today_iso() -> str:
 def _utc_now_iso() -> str:
     # Match LeagueRepo's timestamp format (UTC + "Z", no microseconds).
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _current_season_year_ssot() -> int:
+    """Authoritative season_year source for commands: use state league context snapshot.
+
+    This intentionally fails fast if state is unavailable/missing season_year,
+    to avoid mixed definitions (date-based inference vs explicit league season).
+    """
+    try:
+        import state  # local import to avoid import cycles at module import time
+
+        snap = state.get_league_context_snapshot()
+        y = snap.get("season_year")
+        if y is None:
+            raise KeyError("season_year missing in league context snapshot")
+        return int(y)
+    except Exception as exc:
+        raise RuntimeError("season_year SSOT unavailable: state.get_league_context_snapshot()['season_year'] required") from exc
+
+
+def _infer_season_year_from_date(d: date) -> int:
+    """Infer season start year for a given calendar date.
+
+    Uses config SEASON_START_MONTH/SEASON_START_DAY. If date is before season start
+    in the calendar year, it belongs to previous season year.
+    """
+    if (int(d.month), int(d.day)) >= (int(SEASON_START_MONTH), int(SEASON_START_DAY)):
+        return int(d.year)
+    return int(d.year) - 1
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
@@ -144,7 +172,7 @@ class LeagueService:
     # ----------------------------
     # Internal common helpers
     # ----------------------------
-    @contextlib.contextmanager
+    @contextmanager
     def _atomic(self):
         """
         Yield a cursor inside a DB transaction.
@@ -245,6 +273,13 @@ class LeagueService:
         for e in entries:
             if not isinstance(e, dict):
                 e = dict(e)
+            # Store season_year as a first-class column when provided (else NULL).
+            sy = e.get("season_year")
+            try:
+                season_year_i = int(sy) if sy is not None and str(sy) != "" else None
+            except (TypeError, ValueError):
+                _warn_limited("TX_SEASON_YEAR_COERCE_FAILED", f"value={sy!r}", limit=3)
+                season_year_i = None
             payload = _json_dumps(dict(e))
             tx_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
             rows.append(
@@ -252,6 +287,7 @@ class LeagueService:
                     tx_hash,
                     str(e.get("type") or "unknown"),
                     str(e.get("date") or "") if e.get("date") is not None else None,
+                    season_year_i,
                     str(e.get("deal_id") or "") if e.get("deal_id") is not None else None,
                     str(e.get("source") or "") if e.get("source") is not None else None,
                     _json_dumps(e.get("teams") or []),
@@ -261,8 +297,10 @@ class LeagueService:
             )
         cur.executemany(
             """
-            INSERT OR IGNORE INTO transactions_log(tx_hash, tx_type, tx_date, deal_id, source, teams_json, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR IGNORE INTO transactions_log(
+                tx_hash, tx_type, tx_date, season_year, deal_id, source, teams_json, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             rows,
         )
@@ -722,6 +760,7 @@ class LeagueService:
         This intentionally does *not* assume a specific Deal model shape.
         The raw deal object is stored under payload.deal for traceability.
         """
+        season_year_i = _current_season_year_ssot()
         entry: Dict[str, Any] = {
             "type": "trade",
             "date": _coerce_iso(trade_date),
@@ -730,6 +769,7 @@ class LeagueService:
             "deal_id": deal_id,
             "meta": dict(meta) if meta else {},
             "deal": deal if isinstance(deal, dict) else None,
+            "season_year": int(season_year_i),
         }
         # Remove noisy keys if empty
         if entry.get("deal_id") is None:
@@ -768,18 +808,57 @@ class LeagueService:
         free_agents is derived from roster.team_id == 'FA' by default (SSOT),
         so this method only needs to update the roster (and optionally contracts team sync).
         """
-        # released_date currently used only for logging; the roster update is date-agnostic.
+        released_date_iso = _coerce_iso(released_date)
+        season_year_i = _current_season_year_ssot()
+
+        # released_date is for logging; roster update itself is date-agnostic.
         with self._atomic() as cur:
-            self._move_player_team_in_cur(cur, player_id, "FA")
+            pid = self._norm_player_id(player_id)
+            row = cur.execute(
+                "SELECT team_id FROM roster WHERE player_id=? AND status='active';",
+                (pid,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"active roster entry not found for player_id={player_id}")
+            from_team = str(row["team_id"]).upper()
+            if from_team == "FA":
+                raise ValueError(f"player_id={player_id} is already a free agent")
+
+            self._move_player_team_in_cur(cur, pid, "FA")
+
+            # Log (SSOT): standardized contract-related transaction
+            self._insert_transactions_in_cur(
+                cur,
+                [
+                    {
+                        "type": "RELEASE_TO_FA",
+                        "action_type": "RELEASE_TO_FA",
+                        "action_date": released_date_iso,
+                        "date": released_date_iso,
+                        "season_year": int(season_year_i),
+                        "source": "contracts",
+                        "teams": [from_team],
+                        "team_id": from_team,
+                        "player_id": pid,
+                        "from_team": from_team,
+                        "to_team": "FA",
+                    }
+                ],
+            )
 
         event = ServiceEvent(
             type="release_to_free_agency",
             payload={
-                "date": _coerce_iso(released_date),
-                "player_id": str(player_id),
+                # Standardize payload so API callers can rely on it without
+                # performing additional DB reads.
+                "date": released_date_iso,
+                "season_year": int(season_year_i),
+                "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": from_team,
+                "to_team": "FA",
             },
         )
-        # Optional: also log it (caller can decide; keeping it explicit for now).
         return event
 
     # ----------------------------
@@ -893,6 +972,9 @@ class LeagueService:
             allow_locked_by_deal_id=str(deal_id),
         )
 
+        # SSOT: season_year must come from league context snapshot (state["league"]["season_year"])
+        season_year_i = _current_season_year_ssot()
+
         # Helpers
         def _resolve_receiver(sender_team: str, asset: Any) -> str:
             to_team = getattr(asset, "to_team", None)
@@ -958,14 +1040,20 @@ class LeagueService:
 
         tx_entry: Dict[str, Any] = {
             "type": "trade",
+            "trade_date": trade_date_iso,
             "date": trade_date_iso,
+            "created_at": None,  # filled at commit time
+            "season_year": int(season_year_i),
             "teams": [str(t).upper() for t in list(deal_obj.teams)],
             "assets": assets_summary,
+            "player_moves": [],  # filled at commit time (resolved from SSOT)
             "source": str(source),
             "deal_id": str(deal_id),
         }
 
         now = _utc_now_iso()
+        tx_entry["created_at"] = now
+        resolved_player_moves: List[Dict[str, str]] = []
         with self._atomic() as cur:
             # Idempotency (transactional): avoid double apply even if concurrent.
             if self._tx_exists_by_deal_id(cur, str(deal_id)):
@@ -1002,6 +1090,10 @@ class LeagueService:
                         "Player not owned by team",
                         {"player_id": pid, "team_id": from_team_u, "current_team": current_team},
                     )
+                # Capture from/to immediately before applying the move (SSOT-resolved).
+                resolved_player_moves.append(
+                    {"player_id": str(pid), "from_team": str(current_team), "to_team": str(to_team_u).upper()}
+                )
                 self._move_player_team_in_cur(cur, pid, to_team_u)
 
             # 2) Picks (ownership + protection_json)
@@ -1138,19 +1230,16 @@ class LeagueService:
                 )
 
             # 5) Log
+            tx_entry["player_moves"] = resolved_player_moves
             self._insert_transactions_in_cur(
                 cur,
                 [
-                    {
-                        "type": "trade",
-                        "date": trade_date_iso,
-                        "teams": [str(t).upper() for t in list(deal_obj.teams)],
-                        "assets": assets_summary,
-                        "source": str(source),
-                        "deal_id": str(deal_id),
-                    }
+                    dict(tx_entry)
                 ],
             )
+
+        # Ensure returned payload matches what was persisted (including resolved player_moves).
+        tx_entry["player_moves"] = resolved_player_moves
 
         return tx_entry
 
@@ -1260,6 +1349,7 @@ class LeagueService:
         team_norm = self._norm_team_id(team_id, strict=True)
         pid = self._norm_player_id(player_id)
         signed_date_iso = _coerce_iso(signed_date)
+        season_year_i = _current_season_year_ssot()
         years_i = int(years)
         if years_i <= 0:
             raise ValueError("years must be >= 1")
@@ -1359,12 +1449,17 @@ class LeagueService:
                 cur,
                 [
                     {
-                        "type": "signing",
+                        "type": "SIGN_FREE_AGENT",
                         "date": signed_date_iso,
+                        "action_date": signed_date_iso,
+                        "action_type": "SIGN_FREE_AGENT",
+                        "season_year": int(season_year_i),
                         "source": "contracts",
                         "teams": [team_norm],
                         "team_id": team_norm,
                         "player_id": pid,
+                        "from_team": "FA",
+                        "to_team": team_norm,
                         "contract_id": contract_id,
                         "start_season_year": int(start_season_year),
                         "years": years_i,
@@ -1375,8 +1470,14 @@ class LeagueService:
         return ServiceEvent(
             type="sign_free_agent",
             payload={
-                "team_id": team_norm,
+                # Standardized, rule/endpoint-friendly summary.
+                "date": signed_date_iso,
+                "season_year": int(season_year_i),
                 "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": "FA",
+                "to_team": team_norm,
+                "team_id": team_norm,
                 "contract_id": contract_id,
                 "signed_date": signed_date_iso,
                 "start_season_year": int(start_season_year),
@@ -1397,6 +1498,7 @@ class LeagueService:
         team_norm = self._norm_team_id(team_id, strict=True)
         pid = self._norm_player_id(player_id)
         signed_date_iso = _coerce_iso(signed_date)
+        season_year_i = _current_season_year_ssot()
         years_i = int(years)
         if years_i <= 0:
             raise ValueError("years must be >= 1")
@@ -1477,12 +1579,17 @@ class LeagueService:
                 cur,
                 [
                     {
-                        "type": "re_sign_or_extend",
+                        "type": "RE_SIGN_OR_EXTEND",
                         "date": signed_date_iso,
+                        "action_date": signed_date_iso,
+                        "action_type": "RE_SIGN_OR_EXTEND",
+                        "season_year": int(season_year_i),
                         "source": "contracts",
                         "teams": [team_norm],
                         "team_id": team_norm,
                         "player_id": pid,
+                        "from_team": team_norm,
+                        "to_team": team_norm,
                         "contract_id": contract_id,
                         "start_season_year": int(start_season_year),
                         "years": years_i,
@@ -1493,8 +1600,14 @@ class LeagueService:
         return ServiceEvent(
             type="re_sign_or_extend",
             payload={
-                "team_id": team_norm,
+                # Standardized, rule/endpoint-friendly summary.
+                "date": signed_date_iso,
+                "season_year": int(season_year_i),
                 "player_id": pid,
+                "affected_player_ids": [pid],
+                "from_team": team_norm,
+                "to_team": team_norm,
+                "team_id": team_norm,
                 "contract_id": contract_id,
                 "signed_date": signed_date_iso,
                 "start_season_year": int(start_season_year),
@@ -1699,11 +1812,15 @@ class LeagueService:
                         released_player_ids.append(player_id)
                     except KeyError:
                         # No active roster row; skip release
-                    _warn_limited(
-                        "RELEASE_TO_FA_SKIPPED_NO_ACTIVE_ROSTER",
-                        f"player_id={pid!r} team_id={team_id!r} effective_date={effective_date!r}",
-                        limit=3,
-                    )
+                        _warn_limited(
+                            "RELEASE_TO_FA_SKIPPED_NO_ACTIVE_ROSTER",
+                            (
+                                f"player_id={player_id!r} "
+                                f"contract_id={contract_id!r} "
+                                f"to_year={to_year_i}"
+                            ),
+                            limit=3,
+                        )
                         pass
                 else:
                     # Contract continues: update roster salary for the new season if we can.

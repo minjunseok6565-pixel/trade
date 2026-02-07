@@ -123,11 +123,13 @@ def _resolve_receiver(deal: Any, sender_team: str, asset: Any) -> str:
 
 
 def build_trade_context(
+    deal: Any,
     current_date: Optional[date] = None,
     extra: Optional[dict[str, Any]] = None,
     db_path: Optional[str] = None,
 ) -> TradeContext:
     import state
+    from . import rule_player_meta
 
     if current_date is None:
         current_date = state.get_current_date_as_date()
@@ -144,12 +146,50 @@ def build_trade_context(
 
     resolved_db_path = db_path or state.get_db_path()
     repo = LeagueRepo(resolved_db_path)
-    repo.init_db()
+    # DB schema is guaranteed during server startup (state.startup_init_state()).
 
     ctx_state = state.export_trade_context_snapshot()
     assets_snap = state.export_trade_assets_snapshot()
     resolved_extra.setdefault("assets_snapshot", assets_snap)
+    season_year = int(ctx_state["league"]["season_year"])
 
+    # -----------------------------------------------------------------
+    # Inject rule-only player metadata derived from SSOT (DB).
+    # - Do NOT read UI cache.
+    # - Fail-fast if SSOT cannot provide metadata for any player in the deal.
+    # -----------------------------------------------------------------
+    deal_player_ids: list[str] = []
+    seen: set[str] = set()
+    # Avoid importing trades.models at module import time to reduce cycles.
+    from ..models import PlayerAsset
+
+    for _team_id, assets in getattr(deal, "legs", {}).items():
+        for asset in assets or []:
+            if not isinstance(asset, PlayerAsset):
+                continue
+            try:
+                pid = _normalize_player_id(asset.player_id)
+            except Exception as e:
+                raise RuntimeError(f"Invalid player_id in deal asset: {asset!r}") from e
+            if pid in seen:
+                continue
+            seen.add(pid)
+            deal_player_ids.append(pid)
+
+    # Fail-fast if season_year is missing or current_date format is inconsistent.
+    # season_year SSOT is ctx_state["league"]["season_year"] (from league context snapshot).
+    players_meta = rule_player_meta.build_rule_players_meta(
+        repo, deal_player_ids, season_year=season_year, as_of_date=current_date
+    )
+    missing = sorted(set(deal_player_ids) - set(players_meta.keys()))
+    if missing:
+        raise RuntimeError(
+            "Trade rule evaluation requires SSOT-backed player meta; "
+            f"missing meta for player_ids={missing}"
+        )
+    # Always present a players dict for rules; may be empty for pick-only deals.
+    ctx_state["players"] = players_meta
+    
     return TradeContext(
         game_state=ctx_state,
         repo=repo,

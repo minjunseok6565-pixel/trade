@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import date
+import logging
 from threading import RLock
 from typing import Any, Callable, Optional, TypeVar
 
@@ -17,6 +18,8 @@ from state_modules.state_constants import (
     _META_PLAYER_KEYS,
 )
 from state_modules.state_store import read_state, reset_state_for_dev as _reset_state_for_dev, snapshot_state, transaction
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_TRADE_RULES",
@@ -72,10 +75,12 @@ __all__ = [
     "trade_market_set",
     "trade_memory_get",
     "trade_memory_set",
-    "players_get",
-    "players_set",
-    "teams_get",
-    "teams_set",
+    "ui_cache_get",
+    "ui_cache_set",
+    "ui_players_get",
+    "ui_players_set",
+    "ui_teams_get",
+    "ui_teams_set",
     "reset_state_for_dev",
 ]
 
@@ -192,7 +197,7 @@ def ensure_schedule_for_active_season(*, force: bool = False) -> None:
 
         active_year = _season_year_from_season_id(active)
 
-        # SSOT 동기화(미리 채움): league.season_year/draft_year는 active와 일치해야 한다.
+        # 상태 일관성(미리 채움): active_season_id 기준으로 league.season_year/draft_year를 맞춘다.
         league_year = league.get("season_year")
         if league_year is None:
             league["season_year"] = int(active_year)
@@ -311,7 +316,7 @@ def start_new_season(
         next_sid = _season_id_for_year(int(target_year))
         set_active_season_id(next_sid)
 
-        # SSOT 동기화는 set_active_season_id가 수행한다.
+        # 상태 일관성 동기화는 set_active_season_id가 수행한다.
 
         if rebuild_schedule:
             ensure_schedule_for_active_season(force=True)
@@ -326,7 +331,24 @@ def start_new_season(
             "active_season_id": state.get("active_season_id"),
         }
 
-    return _mutate_state("start_new_season", _impl)
+    result = _mutate_state("start_new_season", _impl)
+
+    # Best-effort UI cache rebuild after offseason / season transition.
+    # UI cache is derived and must not be authoritative; it should never block core state updates.
+    try:
+        if run_offseason and isinstance(result, dict) and result.get("offseason") is not None:
+            # Import locally to avoid import-time cycles (team_utils imports state).
+            from team_utils import ui_cache_rebuild_all
+
+            ui_cache_rebuild_all()
+    except Exception:
+        logger.warning(
+            "UI cache rebuild failed after start_new_season: result=%r",
+            result,
+            exc_info=True,
+        )
+
+    return result
 
 def _require_active_season_id_matches(state: dict, season_id: str) -> str:
     """ingest 등 공개 동작에서 'active season' 불일치를 fail-fast로 차단한다."""
@@ -357,7 +379,9 @@ def startup_init_state() -> None:
         
         state_bootstrap.ensure_db_initialized_and_seeded(state)
 
-        # SSOT 초기화: active_season_id / league.season_year가 비어있으면 INITIAL 시즌을 명시적으로 시작한다.
+        # 상태 초기화/일관성 보정:
+        # - active_season_id와 league.season_year가 모두 비어있으면 INITIAL 시즌을 명시적으로 시작한다.
+        # - 한쪽만 존재하면 다른 쪽을 최소 보정한다(아카이브/리셋 없음).
         league = state.get("league") or {}
         if state.get("active_season_id") is None and league.get("season_year") is None:
             start_new_season(INITIAL_SEASON_YEAR, rebuild_schedule=True, run_offseason=False)
@@ -584,12 +608,24 @@ def set_cached_playoff_news_snapshot(cache: dict) -> None:
 
 def export_trade_context_snapshot() -> dict:
     def _impl(v: Mapping[str, Any]) -> dict:
+        # Include GM/team profiles (e.g., patience/attitude) in the trade context.
+        # Source of truth: SQLite gm_profiles table via LeagueRepo.
+        teams = {}
+        try:
+            from league_repo import LeagueRepo
+
+            with LeagueRepo(get_db_path()) as repo:
+                teams = repo.get_all_gm_profiles() or {}
+            teams = _to_plain(teams)
+        except Exception:
+            # If DB isn't ready or profiles are missing/malformed, fail closed with empty dict.
+            teams = {}
+            
         return {
-            "players": _to_plain(v.get("players") or {}),
-            "teams": _to_plain(v.get("teams") or {}),
             "asset_locks": _to_plain(v.get("asset_locks") or {}),
             "league": get_league_context_snapshot(),
             "my_team_id": v["postseason"]["my_team_id"],
+            "teams": teams,
         }
 
     return _read_state(_impl)
@@ -610,14 +646,6 @@ def ensure_cap_model_populated_if_needed() -> None:
 
     _mutate_state("ensure_cap_model_populated_if_needed", _impl)
 
-
-def ensure_player_ids_normalized(*, allow_legacy_numeric: bool = True) -> dict:
-    from state_modules import state_bootstrap
-
-    def _impl(state: dict) -> dict:
-        return state_bootstrap.ensure_player_ids_normalized(state, allow_legacy_numeric=allow_legacy_numeric)
-
-    return _mutate_state("ensure_player_ids_normalized", _impl)
 
 
 def ensure_trade_state_keys() -> None:
@@ -730,26 +758,62 @@ def trade_memory_set(value: dict) -> None:
     _mutate_state("trade_memory_set", _impl)
 
 
-def players_get() -> dict:
-    return _read_state(lambda v: _to_plain(v.get("players") or {}))
+# ---------------------------------------------------------------------
+# UI cache (read-model) accessors.
+# - This is explicitly *non-authoritative* data meant for UI rendering.
+# - Game rules and validations must not depend on these values.
+# ---------------------------------------------------------------------
 
 
-def players_set(value: dict) -> None:
+def ui_cache_get() -> dict:
+    return _read_state(lambda v: _to_plain(v.get("ui_cache") or {}))
+
+
+def ui_cache_set(value: dict) -> None:
     def _impl(state: dict) -> None:
-        state["players"] = deepcopy(value)
+        state["ui_cache"] = deepcopy(value)
 
-    _mutate_state("players_set", _impl)
-
-
-def teams_get() -> dict:
-    return _read_state(lambda v: _to_plain(v.get("teams") or {}))
+    _mutate_state("ui_cache_set", _impl)
 
 
-def teams_set(value: dict) -> None:
+def ui_players_get() -> dict:
+    def _impl(v: Mapping[str, Any]) -> dict:
+        ui_cache = v.get("ui_cache") or {}
+        if not isinstance(ui_cache, Mapping):
+            return {}
+        return _to_plain(ui_cache.get("players") or {})
+
+    return _read_state(_impl)
+
+
+def ui_players_set(value: dict) -> None:
     def _impl(state: dict) -> None:
-        state["teams"] = deepcopy(value)
+        ui_cache = state.get("ui_cache")
+        if not isinstance(ui_cache, dict):
+            raise ValueError("ui_players_set: ui_cache missing or invalid; UI cache must be initialized explicitly")
+        ui_cache["players"] = deepcopy(value)
 
-    _mutate_state("teams_set", _impl)
+    _mutate_state("ui_players_set", _impl)
+
+
+def ui_teams_get() -> dict:
+    def _impl(v: Mapping[str, Any]) -> dict:
+        ui_cache = v.get("ui_cache") or {}
+        if not isinstance(ui_cache, Mapping):
+            return {}
+        return _to_plain(ui_cache.get("teams") or {})
+
+    return _read_state(_impl)
+
+
+def ui_teams_set(value: dict) -> None:
+    def _impl(state: dict) -> None:
+        ui_cache = state.get("ui_cache")
+        if not isinstance(ui_cache, dict):
+            raise ValueError("ui_teams_set: ui_cache missing or invalid; UI cache must be initialized explicitly")
+        ui_cache["teams"] = deepcopy(value)
+
+    _mutate_state("ui_teams_set", _impl)
 
 
 def reset_state_for_dev() -> None:
@@ -930,6 +994,11 @@ def set_active_season_id(next_season_id: str) -> None:
         next_year = _season_year_from_season_id(str(next_season_id))
         state["league"]["season_year"] = int(next_year)
         state["league"]["draft_year"] = int(next_year) + 1
+
+        # Re-apply cap/apron model on season transition when cap_auto_update is enabled.
+        # This keeps trade_rules.salary_cap/first_apron/second_apron aligned with the new season_year.
+        from state_modules import state_bootstrap
+        state_bootstrap.ensure_cap_model_populated_if_needed(state)
 
         _clear_master_schedule(state["league"])
 

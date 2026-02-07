@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 _WARN_COUNTS: Dict[str, int] = {}
@@ -19,15 +19,15 @@ def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
 
 from derived_formulas import compute_derived
 from state import (
-    ensure_cap_model_populated_if_needed,
     export_full_state_snapshot,
+    export_workflow_state,
     get_db_path,
     get_league_context_snapshot,
-    initialize_master_schedule_if_needed,
-    players_get,
-    players_set,
-    teams_get,
-    teams_set,
+    ui_cache_set,
+    ui_players_get,
+    ui_players_set,
+    ui_teams_get,
+    ui_teams_set,
 )
 
 # Division/Conference mapping can stay in config (static).
@@ -50,16 +50,8 @@ def _repo_ctx() -> "LeagueRepo":
 
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
-        try:
-            repo.init_db()
-        except Exception as exc:
-            logger.exception(
-                "[DB_INIT_FAILED] team_utils._repo_ctx repo.init_db() failed (db_path=%s)",
-                db_path,
-            )
-            raise
+        # DB schema is guaranteed during server startup (state.startup_init_state()). repo
         yield repo
-
 
 def _list_active_team_ids() -> List[str]:
     """Return active team ids from DB if possible.
@@ -111,88 +103,82 @@ def _parse_potential(pot_raw: Any) -> float:
         return 0.6
 
 
-def _init_players_and_teams_if_needed() -> None:
-    """Initialize state player/team caches.
+def build_ui_players(repo: "LeagueRepo") -> Dict[str, Dict[str, Any]]:
+    """Pure builder: create UI players dict from DB SSOT via repo.
 
-    Step 6 invariant:
-    - players are keyed by **player_id (string)**.
-    - Never depend on a pandas DataFrame index for IDs.
+    - No reads/writes to global state.
+    - Shape should remain stable to avoid UI regressions.
     """
-    # If players already exist, backfill missing derived using DB row (if present).
-    existing_players = players_get()
-    if isinstance(existing_players, dict) and existing_players:
-        try:
-            with _repo_ctx() as repo:
-                updated_players = dict(existing_players)
-                for pid, pdata in list(updated_players.items()):
-                    if not isinstance(pdata, dict):
-                        continue
-
-                    derived = pdata.get("derived")
-                    if isinstance(derived, dict) and derived:
-                        continue
-                    try:
-                        row = repo.get_player(str(pid))
-                    except (sqlite3.Error, TypeError, ValueError):
-                        _warn_limited("DB_GET_PLAYER_FAILED", f"player_id={pid!r}", limit=3)
-                        continue
-                    attrs = row.get("attrs") or {}
-                    try:
-                        pdata["derived"] = compute_derived(attrs)
-                    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                        _warn_limited("DERIVED_COMPUTE_FAILED", f"player_id={pid!r}", limit=3)
-                        pass
-                players_set(updated_players)
-                return
-        except (ImportError, sqlite3.Error, OSError, TypeError) as exc:
-            _warn_limited(
-                "INIT_PLAYERS_CACHE_REFRESH_FAILED",
-                f"exc_type={type(exc).__name__}",
-                limit=3,
-            )
-            return
-
-    # Fresh build from DB
     players: Dict[str, Dict[str, Any]] = {}
-    team_ids = _list_active_team_ids()
+
+    # Determine which teams to build rosters for.
+    # Prefer DB-driven teams; fall back to static config on failure.
+    try:
+        team_ids = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
+        if not team_ids:
+            team_ids = list(ALL_TEAM_IDS)
+        has_fa = "FA" in {str(t).upper() for t in repo.list_teams()}
+    except Exception:
+        _warn_limited("UI_PLAYERS_LIST_TEAMS_FAILED", "falling back to ALL_TEAM_IDS", limit=3)
+        team_ids = list(ALL_TEAM_IDS)
+        has_fa = False
+
     roster_team_ids = list(team_ids)
-    if _has_free_agents_team():
+    if has_fa:
         roster_team_ids.append("FA")
 
-    with _repo_ctx() as repo:
-        for tid in roster_team_ids:
+    for tid in roster_team_ids:
+        try:
+            roster_rows = repo.get_team_roster(tid)
+        except (sqlite3.Error, TypeError, ValueError, KeyError):
+            _warn_limited("DB_GET_TEAM_ROSTER_FAILED", f"team_id={tid!r}", limit=3)
+            continue
+
+        for row in roster_rows:
+            pid = str(row.get("player_id"))
+            attrs = row.get("attrs") or {}
+
+            # Keep shape consistent with legacy UI cache entries.
+            # (signed/acquired fields are UI-only now; trade rules must not depend on them.)
+            entry: Dict[str, Any] = {
+                "player_id": pid,
+                "name": row.get("name") or attrs.get("Name") or "",
+                "team_id": str(tid).upper(),
+                "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
+                "age": int(row.get("age") or 0),
+                "overall": float(row.get("ovr") or 0.0),
+                "salary": float(row.get("salary_amount") or 0.0),
+                "potential": _parse_potential(attrs.get("Potential")),
+                "signed_date": "1900-01-01",
+                "signed_via_free_agency": False,
+                "acquired_date": "1900-01-01",
+                "acquired_via_trade": False,
+            }
+
             try:
-                roster_rows = repo.get_team_roster(tid)
-            except (sqlite3.Error, TypeError, ValueError):
-                _warn_limited("DB_GET_TEAM_ROSTER_FAILED", f"team_id={tid!r}", limit=3)
-                continue
-            for row in roster_rows:
-                pid = str(row.get("player_id"))
-                attrs = row.get("attrs") or {}
+                entry["derived"] = compute_derived(attrs)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                _warn_limited("DERIVED_COMPUTE_FAILED", f"player_id={pid!r}", limit=3)
+                entry["derived"] = {}
 
-                players[pid] = {
-                    "player_id": pid,
-                    "name": row.get("name") or attrs.get("Name") or "",
-                    "team_id": str(tid).upper(),
-                    "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
-                    "age": int(row.get("age") or 0),
-                    "overall": float(row.get("ovr") or 0.0),
-                    "salary": float(row.get("salary_amount") or 0.0),
-                    "potential": _parse_potential(attrs.get("Potential")),
-                    "derived": compute_derived(attrs),
-                    "signed_date": "1900-01-01",
-                    "signed_via_free_agency": False,
-                    "acquired_date": "1900-01-01",
-                    "acquired_via_trade": False,
-                }
+            players[pid] = entry
 
-    players_set(players)
+    return players
 
+
+def build_ui_teams(team_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Pure builder: create UI teams dict from static config.
+
+    - No reads/writes to global state.
+    """
     teams_meta: Dict[str, Dict[str, Any]] = {}
     for tid in team_ids:
-        info = TEAM_TO_CONF_DIV.get(tid, {})
-        teams_meta[tid] = {
-            "team_id": tid,
+        tid_u = str(tid).upper()
+        if tid_u == "FA":
+            continue
+        info = TEAM_TO_CONF_DIV.get(tid_u, {})
+        teams_meta[tid_u] = {
+            "team_id": tid_u,
             "conference": info.get("conference"),
             "division": info.get("division"),
             "tendency": "neutral",
@@ -200,7 +186,102 @@ def _init_players_and_teams_if_needed() -> None:
             "market": "mid",
             "patience": 0.5,
         }
-    teams_set(teams_meta)
+    return teams_meta
+
+
+def ui_cache_rebuild_all() -> None:
+    """State writer: rebuild the entire UI cache from DB/config."""
+    with _repo_ctx() as repo:
+        # Team ids for teams meta should exclude FA.
+        try:
+            team_ids = [str(t).upper() for t in repo.list_teams() if str(t).upper() != "FA"]
+            if not team_ids:
+                team_ids = list(ALL_TEAM_IDS)
+        except Exception:
+            _warn_limited("UI_TEAMS_LIST_TEAMS_FAILED", "falling back to ALL_TEAM_IDS", limit=3)
+            team_ids = list(ALL_TEAM_IDS)
+
+        players = build_ui_players(repo)
+        teams = build_ui_teams(team_ids)
+
+    # Commit as one unit to avoid transient mismatch between players/teams.
+    ui_cache_set({"players": players, "teams": teams})
+
+
+def ui_cache_refresh_players(player_ids: Iterable[str]) -> None:
+    """State writer: refresh UI cache entries for the given player_ids only.
+
+    - Reads latest data from DB SSOT (players + roster salary/team).
+    - Deletes entries for players not found on an active roster.
+    """
+    # Normalize & de-dup deterministically.
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for pid in player_ids:
+        spid = str(pid)
+        if not spid or spid in seen:
+            continue
+        seen.add(spid)
+        normalized.append(spid)
+
+    if not normalized:
+        return
+
+    current = ui_players_get()
+    if not isinstance(current, dict):
+        current = {}
+    updated_players: Dict[str, Dict[str, Any]] = dict(current)
+
+    with _repo_ctx() as repo:
+        try:
+            team_by_pid = repo.get_team_ids_by_players(normalized)
+        except Exception:
+            _warn_limited("UI_REFRESH_TEAM_LOOKUP_FAILED", "skipping refresh", limit=3)
+            return
+
+        for pid in normalized:
+            tid = team_by_pid.get(pid)
+            if not tid:
+                # No active roster entry -> remove from UI cache.
+                updated_players.pop(pid, None)
+                continue
+
+            try:
+                row = repo.get_player(pid)
+            except (KeyError, sqlite3.Error, TypeError, ValueError):
+                _warn_limited("DB_GET_PLAYER_FAILED", f"player_id={pid!r}", limit=3)
+                continue
+
+            attrs = row.get("attrs") or {}
+            try:
+                salary_amt = repo.get_salary_amount(pid)
+            except Exception:
+                salary_amt = None
+
+            entry: Dict[str, Any] = {
+                "player_id": str(row.get("player_id") or pid),
+                "name": row.get("name") or attrs.get("Name") or "",
+                "team_id": str(tid).upper(),
+                "pos": row.get("pos") or attrs.get("POS") or attrs.get("Position") or "",
+                "age": int(row.get("age") or 0),
+                "overall": float(row.get("ovr") or 0.0),
+                "salary": float(salary_amt or 0.0),
+                "potential": _parse_potential(attrs.get("Potential")),
+                "signed_date": "1900-01-01",
+                "signed_via_free_agency": False,
+                "acquired_date": "1900-01-01",
+                "acquired_via_trade": False,
+            }
+
+            try:
+                entry["derived"] = compute_derived(attrs)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                _warn_limited("DERIVED_COMPUTE_FAILED", f"player_id={pid!r}", limit=3)
+                entry["derived"] = {}
+
+            updated_players[pid] = entry
+
+    ui_players_set(updated_players)
 
 
 def _compute_team_payroll(team_id: str) -> float:
@@ -223,8 +304,7 @@ def _compute_team_payroll(team_id: str) -> float:
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
-    # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
-    ensure_cap_model_populated_if_needed()
+    # Assumes cap model (salary_cap/aprons) is already populated during server startup/hydration.
     league_context = get_league_context_snapshot()
     trade_rules = league_context.get("trade_rules", {})
     try:
@@ -237,11 +317,15 @@ def _compute_cap_space(team_id: str) -> float:
 
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
-    initialize_master_schedule_if_needed()
     league = export_full_state_snapshot().get("league", {})
     master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
+    if not games:
+        raise RuntimeError(
+            "Master schedule is not initialized. Expected state.startup_init_state() to run before calling team_utils._compute_team_records()."
+        )
+    
     team_ids = _list_active_team_ids()
     records: Dict[str, Dict[str, Any]] = {
         tid: {"wins": 0, "losses": 0, "pf": 0, "pa": 0}
@@ -277,7 +361,6 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
 
 def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
     """Return standings grouped by conference."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
 
     standings = {"east": [], "west": []}
@@ -338,13 +421,16 @@ def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
 
 def get_team_cards() -> List[Dict[str, Any]]:
     """Return team summary cards."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
     team_ids = _list_active_team_ids()
 
     team_cards: List[Dict[str, Any]] = []
     for tid in team_ids:
-        meta = teams_get().get(tid, {})
+        meta = ui_teams_get().get(tid, {})
+        # Default meta fallback (cache may be empty): use static conf/div mapping.
+        static_info = TEAM_TO_CONF_DIV.get(tid, {}) or {}
+        conf = meta.get("conference") or static_info.get("conference")
+        div = meta.get("division") or static_info.get("division")
         rec = records.get(tid, {})
         wins = rec.get("wins", 0)
         losses = rec.get("losses", 0)
@@ -352,8 +438,8 @@ def get_team_cards() -> List[Dict[str, Any]]:
         win_pct = wins / gp if gp else 0.0
         card = {
             "team_id": tid,
-            "conference": meta.get("conference"),
-            "division": meta.get("division"),
+            "conference": conf,
+            "division": div,
             "wins": wins,
             "losses": losses,
             "win_pct": win_pct,
@@ -368,7 +454,6 @@ def get_team_cards() -> List[Dict[str, Any]]:
 
 def get_team_detail(team_id: str) -> Dict[str, Any]:
     """Return team detail (summary + roster) using DB roster."""
-    _init_players_and_teams_if_needed()
     tid = str(team_id).upper()
 
     team_ids = set(_list_active_team_ids())
@@ -379,7 +464,11 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
     standings = get_conference_standings()
     rank_map = {r["team_id"]: r for r in standings.get("east", []) + standings.get("west", [])}
 
-    meta = teams_get().get(tid, {})
+    meta = ui_teams_get().get(tid, {})
+    # Default meta fallback (cache may be empty): use static conf/div mapping.
+    static_info = TEAM_TO_CONF_DIV.get(tid, {}) or {}
+    conf = meta.get("conference") or static_info.get("conference")
+    div = meta.get("division") or static_info.get("division")
     rec = records.get(tid, {})
     rank_entry = rank_map.get(tid, {})
     wins = rec.get("wins", 0)
@@ -392,8 +481,8 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
 
     summary = {
         "team_id": tid,
-        "conference": meta.get("conference"),
-        "division": meta.get("division"),
+        "conference": conf,
+        "division": div,
         "wins": wins,
         "losses": losses,
         "win_pct": win_pct,
@@ -441,6 +530,17 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
+
+
+
+
+
+
+
+
+
+
 
 
 

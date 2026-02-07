@@ -51,7 +51,7 @@ def _compute_assets_hash(deal: Deal) -> str:
     # DB SSOT: draft_picks / swap_rights / fixed_assets are no longer reliable in state.
     # Use one DB transaction snapshot and ensure repo is closed to avoid connection leaks.
     with contextlib.closing(LeagueRepo(db_path)) as repo:
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         snap = repo.get_trade_assets_snapshot() or {}
         draft_picks = (snap.get("draft_picks") or {}) if isinstance(snap, dict) else {}
         swap_rights = (snap.get("swap_rights") or {}) if isinstance(snap, dict) else {}
