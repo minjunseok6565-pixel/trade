@@ -196,13 +196,15 @@ class MarketPricer:
         pick_expectation: Optional[PickExpectation] = None,
         resolved_pick_a: Optional[PickSnapshot] = None,
         resolved_pick_b: Optional[PickSnapshot] = None,
+        resolved_pick_a_expectation: Optional[PickExpectation] = None,
+        resolved_pick_b_expectation: Optional[PickExpectation] = None,
     ) -> MarketValuation:
         """
         deal_evaluator에서 호출하는 단일 진입점.
 
         - pick: pick_expectation을 주입할 수 있음
         - swap: swap의 pick_id_a/b를 resolve한 PickSnapshot을 같이 주입할 수 있음
-          (swap pricing은 pick snapshot이 필요)
+          (swap pricing은 pick snapshot + 기대순번/연도할인 기대치가 필요)
         """
         kind = snapshot_kind(snap)
         ref_id = snapshot_ref_id(snap)
@@ -232,6 +234,8 @@ class MarketPricer:
                 asset_key=asset_key,
                 pick_a=resolved_pick_a,
                 pick_b=resolved_pick_b,
+                pick_a_expectation=resolved_pick_a_expectation,
+                pick_b_expectation=resolved_pick_b_expectation,
             )
             self._cache_swap[ref_id] = out
             return out
@@ -647,6 +651,8 @@ class MarketPricer:
         asset_key: str,
         pick_a: Optional[PickSnapshot],
         pick_b: Optional[PickSnapshot],
+        pick_a_expectation: Optional[PickExpectation],
+        pick_b_expectation: Optional[PickExpectation],
     ) -> MarketValuation:
         cfg = self.config
         steps: List[ValuationStep] = []
@@ -672,20 +678,34 @@ class MarketPricer:
                 meta={"active": snap.active, "owner_team": snap.owner_team},
             )
 
-        # For swap market value we approximate:
-        # value ~= exercise_prob * max(0, V(best) - V(worst)) * swap_exercise_scale
-        # We need pick market value; since market_pricing is pure, we reuse pick curve with neutral expectation (mid pick).
-        # Better: deal_evaluator can pass PickExpectation via pick snapshots meta later; for now, we price with fallback.
-        exp_a = float(pick_a.meta.get("expected_pick_number", 16.0)) if isinstance(pick_a.meta, dict) else 16.0
-        exp_b = float(pick_b.meta.get("expected_pick_number", 16.0)) if isinstance(pick_b.meta, dict) else 16.0
+        # Swap market value:
+        # value ~= exercise_prob * (V(best) - V(worst)) * swap_exercise_scale
+        #
+        # IMPORTANT:
+        # - Do NOT rely on PickSnapshot.meta for expected pick number.
+        # - Reuse pick pricing (_price_pick) so year discount / protection / curves stay consistent.
 
-        v_a = self._pick_number_bonus(exp_a, rnd=int(pick_a.round)) + (cfg.pick_round1_base_future if int(pick_a.round) == 1 else cfg.pick_round2_base_future)
-        v_b = self._pick_number_bonus(exp_b, rnd=int(pick_b.round)) + (cfg.pick_round1_base_future if int(pick_b.round) == 1 else cfg.pick_round2_base_future)
+        mv_a = self._price_pick(
+            pick_a,
+            asset_key=f"pick:{pick_a.pick_id}",
+            expectation=pick_a_expectation,
+        )
+        mv_b = self._price_pick(
+            pick_b,
+            asset_key=f"pick:{pick_b.pick_id}",
+            expectation=pick_b_expectation,
+        )
 
-        # optionality: positive part
-        gain = max(v_b - v_a, 0.0)
+        v_a = float(mv_a.value.future)
+        v_b = float(mv_b.value.future)
+
+        # optionality gain must be symmetric w.r.t. A/B ordering
+        gain_raw = max(v_a, v_b) - min(v_a, v_b)
+
+        exp_a = float(pick_a_expectation.expected_pick_number) if (pick_a_expectation and pick_a_expectation.expected_pick_number is not None) else 16.0
+        exp_b = float(pick_b_expectation.expected_pick_number) if (pick_b_expectation and pick_b_expectation.expected_pick_number is not None) else 16.0
+
         gap = abs(exp_a - exp_b)
-        exercise_prob = _clamp(gap * cfg.swap_gap_to_prob_scale / 10.0, 0.15, 0.85)
 
         steps.append(
             ValuationStep(
@@ -693,8 +713,15 @@ class MarketPricer:
                 mode=StepMode.ADD,
                 code="SWAP_OPTION_GAIN",
                 label="스왑 옵션 기대 이득(프리미엄)",
-                delta=_vc(now=0.0, future=gain),
-                meta={"exp_a": exp_a, "exp_b": exp_b, "v_a": v_a, "v_b": v_b},
+                delta=_vc(now=0.0, future=gain_raw),
+                meta={
+                    "exp_a": exp_a,
+                    "exp_b": exp_b,
+                    "mv_a_future": v_a,
+                    "mv_b_future": v_b,
+                    "pick_id_a": pick_a.pick_id,
+                    "pick_id_b": pick_b.pick_id,
+                },
             )
         )
 
@@ -720,7 +747,7 @@ class MarketPricer:
             )
         )
 
-        future = gain * exercise_prob * cfg.swap_exercise_scale
+        future = gain_raw * exercise_prob * cfg.swap_exercise_scale
         return MarketValuation(
             asset_key=asset_key,
             kind=AssetKind.SWAP,
