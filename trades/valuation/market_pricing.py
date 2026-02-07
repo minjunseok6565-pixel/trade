@@ -706,6 +706,7 @@ class MarketPricer:
         exp_b = float(pick_b_expectation.expected_pick_number) if (pick_b_expectation and pick_b_expectation.expected_pick_number is not None) else 16.0
 
         gap = abs(exp_a - exp_b)
+        exercise_prob = _clamp(gap * cfg.swap_gap_to_prob_scale / 10.0, 0.15, 0.85)
 
         steps.append(
             ValuationStep(
