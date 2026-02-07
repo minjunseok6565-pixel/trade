@@ -1,0 +1,2372 @@
+from __future__ import annotations
+
+"""trade.trades.generation.deal_generator
+
+상업용(게임 플레이 루프)에서 "그대로" 돌려도 안정적인 2-team 딜 생성기.
+
+전제(SSOT)
+---------
+- Hard legality: TradeGenerationTickContext.validate_deal()
+- Valuation/decision: trades.valuation.service.evaluate_deal_for_team()
+- Candidate pools: TradeAssetCatalog (outgoing buckets / incoming_by_need_tag / picks+swaps + Stepien)
+
+설계 원칙
+---------
+- 탐색 폭을 강하게 제한: target 수, per-target attempts, validations/evaluations 상한
+- invalid 최소화: catalog 단계에서 lock/ban을 최대한 걸러두고, 남은 invalid는
+  TradeError.code + TradeError.details 기반으로 "최소 repair"(최대 1~2회)만 수행
+- 현실감: need-tag 기반 타깃/상대 선정 + 2~4개 archetype 스켈레톤 + salary filler / pick sweetener
+- 결정 일관성: 최종 점수는 항상 양팀 evaluate_deal_for_team 결과로만 계산
+
+확장 포인트
+-----------
+- 3팀 이상: Deal.teams/legs 구조는 이미 지원하지만, generator는 2팀만 생성.
+  (resolve_asset_receiver는 multi-team에서 to_team 필요)
+
+주의
+----
+- TradeError.meta는 존재하지 않음. meta-like payload는 TradeError.details(dict)이다.
+- 2nd apron one-for-one 제약은 TeamConstraints.apron_status만으로 확정할 수 없고,
+  SalaryMatchingRule failure.details.method == "second_apron_one_for_one" 를 SSOT로 삼는다.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+import hashlib
+import json
+import math
+import random
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+from ..errors import (
+    TradeError,
+    DEAL_INVALIDATED,
+    ROSTER_LIMIT,
+    ASSET_LOCKED,
+    PLAYER_NOT_OWNED,
+    PICK_NOT_OWNED,
+    SWAP_NOT_OWNED,
+    DUPLICATE_ASSET,
+)
+from ..models import (
+    Deal,
+    PlayerAsset,
+    PickAsset,
+    SwapAsset,
+    Asset,
+    asset_key,
+    canonicalize_deal,
+    serialize_deal,
+    resolve_asset_receiver,
+)
+from ..valuation.service import evaluate_deal_for_team
+from ..valuation.types import DealDecision, DealVerdict, TeamDealEvaluation
+
+from .generation_tick import TradeGenerationTickContext
+from .asset_catalog import (
+    TradeAssetCatalog,
+    IncomingPlayerRef,
+    TeamOutgoingCatalog,
+    PlayerTradeCandidate,
+    PickTradeCandidate,
+    SwapTradeCandidate,
+    PickBucketId,
+    BucketId,
+    build_trade_asset_catalog,
+)
+
+
+# =============================================================================
+# Public DTOs
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class DealGeneratorConfig:
+    """DealGenerator 탐색/수리/복잡도 예산.
+
+    - 이 값들은 "base"이며, generate_for_team() 호출 시 팀 posture/urgency/deadline_pressure에 따라
+      동적으로 스케일링된 DealGeneratorBudget이 실제로 사용된다.
+    - "상업용" 목표: 어떤 팀/어떤 시즌에서도 틱당 계산량이 폭주하지 않도록 상한을 둔다.
+    """
+
+    # --- hard upper bounds (absolute safety)
+    max_targets_hard: int = 28
+    max_attempts_per_target_hard: int = 80
+    max_validations_hard: int = 900
+    max_evaluations_hard: int = 450
+
+    # --- base budgets (scaled)
+    base_max_targets: int = 14
+    base_beam_width: int = 8
+    base_max_attempts_per_target: int = 45
+    base_max_validations: int = 360
+    base_max_evaluations: int = 180
+    base_max_repairs: int = 2
+
+    # --- deal shape constraints (generator-side)
+    max_assets_per_side: int = 6
+    max_players_moved_total: int = 4
+    max_players_per_side: int = 2
+    max_picks_per_side: int = 3
+    max_seconds_per_side: int = 2
+
+    # --- sweetener loop
+    sweetener_enabled: bool = True
+    sweetener_max_additions: int = 2
+    sweetener_max_deficit: float = 10.0  # "조금 부족"(margin deficit)만 수리
+    sweetener_min_improvement: float = 0.25  # score 또는 margin 개선이 거의 없으면 중단
+    sweetener_try_buckets: Tuple[str, ...] = (
+        "SECOND",
+        "SWAP",
+        "FIRST_SAFE",
+        "SECOND",  # allow 2nd second-rounder
+        "FIRST_SENSITIVE",
+    )
+
+    # --- target selection / incoming pool
+    need_tags_max: int = 4
+    incoming_pool_per_tag: int = 60
+    incoming_use_cheap_pool: bool = True
+
+    # --- opponent diversity / spam prevention
+    opponent_repeat_penalty: float = 0.25
+    opponent_multi_repeat_penalty: float = 0.18
+
+    # --- scoring
+    score_sigmoid_scale: float = 8.0
+    penalty_per_asset: float = 0.15
+    penalty_per_player: float = 0.10
+    penalty_overpay_weight: float = 1.00
+    discard_if_overpay_below: float = -18.0  # buyer margin이 이보다 더 나쁘면 후보 폐기
+    discard_if_both_margins_below: float = -10.0
+
+    # --- RNG determinism
+    deterministic_seed_salt: str = "deal_generator_v2"
+
+    # --- catalog behavior
+    # allow_locked_by_deal_id가 주어진 경우, catalog를 1회 재빌드하여 locked asset을 풀어줄지
+    rebuild_catalog_when_allow_locked: bool = True
+
+    # --- soft guard (invalid 폭발 방지)
+    # 현재 팀이 ABOVE_2ND_APRON이면 multi-player outgoing 스켈레톤을 만들지 않는다(soft).
+    soft_guard_second_apron_by_constraints: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DealGeneratorBudget:
+    """팀 posture/urgency 기반으로 스케일된 실제 예산."""
+
+    max_targets: int
+    beam_width: int
+    max_attempts_per_target: int
+    max_validations: int
+    max_evaluations: int
+    max_repairs: int
+
+
+@dataclass(frozen=True, slots=True)
+class DealProposal:
+    deal: Deal
+    buyer_id: str
+    seller_id: str
+    buyer_decision: DealDecision
+    seller_decision: DealDecision
+    buyer_eval: TeamDealEvaluation
+    seller_eval: TeamDealEvaluation
+    score: float
+    tags: Tuple[str, ...] = tuple()
+
+
+@dataclass(slots=True)
+class DealGeneratorStats:
+    """운영/튜닝용 통계(외부 로그/텔레메트리로 보내기 좋음)."""
+
+    mode: str = "BUY"
+    targets_considered: int = 0
+    skeletons_built: int = 0
+    candidates_attempted: int = 0
+
+    validations: int = 0
+    evaluations: int = 0
+    repairs: int = 0
+
+    sweetener_attempts: int = 0
+    sweeteners_added: int = 0
+
+    # failure kind -> count
+    failures_by_kind: Dict[str, int] = field(default_factory=dict)
+
+    def bump_failure(self, kind: str) -> None:
+        self.failures_by_kind[kind] = int(self.failures_by_kind.get(kind, 0)) + 1
+
+
+# =============================================================================
+# Internal DTOs
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class TargetCandidate:
+    """BUY 모드에서 buyer가 원하는 incoming target 후보."""
+
+    player_id: str
+    from_team: str
+    need_tag: str
+    tag_strength: float
+    market_total: float
+    salary_m: float
+    remaining_years: float
+    age: Optional[float]
+
+
+@dataclass(frozen=True, slots=True)
+class SellAssetCandidate:
+    """SELL 모드에서 initiator(=seller)가 시장에 내놓을 outgoing 후보."""
+
+    player_id: str
+    market_total: float
+    salary_m: float
+    remaining_years: float
+    is_expiring: bool
+    top_tags: Tuple[str, ...]
+
+
+@dataclass(slots=True)
+class DealCandidate:
+    """탐색 중인 후보 딜(스켈레톤/수리 과정에서 mutate 가능)."""
+
+    deal: Deal
+    buyer_id: str
+    seller_id: str
+
+    # for debug/tagging
+    focal_player_id: str
+    archetype: str
+
+    tags: List[str] = field(default_factory=list)
+    repairs_used: int = 0
+
+
+# =============================================================================
+# TradeError parsing (SSOT: TradeError.code + TradeError.details)
+# =============================================================================
+
+
+class RuleFailureKind(str, Enum):
+    SALARY_MATCHING = "salary_matching"
+    SECOND_APRON_ONE_FOR_ONE = "second_apron_one_for_one"
+    ROSTER_LIMIT = "roster_limit"
+    ASSET_LOCK = "asset_lock"
+    PLAYER_ELIGIBILITY = "player_eligibility"
+    RETURN_TO_TRADING_TEAM = "return_to_trading_team_same_season"
+    PICK_RULES = "pick_rules"
+    OWNERSHIP = "ownership"
+    DUPLICATE_ASSET = "duplicate_asset"
+    OTHER = "other"
+
+
+@dataclass(frozen=True, slots=True)
+class RuleFailure:
+    kind: RuleFailureKind
+    code: str
+    message: str
+    rule_id: Optional[str] = None
+    team_id: Optional[str] = None
+    reason: Optional[str] = None
+    method: Optional[str] = None
+    status: Optional[str] = None
+    player_id: Optional[str] = None
+    pick_id: Optional[str] = None
+    asset_key: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+def parse_trade_error(err: TradeError) -> RuleFailure:
+    """TradeError -> RuleFailure.
+
+    - 대부분의 rules는 TradeError.details에 {"rule": rule_id, ...}를 넣는다.
+    - 일부는 code로만 구분한다(예: ROSTER_LIMIT, ASSET_LOCKED, DUPLICATE_ASSET, OWNERSHIP 계열).
+    """
+
+    details: Dict[str, Any] = {}
+    if isinstance(getattr(err, "details", None), dict):
+        details = dict(err.details)  # shallow copy
+
+    # --- code-first
+    if err.code == ROSTER_LIMIT:
+        return RuleFailure(
+            kind=RuleFailureKind.ROSTER_LIMIT,
+            code=err.code,
+            message=err.message,
+            rule_id="roster_limit",
+            team_id=str(details.get("team_id") or "") or None,
+            details=details,
+        )
+    if err.code == ASSET_LOCKED:
+        return RuleFailure(
+            kind=RuleFailureKind.ASSET_LOCK,
+            code=err.code,
+            message=err.message,
+            rule_id="asset_lock",
+            asset_key=str(details.get("asset_key") or "") or None,
+            details=details,
+        )
+    if err.code in (PLAYER_NOT_OWNED, PICK_NOT_OWNED, SWAP_NOT_OWNED):
+        return RuleFailure(
+            kind=RuleFailureKind.OWNERSHIP,
+            code=err.code,
+            message=err.message,
+            rule_id="ownership",
+            team_id=str(details.get("team_id") or "") or None,
+            player_id=str(details.get("player_id") or "") or None,
+            pick_id=str(details.get("pick_id") or "") or None,
+            details=details,
+        )
+    if err.code == DUPLICATE_ASSET:
+        return RuleFailure(
+            kind=RuleFailureKind.DUPLICATE_ASSET,
+            code=err.code,
+            message=err.message,
+            rule_id="duplicate_asset",
+            asset_key=str(details.get("asset_key") or "") or None,
+            details=details,
+        )
+
+    # --- details["rule"]
+    rule_id = details.get("rule") if isinstance(details.get("rule"), str) else None
+    if err.code == DEAL_INVALIDATED and rule_id == "salary_matching":
+        method = str(details.get("method") or "")
+        kind = RuleFailureKind.SECOND_APRON_ONE_FOR_ONE if method == "second_apron_one_for_one" else RuleFailureKind.SALARY_MATCHING
+        return RuleFailure(
+            kind=kind,
+            code=err.code,
+            message=err.message,
+            rule_id=rule_id,
+            team_id=str(details.get("team_id") or "") or None,
+            method=method or None,
+            status=str(details.get("status") or "") or None,
+            details=details,
+        )
+
+    if err.code == DEAL_INVALIDATED and rule_id == "player_eligibility":
+        return RuleFailure(
+            kind=RuleFailureKind.PLAYER_ELIGIBILITY,
+            code=err.code,
+            message=err.message,
+            rule_id=rule_id,
+            team_id=str(details.get("team_id") or "") or None,
+            reason=str(details.get("reason") or "") or None,
+            player_id=str(details.get("player_id") or "") or None,
+            details=details,
+        )
+
+    if err.code == DEAL_INVALIDATED and rule_id == "return_to_trading_team_same_season":
+        return RuleFailure(
+            kind=RuleFailureKind.RETURN_TO_TRADING_TEAM,
+            code=err.code,
+            message=err.message,
+            rule_id=rule_id,
+            team_id=str(details.get("from_team") or "") or None,
+            reason=str(details.get("reason") or "") or None,
+            player_id=str(details.get("player_id") or "") or None,
+            details=details,
+        )
+
+    if err.code == DEAL_INVALIDATED and rule_id == "pick_rules":
+        return RuleFailure(
+            kind=RuleFailureKind.PICK_RULES,
+            code=err.code,
+            message=err.message,
+            rule_id=rule_id,
+            team_id=str(details.get("team_id") or "") or None,
+            reason=str(details.get("reason") or "") or None,
+            pick_id=str(details.get("pick_id") or "") or None,
+            details=details,
+        )
+
+    return RuleFailure(
+        kind=RuleFailureKind.OTHER,
+        code=str(getattr(err, "code", "")) or "UNKNOWN",
+        message=str(getattr(err, "message", "")) or str(err),
+        rule_id=rule_id,
+        details=details,
+    )
+
+
+# =============================================================================
+# DealGenerator
+# =============================================================================
+
+
+class DealGenerator:
+    """Tick-scoped caches를 사용하는 2-team deal generator."""
+
+    def __init__(self, config: Optional[DealGeneratorConfig] = None):
+        self.config = config or DealGeneratorConfig()
+        self.last_stats: Optional[DealGeneratorStats] = None
+
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
+    def generate_for_team(
+        self,
+        team_id: str,
+        tick_ctx: TradeGenerationTickContext,
+        *,
+        max_results: int = 8,
+        allow_locked_by_deal_id: Optional[str] = None,
+    ) -> List[DealProposal]:
+        """team_id를 기준으로 2-team 딜 후보를 생성.
+
+        posture에 따라 모드가 달라진다.
+        - BUY/SOFT_BUY/STAND_PAT: team_id를 buyer로 간주
+        - SELL/SOFT_SELL: team_id를 seller로 간주(매물 제안 모드)
+
+        반환:
+        - score 내림차순
+        - 모든 딜은 validate 통과
+        - buyer/seller 모두 evaluate 포함
+        """
+
+        # --- asset catalog 확보(allow_locked_by_deal_id가 있으면 선택적으로 재빌드)
+        catalog = tick_ctx.asset_catalog
+        if allow_locked_by_deal_id and self.config.rebuild_catalog_when_allow_locked:
+            try:
+                catalog = build_trade_asset_catalog(tick_ctx=tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)
+            except Exception:
+                catalog = tick_ctx.asset_catalog
+        if catalog is None:
+            return []
+
+        tid = str(team_id).upper()
+        ts = tick_ctx.get_team_situation(tid)
+
+        # 즉시 중단
+        if bool(getattr(ts, "constraints", None) and ts.constraints.cooldown_active):
+            self.last_stats = DealGeneratorStats(mode="SKIP")
+            return []
+
+        posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+        if posture == "STAND_PAT" and float(getattr(ts, "urgency", 0.0) or 0.0) < 0.35:
+            self.last_stats = DealGeneratorStats(mode="SKIP")
+            return []
+
+        budget = _scale_budget(self.config, ts)
+        rng = random.Random(_compute_seed(self.config, tick_ctx, tid))
+
+        stats = DealGeneratorStats(mode="SELL" if posture in {"SELL", "SOFT_SELL"} else "BUY")
+
+        if posture in {"SELL", "SOFT_SELL"}:
+            proposals = _generate_sell_mode(
+                initiator_seller_id=tid,
+                tick_ctx=tick_ctx,
+                catalog=catalog,
+                config=self.config,
+                budget=budget,
+                rng=rng,
+                max_results=int(max_results),
+                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                stats=stats,
+            )
+        else:
+            proposals = _generate_buy_mode(
+                initiator_buyer_id=tid,
+                tick_ctx=tick_ctx,
+                catalog=catalog,
+                config=self.config,
+                budget=budget,
+                rng=rng,
+                max_results=int(max_results),
+                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                stats=stats,
+            )
+
+        self.last_stats = stats
+        return proposals
+
+
+# =============================================================================
+# Budget scaling
+# =============================================================================
+
+
+def _scale_budget(cfg: DealGeneratorConfig, team_situation: Any) -> DealGeneratorBudget:
+    posture = str(getattr(team_situation, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+    urgency = float(getattr(team_situation, "urgency", 0.0) or 0.0)
+    deadline = 0.0
+    try:
+        deadline = float(getattr(getattr(team_situation, "constraints", None), "deadline_pressure", 0.0) or 0.0)
+    except Exception:
+        deadline = 0.0
+
+    posture_scale = {
+        "AGGRESSIVE_BUY": 1.25,
+        "SOFT_BUY": 1.00,
+        "SELL": 1.05,
+        "SOFT_SELL": 0.95,
+        "STAND_PAT": 0.55,
+    }.get(posture, 0.75)
+
+    # urgency/deadline (0..1) -> intensity (0.85..1.35)
+    u = max(0.0, min(1.0, urgency))
+    d = max(0.0, min(1.0, deadline))
+    intensity = 0.85 + 0.35 * u + 0.25 * d
+    scale = posture_scale * intensity
+
+    def _cap(val: int, hard: int) -> int:
+        return max(1, min(int(val), int(hard)))
+
+    return DealGeneratorBudget(
+        max_targets=_cap(int(cfg.base_max_targets * scale), cfg.max_targets_hard),
+        beam_width=_cap(int(cfg.base_beam_width * scale), 24),
+        max_attempts_per_target=_cap(int(cfg.base_max_attempts_per_target * scale), cfg.max_attempts_per_target_hard),
+        max_validations=_cap(int(cfg.base_max_validations * scale), cfg.max_validations_hard),
+        max_evaluations=_cap(int(cfg.base_max_evaluations * scale), cfg.max_evaluations_hard),
+        max_repairs=_cap(int(cfg.base_max_repairs), 3),
+    )
+
+
+def _compute_seed(cfg: DealGeneratorConfig, tick_ctx: TradeGenerationTickContext, team_id: str) -> int:
+    """결정적 RNG seed (python hash() 금지)."""
+
+    raw = f"{cfg.deterministic_seed_salt}|{tick_ctx.current_date.isoformat()}|{team_id}"
+    h = hashlib.sha256(raw.encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big", signed=False)
+
+
+# =============================================================================
+# Mode orchestrators
+# =============================================================================
+
+
+def _generate_buy_mode(
+    *,
+    initiator_buyer_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    max_results: int,
+    allow_locked_by_deal_id: Optional[str],
+    stats: DealGeneratorStats,
+) -> List[DealProposal]:
+    buyer_id = str(initiator_buyer_id).upper()
+    ts_buyer = tick_ctx.get_team_situation(buyer_id)
+
+    # 탐색 상태
+    seen: Set[str] = set()
+    banned_asset_keys: Set[str] = set()
+    banned_players: Set[str] = set()
+    banned_return_pairs: Set[Tuple[str, str]] = set()  # (player_id, to_team)
+
+    proposals: List[DealProposal] = []
+
+    partner_counts: Dict[str, int] = {}
+
+    targets = select_targets_buy(
+        buyer_id,
+        tick_ctx,
+        catalog,
+        config,
+        budget=budget,
+        rng=rng,
+        banned_players=banned_players,
+    )
+
+    for t in targets:
+        if len(proposals) >= max_results:
+            break
+        if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+            break
+
+        stats.targets_considered += 1
+
+        seller_id = str(t.from_team).upper()
+        if seller_id == buyer_id:
+            continue
+
+        ts_seller = tick_ctx.get_team_situation(seller_id)
+        if bool(getattr(ts_seller, "constraints", None) and ts_seller.constraints.cooldown_active):
+            continue
+
+        candidates = build_offer_skeletons_buy(
+            buyer_id,
+            seller_id,
+            t,
+            tick_ctx,
+            catalog,
+            config=config,
+            budget=budget,
+            rng=rng,
+            banned_players=banned_players,
+            banned_return_pairs=banned_return_pairs,
+        )
+
+        if not candidates:
+            continue
+
+        stats.skeletons_built += len(candidates)
+
+        rng.shuffle(candidates)
+        candidates = candidates[: max(1, int(budget.beam_width))]
+
+        attempts = 0
+        for cand in candidates:
+            if attempts >= budget.max_attempts_per_target:
+                break
+            if len(proposals) >= max_results:
+                break
+            if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+                break
+
+            attempts += 1
+            stats.candidates_attempted += 1
+
+            h = dedupe_hash(cand.deal)
+            if h in seen:
+                continue
+            seen.add(h)
+
+            ok, cand2, v_used = repair_until_valid(
+                cand,
+                tick_ctx,
+                catalog,
+                config,
+                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                budget=budget,
+                banned_asset_keys=banned_asset_keys,
+                banned_players=banned_players,
+                banned_return_pairs=banned_return_pairs,
+                stats=stats,
+            )
+            stats.validations += v_used
+            if not ok or cand2 is None:
+                continue
+
+            # evaluate
+            base_prop, e_used = evaluate_and_score(
+                cand2.deal,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                tick_ctx=tick_ctx,
+                config=config,
+                tags=tuple(cand2.tags),
+                opponent_repeat_count=int(partner_counts.get(seller_id, 0)),
+            )
+            stats.evaluations += e_used
+            if base_prop is None:
+                continue
+
+            # filter: 너무 말도 안 되는 손해
+            if _should_discard_prop(base_prop, config):
+                continue
+
+            # sweetener loop (대개 buyer -> seller)
+            best_prop = base_prop
+            if config.sweetener_enabled and config.sweetener_max_additions > 0:
+                best_prop, extra_v, extra_e = maybe_apply_sweeteners(
+                    base_prop,
+                    tick_ctx=tick_ctx,
+                    catalog=catalog,
+                    config=config,
+                    budget=budget,
+                    allow_locked_by_deal_id=allow_locked_by_deal_id,
+                    banned_asset_keys=banned_asset_keys,
+                    rng=rng,
+                    stats=stats,
+                )
+                stats.validations += extra_v
+                stats.evaluations += extra_e
+
+            proposals = _push_best(
+                proposals,
+                best_prop,
+                max_results=max_results,
+            )
+            partner_counts[best_prop.seller_id] = int(partner_counts.get(best_prop.seller_id, 0)) + 1
+
+    proposals.sort(key=lambda p: p.score, reverse=True)
+    return proposals[:max_results]
+
+
+def _generate_sell_mode(
+    *,
+    initiator_seller_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    max_results: int,
+    allow_locked_by_deal_id: Optional[str],
+    stats: DealGeneratorStats,
+) -> List[DealProposal]:
+    seller_id = str(initiator_seller_id).upper()
+    ts_seller = tick_ctx.get_team_situation(seller_id)
+
+    # 탐색 상태
+    seen: Set[str] = set()
+    banned_asset_keys: Set[str] = set()
+    banned_players: Set[str] = set()
+    banned_return_pairs: Set[Tuple[str, str]] = set()
+
+    proposals: List[DealProposal] = []
+    partner_counts: Dict[str, int] = {}
+
+    sale_assets = select_targets_sell(
+        seller_id,
+        tick_ctx,
+        catalog,
+        config,
+        budget=budget,
+        rng=rng,
+        banned_players=banned_players,
+    )
+
+    for s in sale_assets:
+        if len(proposals) >= max_results:
+            break
+        if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+            break
+
+        stats.targets_considered += 1
+
+        buyer_candidates = select_buyers_for_sale_asset(
+            seller_id,
+            s,
+            tick_ctx,
+            catalog,
+            config=config,
+            budget=budget,
+            rng=rng,
+        )
+
+        for buyer_id, match_tag in buyer_candidates:
+            if len(proposals) >= max_results:
+                break
+            if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+                break
+
+            buyer_id = str(buyer_id).upper()
+            if buyer_id == seller_id:
+                continue
+            ts_buyer = tick_ctx.get_team_situation(buyer_id)
+            if bool(getattr(ts_buyer, "constraints", None) and ts_buyer.constraints.cooldown_active):
+                continue
+
+            candidates = build_offer_skeletons_sell(
+                seller_id=seller_id,
+                buyer_id=buyer_id,
+                sale_asset=s,
+                match_tag=match_tag,
+                tick_ctx=tick_ctx,
+                catalog=catalog,
+                config=config,
+                budget=budget,
+                rng=rng,
+                banned_players=banned_players,
+                banned_return_pairs=banned_return_pairs,
+            )
+
+            if not candidates:
+                continue
+
+            stats.skeletons_built += len(candidates)
+
+            rng.shuffle(candidates)
+            candidates = candidates[: max(1, int(budget.beam_width))]
+
+            attempts = 0
+            for cand in candidates:
+                if attempts >= budget.max_attempts_per_target:
+                    break
+                if len(proposals) >= max_results:
+                    break
+                if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+                    break
+
+                attempts += 1
+                stats.candidates_attempted += 1
+
+                h = dedupe_hash(cand.deal)
+                if h in seen:
+                    continue
+                seen.add(h)
+
+                ok, cand2, v_used = repair_until_valid(
+                    cand,
+                    tick_ctx,
+                    catalog,
+                    config,
+                    allow_locked_by_deal_id=allow_locked_by_deal_id,
+                    budget=budget,
+                    banned_asset_keys=banned_asset_keys,
+                    banned_players=banned_players,
+                    banned_return_pairs=banned_return_pairs,
+                    stats=stats,
+                )
+                stats.validations += v_used
+                if not ok or cand2 is None:
+                    continue
+
+                base_prop, e_used = evaluate_and_score(
+                    cand2.deal,
+                    buyer_id=buyer_id,
+                    seller_id=seller_id,
+                    tick_ctx=tick_ctx,
+                    config=config,
+                    tags=tuple(cand2.tags),
+                    opponent_repeat_count=int(partner_counts.get(buyer_id, 0)),
+                )
+                stats.evaluations += e_used
+                if base_prop is None:
+                    continue
+
+                if _should_discard_prop(base_prop, config):
+                    continue
+
+                best_prop = base_prop
+                if config.sweetener_enabled and config.sweetener_max_additions > 0:
+                    best_prop, extra_v, extra_e = maybe_apply_sweeteners(
+                        base_prop,
+                        tick_ctx=tick_ctx,
+                        catalog=catalog,
+                        config=config,
+                        budget=budget,
+                        allow_locked_by_deal_id=allow_locked_by_deal_id,
+                        banned_asset_keys=banned_asset_keys,
+                        rng=rng,
+                        stats=stats,
+                    )
+                    stats.validations += extra_v
+                    stats.evaluations += extra_e
+
+                proposals = _push_best(proposals, best_prop, max_results=max_results)
+                partner_counts[best_prop.buyer_id] = int(partner_counts.get(best_prop.buyer_id, 0)) + 1
+
+    proposals.sort(key=lambda p: p.score, reverse=True)
+    return proposals[:max_results]
+
+
+def _push_best(existing: List[DealProposal], prop: DealProposal, *, max_results: int) -> List[DealProposal]:
+    existing.append(prop)
+    existing.sort(key=lambda p: p.score, reverse=True)
+    return existing[: max_results]
+
+
+def _should_discard_prop(prop: DealProposal, cfg: DealGeneratorConfig) -> bool:
+    # 양팀 모두 심각하게 나쁘면 버림
+    mb = float(prop.buyer_eval.net_surplus) - float(prop.buyer_decision.required_surplus)
+    ms = float(prop.seller_eval.net_surplus) - float(prop.seller_decision.required_surplus)
+    if mb < cfg.discard_if_overpay_below:
+        return True
+    if mb < cfg.discard_if_both_margins_below and ms < cfg.discard_if_both_margins_below:
+        return True
+    return False
+
+
+# =============================================================================
+# Target selection
+# =============================================================================
+
+
+def select_targets_buy(
+    buyer_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    *,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    banned_players: Set[str],
+) -> List[TargetCandidate]:
+    """need_map 기반 BUY 타깃 후보 구성(우선순위 높은 후보가 앞)."""
+
+    dc = tick_ctx.get_decision_context(buyer_id)
+    need_map = dict(getattr(dc, "need_map", {}) or {})
+
+    # fallback: TeamSituation.needs
+    if not need_map:
+        ts = tick_ctx.get_team_situation(buyer_id)
+        for n in getattr(ts, "needs", []) or []:
+            try:
+                need_map[str(getattr(n, "tag", ""))] = float(getattr(n, "weight", 0.0) or 0.0)
+            except Exception:
+                continue
+
+    tags_sorted = sorted(need_map.items(), key=lambda kv: float(kv[1] or 0.0), reverse=True)
+    tags = [str(t) for t, w in tags_sorted if str(t).strip() and float(w or 0.0) > 0.0]
+
+    ts = tick_ctx.get_team_situation(buyer_id)
+    if str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper() == "STAND_PAT":
+        tags = tags[:2]
+    tags = tags[: int(config.need_tags_max)]
+
+    out: List[TargetCandidate] = []
+    for tag in tags:
+        refs: Sequence[IncomingPlayerRef] = catalog.incoming_by_need_tag.get(tag, tuple())
+        if not refs and bool(config.incoming_use_cheap_pool):
+            refs = catalog.incoming_cheap_by_need_tag.get(tag, tuple())
+        refs = refs[: int(config.incoming_pool_per_tag)]
+        w_need = float(need_map.get(tag, 0.0) or 0.0)
+
+        for r in refs:
+            if str(r.from_team).upper() == str(buyer_id).upper():
+                continue
+            if r.player_id in banned_players:
+                continue
+            # 가벼운 rank score는 정렬에만 사용
+            rank = float(r.tag_strength) * (0.55 + 0.45 * w_need) + 0.02 * float(r.market_total)
+            rank -= 0.015 * float(r.salary_m)
+            rank += rng.random() * 0.01
+            out.append(
+                TargetCandidate(
+                    player_id=r.player_id,
+                    from_team=str(r.from_team).upper(),
+                    need_tag=str(tag),
+                    tag_strength=float(rank),
+                    market_total=float(r.market_total),
+                    salary_m=float(r.salary_m),
+                    remaining_years=float(r.remaining_years),
+                    age=r.age,
+                )
+            )
+
+    out.sort(key=lambda t: (-t.tag_strength, -t.market_total, t.salary_m, t.player_id))
+    return out[: int(budget.max_targets)]
+
+
+def select_targets_sell(
+    seller_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    *,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    banned_players: Set[str],
+) -> List[SellAssetCandidate]:
+    """SELL 모드: initiator가 내놓을 매물(선수) 후보를 고른다."""
+
+    out_cat = catalog.outgoing_by_team.get(str(seller_id).upper())
+    if out_cat is None:
+        return []
+
+    # SELL 모드 우선순위: 현실적으로 팔 만한 버킷 중심
+    priority: Tuple[BucketId, ...] = (
+        "VETERAN_SALE",
+        "EXPIRING",
+        "SURPLUS_REDUNDANT",
+        "SURPLUS_LOW_FIT",
+        "FILLER_BAD_CONTRACT",
+        "CONSOLIDATE",
+        "FILLER_CHEAP",
+    )
+
+    ids: List[str] = []
+    for b in priority:
+        ids.extend(list(out_cat.player_ids_by_bucket.get(b, tuple())))
+
+    # unique preserve order
+    seen: Set[str] = set()
+    uniq_ids = []
+    for pid in ids:
+        if pid in seen or pid in banned_players:
+            continue
+        seen.add(pid)
+        uniq_ids.append(pid)
+
+    sale: List[SellAssetCandidate] = []
+    for pid in uniq_ids:
+        c = out_cat.players.get(pid)
+        if c is None:
+            continue
+        sale.append(
+            SellAssetCandidate(
+                player_id=pid,
+                market_total=float(c.market.total),
+                salary_m=float(c.salary_m),
+                remaining_years=float(c.remaining_years),
+                is_expiring=bool(c.is_expiring),
+                top_tags=tuple(c.top_tags or ()),
+            )
+        )
+
+    # prefer higher market & more surplus (heuristic: expiring + low fit)
+    def score(x: SellAssetCandidate) -> float:
+        exp_bonus = 0.7 if x.is_expiring else 0.0
+        return float(x.market_total) + exp_bonus - 0.12 * float(x.remaining_years)
+
+    sale.sort(key=lambda x: (-score(x), x.salary_m, x.player_id))
+
+    # deterministically shuffle a bit within top slice for variety
+    top = sale[: max(0, min(len(sale), 24))]
+    rng.shuffle(top)
+    sale = top + sale[len(top) :]
+
+    return sale[: int(budget.max_targets)]
+
+
+def select_buyers_for_sale_asset(
+    seller_id: str,
+    sale_asset: SellAssetCandidate,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    *,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+) -> List[Tuple[str, str]]:
+    """SELL 모드: 특정 매물에 대해 관심 가질 가능성이 큰 buyer 팀을 고른다.
+
+    Returns: list[(buyer_id, match_tag)]
+    """
+
+    tags = list(sale_asset.top_tags or ())
+    if not tags:
+        return []
+
+    # 후보 팀: 전체 30팀에서 계산해도 비싸지 않지만, 여기선 상한을 둔다.
+    # BUY 의지가 있는 팀을 우선.
+    all_teams = list(catalog.outgoing_by_team.keys())
+    rng.shuffle(all_teams)
+
+    rows: List[Tuple[float, str, str]] = []
+    for tid in all_teams:
+        buyer_id = str(tid).upper()
+        if buyer_id == str(seller_id).upper():
+            continue
+
+        ts = tick_ctx.get_team_situation(buyer_id)
+        if bool(getattr(ts, "constraints", None) and ts.constraints.cooldown_active):
+            continue
+
+        posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+        posture_bonus = {
+            "AGGRESSIVE_BUY": 1.2,
+            "SOFT_BUY": 0.7,
+            "STAND_PAT": 0.2,
+            "SOFT_SELL": -0.3,
+            "SELL": -0.6,
+        }.get(posture, 0.0)
+
+        dc = tick_ctx.get_decision_context(buyer_id)
+        need_map = dict(getattr(dc, "need_map", {}) or {})
+
+        best_tag = tags[0]
+        best = 0.0
+        for tag in tags[:4]:
+            v = float(need_map.get(tag, 0.0) or 0.0)
+            if v > best:
+                best = v
+                best_tag = tag
+
+        urgency = float(getattr(ts, "urgency", 0.0) or 0.0)
+        score = best + 0.35 * urgency + posture_bonus
+
+        # 매우 낮으면 제외
+        if score <= 0.10:
+            continue
+
+        rows.append((score, buyer_id, str(best_tag)))
+
+        # hard cap to avoid worst-case O(teams*targets) blow-up
+        if len(rows) >= 24:
+            break
+
+    rows.sort(key=lambda r: (-r[0], r[1]))
+
+    # 최대 ~10팀만
+    out = [(buyer_id, tag) for _, buyer_id, tag in rows[:10]]
+    return out
+
+
+# =============================================================================
+# Offer skeletons
+# =============================================================================
+
+
+def build_offer_skeletons_buy(
+    buyer_id: str,
+    seller_id: str,
+    target: TargetCandidate,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    *,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    banned_players: Set[str],
+    banned_return_pairs: Set[Tuple[str, str]],
+) -> List[DealCandidate]:
+    """BUY 모드: target 1명 기준 2~4개 archetype 스켈레톤."""
+
+    buyer_out = catalog.outgoing_by_team.get(str(buyer_id).upper())
+    seller_out = catalog.outgoing_by_team.get(str(seller_id).upper())
+    if buyer_out is None or seller_out is None:
+        return []
+
+    # seller가 해당 선수를 "매물"로 갖고 있는지(= outgoing pool에 포함) 확인
+    if not _is_seller_willing_to_move_player(target.player_id, seller_out):
+        return []
+
+    # return-ban precheck
+    cand_target = seller_out.players.get(target.player_id)
+    if cand_target is not None:
+        if str(buyer_id).upper() in set(cand_target.return_ban_teams or ()):
+            banned_return_pairs.add((cand_target.player_id, str(buyer_id).upper()))
+            return []
+
+    ts_buyer = tick_ctx.get_team_situation(buyer_id)
+    ts_seller = tick_ctx.get_team_situation(seller_id)
+
+    # soft 2nd apron guard
+    buyer_one_for_one_soft = False
+    if config.soft_guard_second_apron_by_constraints:
+        try:
+            buyer_one_for_one_soft = str(ts_buyer.constraints.apron_status) == "ABOVE_2ND_APRON"
+        except Exception:
+            buyer_one_for_one_soft = False
+
+    # base deal: seller sends target
+    base = Deal(
+        teams=[str(buyer_id).upper(), str(seller_id).upper()],
+        legs={
+            str(buyer_id).upper(): [],
+            str(seller_id).upper(): [PlayerAsset(kind="player", player_id=target.player_id)],
+        },
+        meta={"generated": True, "mode": "BUY", "focal": target.player_id},
+    )
+
+    out: List[DealCandidate] = []
+
+    # archetype 1) picks-only (or picks+cheap)
+    deal1 = _clone_deal(base)
+    # seller rebuild이면 pick을 조금 더
+    max_picks = 2 if str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL") == "REBUILD" else 1
+    _add_pick_package(
+        deal1,
+        from_team=buyer_id,
+        out_cat=buyer_out,
+        catalog=catalog,
+        config=config,
+        rng=rng,
+        prefer=("SECOND", "FIRST_SAFE"),
+        max_picks=max_picks,
+    )
+    out.append(
+        DealCandidate(
+            deal=deal1,
+            buyer_id=buyer_id,
+            seller_id=seller_id,
+            focal_player_id=target.player_id,
+            archetype="picks_only",
+            tags=[f"need:{target.need_tag}", "pkg:picks"],
+        )
+    )
+
+    # archetype 2) young + pick (one outgoing player)
+    young_id = _pick_youngish_player(buyer_out, banned_players=banned_players)
+    if young_id and not buyer_one_for_one_soft:
+        # soft guard: ABOVE_2ND_APRON에서도 1명 outgoing은 OK, 이 archetype은 1명
+        pass
+    if young_id:
+        deal2 = _clone_deal(base)
+        deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
+        _add_pick_package(
+            deal2,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND",),
+            max_picks=1,
+        )
+        out.append(
+            DealCandidate(
+                deal=deal2,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=target.player_id,
+                archetype="young_plus_pick",
+                tags=[f"need:{target.need_tag}", "pkg:young+pick"],
+            )
+        )
+
+    # archetype 3) player-for-player (salary-ish)
+    filler_id = _pick_filler_player_for_salary(
+        buyer_out,
+        target_salary_m=target.salary_m,
+        banned_players=banned_players,
+    )
+    if filler_id:
+        deal3 = _clone_deal(base)
+        deal3.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=filler_id))
+        out.append(
+            DealCandidate(
+                deal=deal3,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=target.player_id,
+                archetype="p4p_salary",
+                tags=[f"need:{target.need_tag}", "pkg:player_for_player"],
+            )
+        )
+
+    # archetype 4) consolidate 2-for-1 (soft)
+    # soft guard: 팀이 ABOVE_2ND_APRON이면 multi-outgoing은 만들지 않는다.
+    if not buyer_one_for_one_soft:
+        cons_id = _pick_bucket_player(buyer_out, bucket="CONSOLIDATE", banned_players=banned_players)
+        cheap_id = _pick_bucket_player(buyer_out, bucket="FILLER_CHEAP", banned_players=banned_players)
+        if cons_id and cheap_id and cons_id != cheap_id:
+            deal4 = _clone_deal(base)
+            deal4.legs[str(buyer_id).upper()].extend(
+                [
+                    PlayerAsset(kind="player", player_id=cons_id),
+                    PlayerAsset(kind="player", player_id=cheap_id),
+                ]
+            )
+            _add_pick_package(
+                deal4,
+                from_team=buyer_id,
+                out_cat=buyer_out,
+                catalog=catalog,
+                config=config,
+                rng=rng,
+                prefer=("SECOND",),
+                max_picks=1,
+            )
+            out.append(
+                DealCandidate(
+                    deal=deal4,
+                    buyer_id=buyer_id,
+                    seller_id=seller_id,
+                    focal_player_id=target.player_id,
+                    archetype="consolidate_2_for_1",
+                    tags=[f"need:{target.need_tag}", "pkg:consolidate"],
+                )
+            )
+
+    # shape cap
+    trimmed: List[DealCandidate] = []
+    for c in out:
+        if _shape_ok(c.deal, config=config):
+            trimmed.append(c)
+
+    # beam cap
+    return trimmed[: max(2, int(budget.beam_width))]
+
+
+def build_offer_skeletons_sell(
+    *,
+    seller_id: str,
+    buyer_id: str,
+    sale_asset: SellAssetCandidate,
+    match_tag: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    rng: random.Random,
+    banned_players: Set[str],
+    banned_return_pairs: Set[Tuple[str, str]],
+) -> List[DealCandidate]:
+    """SELL 모드: (seller sends sale_asset.player_id) 기준 BUYER 패키지를 생성."""
+
+    buyer_out = catalog.outgoing_by_team.get(str(buyer_id).upper())
+    seller_out = catalog.outgoing_by_team.get(str(seller_id).upper())
+    if buyer_out is None or seller_out is None:
+        return []
+
+    pid = sale_asset.player_id
+    if pid in banned_players:
+        return []
+
+    # return-ban precheck
+    c_sale = seller_out.players.get(pid)
+    if c_sale is not None:
+        if str(buyer_id).upper() in set(c_sale.return_ban_teams or ()):
+            banned_return_pairs.add((c_sale.player_id, str(buyer_id).upper()))
+            return []
+
+    # base deal: seller sends player to buyer
+    base = Deal(
+        teams=[str(buyer_id).upper(), str(seller_id).upper()],
+        legs={
+            str(buyer_id).upper(): [],
+            str(seller_id).upper(): [PlayerAsset(kind="player", player_id=pid)],
+        },
+        meta={"generated": True, "mode": "SELL", "focal": pid},
+    )
+
+    ts_seller = tick_ctx.get_team_situation(seller_id)
+    time_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL")
+
+    # soft 2nd apron guard for buyer
+    buyer_one_for_one_soft = False
+    if config.soft_guard_second_apron_by_constraints:
+        try:
+            buyer_one_for_one_soft = str(tick_ctx.get_team_situation(buyer_id).constraints.apron_status) == "ABOVE_2ND_APRON"
+        except Exception:
+            buyer_one_for_one_soft = False
+
+    out: List[DealCandidate] = []
+
+    # archetype 1) buyer picks package to seller
+    deal1 = _clone_deal(base)
+    # rebuild seller는 picks 선호
+    max_picks = 2 if time_horizon == "REBUILD" else 1
+    _add_pick_package(
+        deal1,
+        from_team=buyer_id,
+        out_cat=buyer_out,
+        catalog=catalog,
+        config=config,
+        rng=rng,
+        prefer=("SECOND", "FIRST_SAFE"),
+        max_picks=max_picks,
+    )
+    out.append(
+        DealCandidate(
+            deal=deal1,
+            buyer_id=buyer_id,
+            seller_id=seller_id,
+            focal_player_id=pid,
+            archetype="buyer_picks",
+            tags=[f"match:{match_tag}", "pkg:picks"],
+        )
+    )
+
+    # archetype 2) buyer young + pick
+    young_id = _pick_youngish_player(buyer_out, banned_players=banned_players)
+    if young_id:
+        deal2 = _clone_deal(base)
+        deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
+        _add_pick_package(
+            deal2,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND",),
+            max_picks=1,
+        )
+        out.append(
+            DealCandidate(
+                deal=deal2,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=pid,
+                archetype="buyer_young_plus_pick",
+                tags=[f"match:{match_tag}", "pkg:young+pick"],
+            )
+        )
+
+    # archetype 3) buyer sends salary-ish player back (WIN_NOW seller라면 우선)
+    if time_horizon in {"WIN_NOW", "RE_TOOL"}:
+        filler_id = _pick_filler_player_for_salary(
+            buyer_out,
+            target_salary_m=float(sale_asset.salary_m),
+            banned_players=banned_players,
+        )
+        if filler_id:
+            deal3 = _clone_deal(base)
+            deal3.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=filler_id))
+            out.append(
+                DealCandidate(
+                    deal=deal3,
+                    buyer_id=buyer_id,
+                    seller_id=seller_id,
+                    focal_player_id=pid,
+                    archetype="buyer_p4p",
+                    tags=[f"match:{match_tag}", "pkg:player_for_player"],
+                )
+            )
+
+    # archetype 4) consolidate (buyer 2-for-1) if not soft-guard
+    if not buyer_one_for_one_soft:
+        cons_id = _pick_bucket_player(buyer_out, bucket="CONSOLIDATE", banned_players=banned_players)
+        cheap_id = _pick_bucket_player(buyer_out, bucket="FILLER_CHEAP", banned_players=banned_players)
+        if cons_id and cheap_id and cons_id != cheap_id:
+            deal4 = _clone_deal(base)
+            deal4.legs[str(buyer_id).upper()].extend(
+                [PlayerAsset(kind="player", player_id=cons_id), PlayerAsset(kind="player", player_id=cheap_id)]
+            )
+            _add_pick_package(
+                deal4,
+                from_team=buyer_id,
+                out_cat=buyer_out,
+                catalog=catalog,
+                config=config,
+                rng=rng,
+                prefer=("SECOND",),
+                max_picks=1,
+            )
+            out.append(
+                DealCandidate(
+                    deal=deal4,
+                    buyer_id=buyer_id,
+                    seller_id=seller_id,
+                    focal_player_id=pid,
+                    archetype="buyer_consolidate",
+                    tags=[f"match:{match_tag}", "pkg:consolidate"],
+                )
+            )
+
+    trimmed: List[DealCandidate] = []
+    for c in out:
+        if _shape_ok(c.deal, config=config):
+            trimmed.append(c)
+
+    return trimmed[: max(2, int(budget.beam_width))]
+
+
+def _is_seller_willing_to_move_player(player_id: str, seller_out: TeamOutgoingCatalog) -> bool:
+    core = set(seller_out.player_ids_by_bucket.get("CORE", tuple()))
+    if player_id in core:
+        return False
+    for b, ids in seller_out.player_ids_by_bucket.items():
+        if b == "CORE":
+            continue
+        if player_id in ids:
+            return True
+    return False
+
+
+# =============================================================================
+# Validate + Repair
+# =============================================================================
+
+
+def repair_until_valid(
+    cand: DealCandidate,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    *,
+    allow_locked_by_deal_id: Optional[str],
+    budget: DealGeneratorBudget,
+    banned_asset_keys: Set[str],
+    banned_players: Set[str],
+    banned_return_pairs: Set[Tuple[str, str]],
+    stats: DealGeneratorStats,
+) -> Tuple[bool, Optional[DealCandidate], int]:
+    """validate -> 실패 유형에 따라 최대 budget.max_repairs회 repair.
+
+    Returns: (ok, candidate_or_none, validations_used)
+    """
+
+    validations_used = 0
+
+    if not _shape_ok(cand.deal, config=config):
+        return False, None, validations_used
+
+    for _ in range(int(budget.max_repairs) + 1):
+        try:
+            tick_ctx.validate_deal(cand.deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+            validations_used += 1
+            return True, cand, validations_used
+        except TradeError as err:
+            validations_used += 1
+            failure = parse_trade_error(err)
+            stats.bump_failure(str(failure.kind.value))
+
+            if cand.repairs_used >= int(budget.max_repairs):
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_return_pairs)
+                return False, None, validations_used
+
+            repaired = repair_once(
+                cand,
+                failure,
+                tick_ctx=tick_ctx,
+                catalog=catalog,
+                config=config,
+                banned_asset_keys=banned_asset_keys,
+                banned_players=banned_players,
+                banned_return_pairs=banned_return_pairs,
+            )
+            if not repaired:
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_return_pairs)
+                return False, None, validations_used
+
+            cand.repairs_used += 1
+            stats.repairs += 1
+
+            # repair 후 shape check
+            if not _shape_ok(cand.deal, config=config):
+                return False, None, validations_used
+
+    return False, None, validations_used
+
+
+def repair_once(
+    cand: DealCandidate,
+    failure: RuleFailure,
+    *,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    banned_asset_keys: Set[str],
+    banned_players: Set[str],
+    banned_return_pairs: Set[Tuple[str, str]],
+) -> bool:
+    """실패 유형에 따라 '최소 수정' 1회 적용.
+
+    True면 cand.deal이 mutate되었음을 의미.
+    False면 이 후보는 prune.
+    """
+
+    # 구조적으로 수리 의미가 거의 없는 유형
+    if failure.kind in (RuleFailureKind.ASSET_LOCK, RuleFailureKind.OWNERSHIP, RuleFailureKind.DUPLICATE_ASSET):
+        return False
+
+    if failure.kind == RuleFailureKind.PLAYER_ELIGIBILITY:
+        reason = failure.reason or ""
+        pid = failure.player_id
+        if not pid:
+            return False
+        if reason == "recent_contract_signing":
+            banned_players.add(pid)
+            return False
+        if reason == "aggregation_ban":
+            team_id = str(failure.team_id or "").upper()
+            if not team_id or team_id not in cand.deal.legs:
+                return False
+            assets = cand.deal.legs[team_id]
+            players = [a for a in assets if isinstance(a, PlayerAsset)]
+            if len(players) <= 1:
+                return False
+            cand.deal.legs[team_id] = [a for a in assets if not (isinstance(a, PlayerAsset) and a.player_id == pid)]
+            cand.tags.append("repair:aggregation_remove")
+            return True
+        return False
+
+    if failure.kind == RuleFailureKind.RETURN_TO_TRADING_TEAM:
+        pid = failure.player_id
+        to_team = str(failure.details.get("to_team") or "").upper()
+        if pid and to_team:
+            banned_return_pairs.add((pid, to_team))
+        return False
+
+    if failure.kind == RuleFailureKind.ROSTER_LIMIT:
+        team_id = str(failure.team_id or "").upper()
+        if not team_id:
+            return False
+        return _repair_roster_limit(cand, team_id, catalog, config)
+
+    if failure.kind in (RuleFailureKind.SALARY_MATCHING, RuleFailureKind.SECOND_APRON_ONE_FOR_ONE):
+        team_id = str(failure.team_id or "").upper()
+        if not team_id:
+            return False
+        if failure.kind == RuleFailureKind.SECOND_APRON_ONE_FOR_ONE:
+            return _repair_second_apron_one_for_one(cand, team_id)
+        return _repair_salary_matching(cand, team_id, catalog, config, failure)
+
+    if failure.kind == RuleFailureKind.PICK_RULES:
+        team_id = str(failure.team_id or "").upper()
+        return _repair_pick_rules(cand, team_id, catalog, config, failure)
+
+    return False
+
+
+def _apply_prune_side_effects(
+    failure: RuleFailure,
+    banned_asset_keys: Set[str],
+    banned_players: Set[str],
+    banned_return_pairs: Set[Tuple[str, str]],
+) -> None:
+    if failure.kind == RuleFailureKind.ASSET_LOCK and failure.asset_key:
+        banned_asset_keys.add(failure.asset_key)
+    if failure.kind == RuleFailureKind.PLAYER_ELIGIBILITY and failure.player_id and failure.reason == "recent_contract_signing":
+        banned_players.add(failure.player_id)
+    if failure.kind == RuleFailureKind.RETURN_TO_TRADING_TEAM and failure.player_id:
+        to_team = str(failure.details.get("to_team") or "").upper()
+        if to_team:
+            banned_return_pairs.add((failure.player_id, to_team))
+
+
+def _repair_salary_matching(
+    cand: DealCandidate,
+    failing_team: str,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    failure: RuleFailure,
+) -> bool:
+    """SalaryMatchingRule 실패 수리.
+
+    가장 안전한 수리:
+    - failing_team outgoing에 filler 1명을 추가(FILLER_CHEAP -> EXPIRING -> FILLER_BAD_CONTRACT)
+
+    단, failure.details.status == SECOND_APRON이면 multi-player가 2nd apron one-for-one을
+    촉발할 가능성이 매우 높으므로 여기서 추가 수리를 시도하지 않는다.
+    """
+
+    status = str(failure.status or "")
+    if status == "SECOND_APRON":
+        return False
+
+    out_catalog = catalog.outgoing_by_team.get(failing_team)
+    if out_catalog is None:
+        return False
+
+    # max_players_per_side guard
+    if _count_players(cand.deal, failing_team) >= int(config.max_players_per_side):
+        return False
+
+    # aggregation_solo_only가 이미 포함되면 추가 player를 붙이면 바로 다시 실패할 확률이 큼
+    for a in cand.deal.legs.get(failing_team, []):
+        if isinstance(a, PlayerAsset):
+            c = out_catalog.players.get(a.player_id)
+            if c is not None and bool(getattr(c, "aggregation_solo_only", False)):
+                return False
+
+    filler = _pick_bucket_player(out_catalog, bucket="FILLER_CHEAP")
+    if not filler:
+        filler = _pick_bucket_player(out_catalog, bucket="EXPIRING")
+    if not filler:
+        filler = _pick_bucket_player(out_catalog, bucket="FILLER_BAD_CONTRACT")
+    if not filler:
+        return False
+
+    already = {a.player_id for a in cand.deal.legs.get(failing_team, []) if isinstance(a, PlayerAsset)}
+    if filler in already:
+        return False
+
+    cand.deal.legs[failing_team].append(PlayerAsset(kind="player", player_id=filler))
+    cand.tags.append("repair:add_filler_salary")
+    return True
+
+
+def _repair_second_apron_one_for_one(cand: DealCandidate, failing_team: str) -> bool:
+    """2nd apron one-for-one 위반: failing_team의 in/out player count를 1로 낮춘다."""
+
+    out_assets = list(cand.deal.legs.get(failing_team, []))
+    out_players = [a for a in out_assets if isinstance(a, PlayerAsset)]
+    if len(out_players) > 1:
+        keep = out_players[0]
+        cand.deal.legs[failing_team] = [a for a in out_assets if not (isinstance(a, PlayerAsset) and a.player_id != keep.player_id)]
+        cand.tags.append("repair:second_apron_trim_out")
+        return True
+
+    other = [t for t in cand.deal.teams if str(t).upper() != failing_team]
+    if not other:
+        return False
+    other_team = str(other[0]).upper()
+    other_assets = list(cand.deal.legs.get(other_team, []))
+    other_players = [a for a in other_assets if isinstance(a, PlayerAsset)]
+    if len(other_players) > 1:
+        removed = other_players[-1]
+        cand.deal.legs[other_team] = [a for a in other_assets if not (isinstance(a, PlayerAsset) and a.player_id == removed.player_id)]
+        cand.tags.append("repair:second_apron_trim_in")
+        return True
+
+    return False
+
+
+def _repair_roster_limit(cand: DealCandidate, problem_team: str, catalog: TradeAssetCatalog, config: DealGeneratorConfig) -> bool:
+    """ROSTER_LIMIT 수리."""
+
+    other = [t for t in cand.deal.teams if str(t).upper() != problem_team]
+    if not other:
+        return False
+    other_team = str(other[0]).upper()
+
+    # 1) remove an incoming player to problem_team (player asset in other_team leg)
+    other_assets = list(cand.deal.legs.get(other_team, []))
+    player_ids = [a.player_id for a in other_assets if isinstance(a, PlayerAsset)]
+    if len(player_ids) >= 2:
+        other_out = catalog.outgoing_by_team.get(other_team)
+        if other_out is not None:
+            def market(pid: str) -> float:
+                c = other_out.players.get(pid)
+                return float(c.market.total) if c is not None else 0.0
+            pid_remove = sorted(player_ids, key=market)[0]
+        else:
+            pid_remove = player_ids[-1]
+        cand.deal.legs[other_team] = [a for a in other_assets if not (isinstance(a, PlayerAsset) and a.player_id == pid_remove)]
+        cand.tags.append("repair:roster_remove_in")
+        return True
+
+    # 2) add outgoing from problem_team to reduce net incoming
+    prob_out = catalog.outgoing_by_team.get(problem_team)
+    if prob_out is None:
+        return False
+
+    if _count_players(cand.deal, problem_team) >= int(config.max_players_per_side):
+        return False
+
+    filler = _pick_bucket_player(prob_out, bucket="FILLER_CHEAP")
+    if not filler:
+        return False
+    already = {a.player_id for a in cand.deal.legs.get(problem_team, []) if isinstance(a, PlayerAsset)}
+    if filler in already:
+        return False
+    cand.deal.legs[problem_team].append(PlayerAsset(kind="player", player_id=filler))
+    cand.tags.append("repair:roster_send_out")
+    return True
+
+
+def _repair_pick_rules(cand: DealCandidate, team_id: str, catalog: TradeAssetCatalog, config: DealGeneratorConfig, failure: RuleFailure) -> bool:
+    """PickRulesRule 실패(stepien/pick_too_far 등) 수리."""
+
+    if not team_id or team_id not in cand.deal.legs:
+        return False
+
+    reason = failure.reason or ""
+    if reason == "pick_too_far" and failure.pick_id:
+        pid = str(failure.pick_id)
+        cand.deal.legs[team_id] = [a for a in cand.deal.legs[team_id] if not (isinstance(a, PickAsset) and a.pick_id == pid)]
+        cand.tags.append("repair:pick_remove_far")
+        return True
+
+    out_cat = catalog.outgoing_by_team.get(team_id)
+    if out_cat is None:
+        return False
+
+    picks_out = [a for a in cand.deal.legs[team_id] if isinstance(a, PickAsset)]
+    if not picks_out:
+        return False
+
+    sensitive_set = set(out_cat.pick_ids_by_bucket.get("FIRST_SENSITIVE", tuple()))
+    safe_set = set(out_cat.pick_ids_by_bucket.get("FIRST_SAFE", tuple()))
+
+    pid_remove: Optional[str] = None
+    for a in picks_out:
+        if a.pick_id in sensitive_set:
+            pid_remove = a.pick_id
+            break
+    if pid_remove is None:
+        for a in picks_out:
+            if a.pick_id in safe_set:
+                pid_remove = a.pick_id
+                break
+    if pid_remove is None:
+        pid_remove = picks_out[-1].pick_id
+
+    cand.deal.legs[team_id] = [a for a in cand.deal.legs[team_id] if not (isinstance(a, PickAsset) and a.pick_id == pid_remove)]
+    cand.tags.append("repair:stepien_remove_pick")
+
+    # optional replacement: first -> second
+    if pid_remove in safe_set or pid_remove in sensitive_set:
+        if _count_picks(cand.deal, team_id) >= int(config.max_picks_per_side):
+            return True
+        replacement = _pick_best_pick_id(out_cat, bucket="SECOND", excluded=_current_pick_ids(cand.deal, team_id))
+        if replacement:
+            cand.deal.legs[team_id].append(out_cat.picks[replacement].as_asset())
+            cand.tags.append("repair:stepien_replace_second")
+
+    return True
+
+
+# =============================================================================
+# Sweetener loop
+# =============================================================================
+
+
+def maybe_apply_sweeteners(
+    base: DealProposal,
+    *,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    budget: DealGeneratorBudget,
+    allow_locked_by_deal_id: Optional[str],
+    banned_asset_keys: Set[str],
+    rng: random.Random,
+    stats: DealGeneratorStats,
+) -> Tuple[DealProposal, int, int]:
+    """"조금 부족"한 쪽이 있을 때 pick/swap sweetener를 1~2개만 추가해서 재시도.
+
+    - base.deal은 이미 validate 통과 상태여야 한다.
+    - 추가한 딜도 validate + evaluate를 통과해야 한다.
+
+    Returns: (best_prop, extra_validations, extra_evaluations)
+    """
+
+    if not config.sweetener_enabled:
+        return base, 0, 0
+
+    # 예산 가드
+    if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
+        return base, 0, 0
+
+    mb = float(base.buyer_eval.net_surplus) - float(base.buyer_decision.required_surplus)
+    ms = float(base.seller_eval.net_surplus) - float(base.seller_decision.required_surplus)
+
+    # 어느 쪽이 부족한가?
+    giver: Optional[str] = None
+    receiver: Optional[str] = None
+    deficit = 0.0
+
+    if base.seller_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and ms < 0.0 and abs(ms) <= float(config.sweetener_max_deficit):
+        giver, receiver, deficit = base.buyer_id, base.seller_id, abs(ms)
+    elif base.buyer_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and mb < 0.0 and abs(mb) <= float(config.sweetener_max_deficit):
+        giver, receiver, deficit = base.seller_id, base.buyer_id, abs(mb)
+    else:
+        return base, 0, 0
+
+    if not giver or not receiver:
+        return base, 0, 0
+
+    out_cat = catalog.outgoing_by_team.get(str(giver).upper())
+    if out_cat is None:
+        return base, 0, 0
+
+    best = base
+    extra_v = 0
+    extra_e = 0
+
+    deal = _clone_deal(base.deal)
+    added_count = 0
+
+    # score/margin 기반 early stop
+    last_best_score = float(best.score)
+
+    # deterministic shuffle inside same bucket selection
+    bucket_order = list(config.sweetener_try_buckets)
+
+    for bucket in bucket_order:
+        if added_count >= int(config.sweetener_max_additions):
+            break
+        if stats.validations + extra_v >= budget.max_validations or stats.evaluations + extra_e >= budget.max_evaluations:
+            break
+
+        added = _try_add_one_sweetener(
+            deal,
+            giver_team=str(giver).upper(),
+            receiver_team=str(receiver).upper(),
+            out_cat=out_cat,
+            catalog=catalog,
+            config=config,
+            target_value=float(deficit),
+            bucket=str(bucket),
+            banned_asset_keys=banned_asset_keys,
+            rng=rng,
+        )
+        if not added:
+            continue
+
+        added_count += 1
+        stats.sweeteners_added += 1
+        stats.sweetener_attempts += 1
+
+        # validate
+        try:
+            tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+            extra_v += 1
+        except TradeError:
+            # rollback this sweetener (remove last asset from giver leg)
+            extra_v += 1
+            _rollback_last_asset_from_leg(deal, str(giver).upper())
+            continue
+
+        # evaluate
+        prop, used = evaluate_and_score(
+            deal,
+            buyer_id=base.buyer_id,
+            seller_id=base.seller_id,
+            tick_ctx=tick_ctx,
+            config=config,
+            tags=tuple(best.tags) + (f"sweetener:{bucket}",),
+            opponent_repeat_count=0,
+        )
+        extra_e += used
+        if prop is None:
+            _rollback_last_asset_from_leg(deal, str(giver).upper())
+            continue
+
+        if _should_discard_prop(prop, config):
+            _rollback_last_asset_from_leg(deal, str(giver).upper())
+            continue
+
+        # 개선이 거의 없으면 중단(낭비 방지)
+        if float(prop.score) < last_best_score + float(config.sweetener_min_improvement):
+            # 계속 추가해도 의미 없을 확률이 높아 중단
+            best = max(best, prop, key=lambda p: p.score)
+            break
+
+        if float(prop.score) > float(best.score):
+            best = prop
+            last_best_score = float(best.score)
+
+        # 둘 다 accept면 즉시 종료
+        if best.buyer_decision.verdict == DealVerdict.ACCEPT and best.seller_decision.verdict == DealVerdict.ACCEPT:
+            break
+
+    return best, extra_v, extra_e
+
+
+def _try_add_one_sweetener(
+    deal: Deal,
+    *,
+    giver_team: str,
+    receiver_team: str,
+    out_cat: TeamOutgoingCatalog,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    target_value: float,
+    bucket: str,
+    banned_asset_keys: Set[str],
+    rng: random.Random,
+) -> bool:
+    """deal에 sweetener 1개를 추가(성공 시 deal mutate).
+
+    bucket:
+      - SECOND / FIRST_SAFE / FIRST_SENSITIVE: PickAsset
+      - SWAP: SwapAsset
+    """
+
+    giver_team = str(giver_team).upper()
+
+    # max assets / picks guard
+    if len(deal.legs.get(giver_team, [])) >= int(config.max_assets_per_side):
+        return False
+
+    if bucket == "SWAP":
+        if _count_swaps(deal, giver_team) >= 1:
+            return False
+        cands = list(out_cat.swap_ids or ())
+        rng.shuffle(cands)
+        for sid in cands:
+            s = out_cat.swaps.get(sid)
+            if s is None:
+                continue
+            a = s.as_asset()
+            if asset_key(a) in banned_asset_keys:
+                continue
+            if _asset_in_deal(deal, a):
+                continue
+            deal.legs[giver_team].append(a)
+            return True
+        return False
+
+    # pick buckets
+    if _count_picks(deal, giver_team) >= int(config.max_picks_per_side):
+        return False
+
+    pick_bucket: Optional[PickBucketId] = None
+    if bucket == "SECOND":
+        if _count_seconds(deal, giver_team) >= int(config.max_seconds_per_side):
+            return False
+        pick_bucket = "SECOND"
+    elif bucket == "FIRST_SAFE":
+        pick_bucket = "FIRST_SAFE"
+    elif bucket == "FIRST_SENSITIVE":
+        pick_bucket = "FIRST_SENSITIVE"
+    else:
+        return False
+
+    excluded = _current_pick_ids(deal, giver_team)
+
+    pid = _pick_pick_id_matching_value(out_cat, pick_bucket, excluded=excluded, target_value=target_value)
+    if not pid:
+        return False
+
+    # Stepien check for 1st
+    if pick_bucket in ("FIRST_SAFE", "FIRST_SENSITIVE"):
+        out_ids, in_ids = _team_pick_flow(deal, giver_team)
+        out_ids = set(out_ids | {pid})
+        if not catalog.stepien.is_compliant_after(team_id=giver_team, outgoing_pick_ids=out_ids, incoming_pick_ids=set(in_ids)):
+            return False
+
+    a = out_cat.picks[pid].as_asset()
+    if asset_key(a) in banned_asset_keys:
+        return False
+    if _asset_in_deal(deal, a):
+        return False
+
+    deal.legs[giver_team].append(a)
+    return True
+
+
+def _rollback_last_asset_from_leg(deal: Deal, team_id: str) -> None:
+    tid = str(team_id).upper()
+    leg = deal.legs.get(tid)
+    if not leg:
+        return
+    try:
+        leg.pop()
+    except Exception:
+        return
+
+
+def _asset_in_deal(deal: Deal, asset: Asset) -> bool:
+    k = asset_key(asset)
+    for assets in deal.legs.values():
+        for a in assets:
+            if asset_key(a) == k:
+                return True
+    return False
+
+
+# =============================================================================
+# Evaluation + scoring
+# =============================================================================
+
+
+def evaluate_and_score(
+    deal: Deal,
+    *,
+    buyer_id: str,
+    seller_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    config: DealGeneratorConfig,
+    tags: Tuple[str, ...],
+    opponent_repeat_count: int,
+) -> Tuple[Optional[DealProposal], int]:
+    """양팀 evaluate_deal_for_team 호출 + score 산정."""
+
+    try:
+        buyer_decision, buyer_eval = evaluate_deal_for_team(
+            deal,
+            buyer_id,
+            tick_ctx=tick_ctx,
+            include_breakdown=False,
+            validate=False,
+        )
+        seller_decision, seller_eval = evaluate_deal_for_team(
+            deal,
+            seller_id,
+            tick_ctx=tick_ctx,
+            include_breakdown=False,
+            validate=False,
+        )
+    except TradeError:
+        return None, 1
+
+    score = score_deal(
+        deal,
+        buyer_decision=buyer_decision,
+        seller_decision=seller_decision,
+        buyer_eval=buyer_eval,
+        seller_eval=seller_eval,
+        config=config,
+        opponent_repeat_count=opponent_repeat_count,
+    )
+
+    prop = DealProposal(
+        deal=deal,
+        buyer_id=str(buyer_id).upper(),
+        seller_id=str(seller_id).upper(),
+        buyer_decision=buyer_decision,
+        seller_decision=seller_decision,
+        buyer_eval=buyer_eval,
+        seller_eval=seller_eval,
+        score=float(score),
+        tags=tuple(tags),
+    )
+    return prop, 2
+
+
+def score_deal(
+    deal: Deal,
+    *,
+    buyer_decision: DealDecision,
+    seller_decision: DealDecision,
+    buyer_eval: TeamDealEvaluation,
+    seller_eval: TeamDealEvaluation,
+    config: DealGeneratorConfig,
+    opponent_repeat_count: int,
+) -> float:
+    """게임용 점수: ACCEPT 가능한 딜 우선 + 과도한 overpay/복잡도 패널티."""
+
+    mb = float(buyer_eval.net_surplus) - float(buyer_decision.required_surplus)
+    ms = float(seller_eval.net_surplus) - float(seller_decision.required_surplus)
+
+    def sigmoid(x: float, scale: float) -> float:
+        s = float(scale) if float(scale) != 0 else 1.0
+        return 1.0 / (1.0 + math.exp(-x / s))
+
+    accept_score = sigmoid(mb, config.score_sigmoid_scale) + sigmoid(ms, config.score_sigmoid_scale)
+
+    n_assets = sum(len(v) for v in deal.legs.values())
+    n_players = sum(1 for leg in deal.legs.values() for a in leg if isinstance(a, PlayerAsset))
+    complexity_penalty = config.penalty_per_asset * max(0, n_assets - 2) + config.penalty_per_player * max(0, n_players - 2)
+
+    overpay_penalty = config.penalty_overpay_weight * max(0.0, -mb)
+
+    repeat_penalty = 0.0
+    if opponent_repeat_count >= 1:
+        repeat_penalty += float(config.opponent_repeat_penalty)
+        if opponent_repeat_count >= 2:
+            repeat_penalty += float(config.opponent_multi_repeat_penalty) * float(opponent_repeat_count - 1)
+
+    bonus = 0.0
+    if buyer_decision.verdict == DealVerdict.ACCEPT and seller_decision.verdict == DealVerdict.ACCEPT:
+        bonus += 0.35
+    elif buyer_decision.verdict == DealVerdict.ACCEPT and seller_decision.verdict == DealVerdict.COUNTER:
+        bonus += 0.15
+    elif seller_decision.verdict == DealVerdict.ACCEPT and buyer_decision.verdict == DealVerdict.COUNTER:
+        bonus += 0.15
+
+    return float(accept_score + bonus - complexity_penalty - overpay_penalty - repeat_penalty)
+
+
+# =============================================================================
+# Dedupe / misc
+# =============================================================================
+
+
+def dedupe_hash(deal: Deal) -> str:
+    canon = canonicalize_deal(deal)
+    payload = serialize_deal(canon)
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _clone_deal(deal: Deal) -> Deal:
+    return Deal(
+        teams=list(deal.teams),
+        legs={tid: list(assets) for tid, assets in deal.legs.items()},
+        meta=dict(deal.meta or {}),
+    )
+
+
+def _shape_ok(deal: Deal, *, config: DealGeneratorConfig) -> bool:
+    for assets in deal.legs.values():
+        if len(assets) > int(config.max_assets_per_side):
+            return False
+
+    n_players = sum(1 for leg in deal.legs.values() for a in leg if isinstance(a, PlayerAsset))
+    if n_players > int(config.max_players_moved_total):
+        return False
+
+    for tid in deal.teams:
+        tid_u = str(tid).upper()
+        if _count_players(deal, tid_u) > int(config.max_players_per_side):
+            return False
+        if _count_picks(deal, tid_u) > int(config.max_picks_per_side):
+            return False
+        if _count_seconds(deal, tid_u) > int(config.max_seconds_per_side):
+            return False
+
+    return True
+
+
+def _count_players(deal: Deal, team_id: str) -> int:
+    return sum(1 for a in deal.legs.get(str(team_id).upper(), []) if isinstance(a, PlayerAsset))
+
+
+def _count_picks(deal: Deal, team_id: str) -> int:
+    return sum(1 for a in deal.legs.get(str(team_id).upper(), []) if isinstance(a, PickAsset))
+
+
+def _count_seconds(deal: Deal, team_id: str) -> int:
+    tid = str(team_id).upper()
+    return sum(1 for a in deal.legs.get(tid, []) if isinstance(a, PickAsset) and _is_second_round_pick_id(a.pick_id))
+
+
+def _count_swaps(deal: Deal, team_id: str) -> int:
+    tid = str(team_id).upper()
+    return sum(1 for a in deal.legs.get(tid, []) if isinstance(a, SwapAsset))
+
+
+def _is_second_round_pick_id(pick_id: str) -> bool:
+    # SSOT는 PickSnapshot.round 이지만, 여기선 id 기반으로는 확정이 어렵다.
+    # 대신 catalog를 통해 생성된 pick은 대체로 id에 "R2" 등 표기가 있을 수 있으나 보장되지 않는다.
+    # 안전하게: Deal 내 PickAsset만으로 판별 불가 -> seconds cap은 generator 단계에서
+    # pick bucket(SECOND)로 추가할 때만 증가시키도록 쓰는 편이 이상적.
+    # 여기서는 best-effort: 대부분 데이터셋에서 "R2"/"2ND" 포함.
+    s = str(pick_id).upper()
+    return ("R2" in s) or ("2ND" in s) or ("ROUND2" in s)
+
+
+def _current_pick_ids(deal: Deal, team_id: str) -> Set[str]:
+    tid = str(team_id).upper()
+    return {a.pick_id for a in deal.legs.get(tid, []) if isinstance(a, PickAsset)}
+
+
+def _team_pick_flow(deal: Deal, team_id: str) -> Tuple[Set[str], Set[str]]:
+    """team_id 기준 (outgoing_pick_ids, incoming_pick_ids)."""
+
+    tid = str(team_id).upper()
+    out_ids: Set[str] = set()
+    in_ids: Set[str] = set()
+
+    for from_team, assets in deal.legs.items():
+        for a in assets:
+            if not isinstance(a, PickAsset):
+                continue
+            receiver = resolve_asset_receiver(deal, str(from_team), a)
+            if str(from_team).upper() == tid:
+                out_ids.add(str(a.pick_id))
+            if str(receiver).upper() == tid:
+                in_ids.add(str(a.pick_id))
+
+    return out_ids, in_ids
+
+
+# =============================================================================
+# Asset picking helpers (bucket-aware)
+# =============================================================================
+
+
+def _pick_bucket_player(
+    out: TeamOutgoingCatalog,
+    *,
+    bucket: BucketId,
+    banned_players: Optional[Set[str]] = None,
+) -> Optional[str]:
+    ids = list(out.player_ids_by_bucket.get(bucket, tuple()))
+    for pid in ids:
+        if banned_players and pid in banned_players:
+            continue
+        return pid
+    return None
+
+
+def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str]) -> Optional[str]:
+    """버킷에 YOUNG가 없으므로 age 기반 휴리스틱."""
+
+    cands: List[PlayerTradeCandidate] = []
+    for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
+        for pid in out.player_ids_by_bucket.get(b, tuple()):
+            if pid in banned_players:
+                continue
+            c = out.players.get(pid)
+            if c is None:
+                continue
+            age = c.snap.age
+            if age is not None and float(age) <= 24.5:
+                cands.append(c)
+
+    if not cands:
+        return None
+
+    cands.sort(key=lambda c: (-float(c.market.total), float(c.salary_m), c.player_id))
+    return cands[0].player_id
+
+
+def _pick_filler_player_for_salary(
+    out: TeamOutgoingCatalog,
+    *,
+    target_salary_m: float,
+    banned_players: Set[str],
+) -> Optional[str]:
+    ids: List[str] = []
+    for b in ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"):
+        ids.extend(list(out.player_ids_by_bucket.get(b, tuple())))
+
+    best: Optional[str] = None
+    best_gap = 1e9
+    for pid in ids:
+        if pid in banned_players:
+            continue
+        c = out.players.get(pid)
+        if c is None:
+            continue
+        gap = abs(float(c.salary_m) - float(target_salary_m))
+        if gap < best_gap:
+            best_gap = gap
+            best = pid
+
+    return best
+
+
+def _add_pick_package(
+    deal: Deal,
+    *,
+    from_team: str,
+    out_cat: TeamOutgoingCatalog,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    rng: random.Random,
+    prefer: Tuple[str, ...],
+    max_picks: int,
+) -> None:
+    """pick bucket 우선순위 기반으로 pick을 추가.
+
+    catalog는 이미 lock/max_year를 필터했지만 Stepien은 조합에 따라 달라질 수 있으니
+    1st 추가 시점에만 StepienHelper로 체크한다.
+    """
+
+    tid = str(from_team).upper()
+    if tid not in deal.legs:
+        return
+
+    picks_added = 0
+    outgoing_pick_ids = _current_pick_ids(deal, tid)
+
+    def iter_bucket(name: str) -> Iterable[str]:
+        if name == "FIRST_SAFE":
+            return out_cat.pick_ids_by_bucket.get("FIRST_SAFE", tuple())
+        if name == "FIRST_SENSITIVE":
+            return out_cat.pick_ids_by_bucket.get("FIRST_SENSITIVE", tuple())
+        if name == "SECOND":
+            return out_cat.pick_ids_by_bucket.get("SECOND", tuple())
+        return tuple()
+
+    for bucket in prefer:
+        if picks_added >= int(max_picks):
+            break
+        if bucket == "SWAP":
+            continue
+
+        for pid in iter_bucket(bucket):
+            if picks_added >= int(max_picks):
+                break
+            if _count_picks(deal, tid) >= int(config.max_picks_per_side):
+                break
+            if bucket == "SECOND" and _count_seconds(deal, tid) >= int(config.max_seconds_per_side):
+                break
+            if pid in outgoing_pick_ids:
+                continue
+
+            # stepien check for 1st(s)
+            if bucket.startswith("FIRST"):
+                out_ids, in_ids = _team_pick_flow(deal, tid)
+                if not catalog.stepien.is_compliant_after(team_id=tid, outgoing_pick_ids=set(out_ids | {pid}), incoming_pick_ids=set(in_ids)):
+                    continue
+
+            try:
+                deal.legs[tid].append(out_cat.picks[str(pid)].as_asset())
+            except Exception:
+                deal.legs[tid].append(PickAsset(kind="pick", pick_id=str(pid)))
+            outgoing_pick_ids.add(str(pid))
+            picks_added += 1
+            break
+
+
+def _pick_best_pick_id(out_cat: TeamOutgoingCatalog, *, bucket: PickBucketId, excluded: Set[str]) -> Optional[str]:
+    for pid in out_cat.pick_ids_by_bucket.get(bucket, tuple()):
+        if pid in excluded:
+            continue
+        return str(pid)
+    return None
+
+
+def _pick_pick_id_matching_value(
+    out_cat: TeamOutgoingCatalog,
+    bucket: PickBucketId,
+    *,
+    excluded: Set[str],
+    target_value: float,
+) -> Optional[str]:
+    """bucket 내 pick 중 market.total이 target_value와 가장 가까운 것을 선택."""
+
+    cands = [str(pid) for pid in out_cat.pick_ids_by_bucket.get(bucket, tuple()) if str(pid) not in excluded]
+    if not cands:
+        return None
+
+    # picks dict에는 market 포함
+    def key(pid: str) -> float:
+        p = out_cat.picks.get(pid)
+        mv = float(p.market.total) if p is not None else 0.0
+        return abs(mv - float(target_value))
+
+    cands.sort(key=key)
+    return cands[0]
+
+
+# =============================================================================
+# Dedupe helpers
+# =============================================================================
+
+
+# =============================================================================
+# End
+# =============================================================================
