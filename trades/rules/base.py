@@ -20,6 +20,49 @@ class TradeContext:
     current_date: date
     extra: dict[str, Any] = field(default_factory=dict)
     owns_repo: bool = True
+    tick_ctx: Optional["TradeRuleTickContext"] = None
+
+    # -----------------------------
+    # Fast accessors (prefer tick caches when available)
+    # -----------------------------
+    def _ensure_active_roster_index(self) -> None:
+        if self.tick_ctx is not None:
+            self.tick_ctx.ensure_active_roster_index()
+
+    def get_salary_amount(self, player_id: Any) -> Optional[int]:
+        pid = _normalize_player_id(player_id)
+        if self.tick_ctx is not None:
+            self._ensure_active_roster_index()
+            if pid in self.tick_ctx.player_salary_map:
+                return self.tick_ctx.player_salary_map.get(pid)
+        return self.repo.get_salary_amount(pid)
+
+    def get_team_id_by_player(self, player_id: Any) -> str:
+        pid = _normalize_player_id(player_id)
+        if self.tick_ctx is not None:
+            self._ensure_active_roster_index()
+            team = self.tick_ctx.player_team_map.get(pid)
+            if team is not None:
+                return str(team)
+        return self.repo.get_team_id_by_player(pid)
+
+    def get_roster_player_ids(self, team_id: Any) -> set[str]:
+        tid = _normalize_team_id(team_id)
+        if self.tick_ctx is not None:
+            self._ensure_active_roster_index()
+            ids = self.tick_ctx.team_roster_ids_map.get(tid)
+            if ids is not None:
+                return ids
+        return self.repo.get_roster_player_ids(tid)
+
+    def get_team_payroll_before(self, team_id: Any) -> float:
+        tid = _normalize_team_id(team_id)
+        if self.tick_ctx is not None:
+            self._ensure_active_roster_index()
+            if tid in self.tick_ctx.team_payroll_before_map:
+                return float(self.tick_ctx.team_payroll_before_map.get(tid) or 0.0)
+        # Fallback: compute from roster join (slower, but correct).
+        return float(sum(float(row.get("salary_amount") or 0) for row in self.repo.get_team_roster(tid)))
 
 
 class Rule(Protocol):
@@ -59,13 +102,13 @@ def _normalize_team_id(value: Any) -> str:
     return str(normalize_team_id(value, strict=True))
 
 
-def _sum_player_salaries(repo: LeagueRepo, player_ids: list[str]) -> float:
+def _sum_player_salaries(ctx: TradeContext, player_ids: list[str]) -> float:
     if not player_ids:
         return 0.0
     total = 0.0
     for player_id in player_ids:
         pid = _normalize_player_id(player_id)
-        salary = repo.get_salary_amount(pid)
+        salary = ctx.get_salary_amount(pid)
         total += float(salary or 0)
     return total
 
@@ -81,8 +124,8 @@ def build_team_trade_totals(
         outgoing_players = players_out.get(team_id, [])
         incoming_players = players_in.get(team_id, [])
         totals[team_id] = {
-            "outgoing_salary": _sum_player_salaries(ctx.repo, outgoing_players),
-            "incoming_salary": _sum_player_salaries(ctx.repo, incoming_players),
+            "outgoing_salary": _sum_player_salaries(ctx, outgoing_players),
+            "incoming_salary": _sum_player_salaries(ctx, incoming_players),
             "outgoing_players_count": len(outgoing_players),
             "incoming_players_count": len(incoming_players),
         }
@@ -100,9 +143,7 @@ def build_team_payrolls(
 
     for team_id in deal.teams:
         tid = _normalize_team_id(team_id)
-        payroll_before = float(
-            sum(float(row.get("salary_amount") or 0) for row in ctx.repo.get_team_roster(tid))
-        )
+        payroll_before = float(ctx.get_team_payroll_before(tid))
         outgoing_salary = float(totals[team_id]["outgoing_salary"])
         incoming_salary = float(totals[team_id]["incoming_salary"])
         payrolls[team_id] = {
@@ -216,4 +257,5 @@ def build_trade_context(
         current_date=current_date,
         extra=resolved_extra,
         owns_repo=owns_repo,
+        tick_ctx=tick_ctx,
     )
