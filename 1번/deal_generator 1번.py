@@ -636,6 +636,12 @@ def _generate_buy_mode(
         )
         variant_cap = min(12, max(6, int(budget.beam_width)))
 
+        # soft guard: ABOVE_2ND_APRON 팀은 one-for-one 형태만 남김(탐색 낭비/invalid 감소)
+        if getattr(config, "soft_guard_second_apron_by_constraints", False):
+            candidates = _soft_guard_second_apron_candidates(candidates, tick_ctx)
+            if not candidates:
+                continue
+
         rng.shuffle(candidates)
         candidates = candidates[: variant_cap]
 
@@ -802,6 +808,12 @@ def _generate_sell_mode(
 
             stats.skeletons_built += len(candidates)
 
+            # soft guard: ABOVE_2ND_APRON 팀은 one-for-one 형태만 남김(탐색 낭비/invalid 감소)
+            if getattr(config, "soft_guard_second_apron_by_constraints", False):
+                candidates = _soft_guard_second_apron_candidates(candidates, tick_ctx)
+                if not candidates:
+                    continue
+
             rng.shuffle(candidates)
             candidates = candidates[: max(1, int(budget.beam_width))]
 
@@ -918,6 +930,50 @@ def _should_discard_prop(prop: DealProposal, cfg: DealGeneratorConfig) -> bool:
         return True
 
     return False
+
+
+def _incoming_player_count(deal: Deal, team_id: str) -> int:
+    """team_id 기준 incoming player count(2팀 딜 가정)."""
+    tid = str(team_id).upper()
+    other = [t for t in deal.teams if str(t).upper() != tid]
+    if not other:
+        return 0
+    other_team = str(other[0]).upper()
+    return sum(1 for a in deal.legs.get(other_team, []) if isinstance(a, PlayerAsset))
+
+
+def _soft_guard_second_apron_candidates(
+    candidates: List[DealCandidate],
+    tick_ctx: TradeGenerationTickContext,
+) -> List[DealCandidate]:
+    """ABOVE_2ND_APRON 팀은 'one-for-one' 형태만 남긴다(soft guard).
+
+    SSOT는 validate_deal이지만, 이 필터는 "탐색 낭비"를 줄이기 위한 휴리스틱이다.
+    - outgoing players > 1 이거나
+    - incoming players > 1 이면
+      해당 후보를 제거한다.
+    """
+    out: List[DealCandidate] = []
+    for c in candidates:
+        d = c.deal
+        ok = True
+        for tid in [str(t).upper() for t in (d.teams or [])]:
+            try:
+                ts = tick_ctx.get_team_situation(tid)
+                status = str(getattr(ts.constraints, "apron_status", "") or "")
+                if status == "ABOVE_2ND_APRON":
+                    if _count_players(d, tid) > 1:
+                        ok = False
+                        break
+                    if _incoming_player_count(d, tid) > 1:
+                        ok = False
+                        break
+            except Exception:
+                # soft guard이므로 실패 시 그냥 통과
+                continue
+        if ok:
+            out.append(c)
+    return out
 
 
 # =============================================================================
@@ -1221,7 +1277,12 @@ def build_offer_skeletons_buy(
     )
 
     # archetype 2) young + pick (one outgoing player)
-    young_id = _pick_youngish_player(buyer_out, banned_players=banned_players)
+    young_id = _pick_youngish_player(
+        buyer_out,
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
     if young_id and not buyer_one_for_one_soft:
         # soft guard: ABOVE_2ND_APRON에서도 1명 outgoing은 OK, 이 archetype은 1명
         pass
@@ -1252,8 +1313,10 @@ def build_offer_skeletons_buy(
     # archetype 3) player-for-player (salary-ish)
     filler_id = _pick_filler_player_for_salary(
         buyer_out,
+        receiver_team_id=seller_id,
         target_salary_m=target.salary_m,
         banned_players=banned_players,
+        must_be_aggregation_friendly=True,
     )
     if filler_id:
         deal3 = _clone_deal(base)
@@ -1272,8 +1335,20 @@ def build_offer_skeletons_buy(
     # archetype 4) consolidate 2-for-1 (soft)
     # soft guard: 팀이 ABOVE_2ND_APRON이면 multi-outgoing은 만들지 않는다.
     if not buyer_one_for_one_soft:
-        cons_id = _pick_bucket_player(buyer_out, bucket="CONSOLIDATE", banned_players=banned_players)
-        cheap_id = _pick_bucket_player(buyer_out, bucket="FILLER_CHEAP", banned_players=banned_players)
+        cons_id = _pick_bucket_player(
+            buyer_out,
+            bucket="CONSOLIDATE",
+            receiver_team_id=seller_id,
+            banned_players=banned_players,
+            must_be_aggregation_friendly=True,
+        )
+        cheap_id = _pick_bucket_player(
+            buyer_out,
+            bucket="FILLER_CHEAP",
+            receiver_team_id=seller_id,
+            banned_players=banned_players,
+            must_be_aggregation_friendly=True,
+        )
         if cons_id and cheap_id and cons_id != cheap_id:
             deal4 = _clone_deal(base)
             deal4.legs[str(buyer_id).upper()].extend(
@@ -1394,7 +1469,12 @@ def build_offer_skeletons_sell(
     )
 
     # archetype 2) buyer young + pick
-    young_id = _pick_youngish_player(buyer_out, banned_players=banned_players)
+    young_id = _pick_youngish_player(
+        buyer_out,
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
     if young_id:
         deal2 = _clone_deal(base)
         deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
@@ -1423,8 +1503,10 @@ def build_offer_skeletons_sell(
     if time_horizon in {"WIN_NOW", "RE_TOOL"}:
         filler_id = _pick_filler_player_for_salary(
             buyer_out,
+            receiver_team_id=seller_id,
             target_salary_m=float(sale_asset.salary_m),
             banned_players=banned_players,
+            must_be_aggregation_friendly=True,
         )
         if filler_id:
             deal3 = _clone_deal(base)
@@ -1442,8 +1524,20 @@ def build_offer_skeletons_sell(
 
     # archetype 4) consolidate (buyer 2-for-1) if not soft-guard
     if not buyer_one_for_one_soft:
-        cons_id = _pick_bucket_player(buyer_out, bucket="CONSOLIDATE", banned_players=banned_players)
-        cheap_id = _pick_bucket_player(buyer_out, bucket="FILLER_CHEAP", banned_players=banned_players)
+        cons_id = _pick_bucket_player(
+            buyer_out,
+            bucket="CONSOLIDATE",
+            receiver_team_id=seller_id,
+            banned_players=banned_players,
+            must_be_aggregation_friendly=True,
+        )
+        cheap_id = _pick_bucket_player(
+            buyer_out,
+            bucket="FILLER_CHEAP",
+            receiver_team_id=seller_id,
+            banned_players=banned_players,
+            must_be_aggregation_friendly=True,
+        )
         if cons_id and cheap_id and cons_id != cheap_id:
             deal4 = _clone_deal(base)
             deal4.legs[str(buyer_id).upper()].extend(
@@ -1909,11 +2003,31 @@ def _repair_salary_matching(
             if c is not None and bool(getattr(c, "aggregation_solo_only", False)):
                 return False
 
-    filler = _pick_bucket_player(out_catalog, bucket="FILLER_CHEAP")
+    # receiver team(상대팀) 계산: return-ban 프리필터에 사용
+    other = [t for t in cand.deal.teams if str(t).upper() != str(failing_team).upper()]
+    receiver_team = str(other[0]).upper() if other else None
+    outgoing_cnt = _count_players(cand.deal, failing_team)
+
+    filler = _pick_bucket_player(
+        out_catalog,
+        bucket="FILLER_CHEAP",
+        receiver_team_id=receiver_team,
+        must_be_aggregation_friendly=True,
+    )
     if not filler:
-        filler = _pick_bucket_player(out_catalog, bucket="EXPIRING")
+        filler = _pick_bucket_player(
+            out_catalog,
+            bucket="EXPIRING",
+            receiver_team_id=receiver_team,
+            must_be_aggregation_friendly=True,
+        )
     if not filler:
-        filler = _pick_bucket_player(out_catalog, bucket="FILLER_BAD_CONTRACT")
+        filler = _pick_bucket_player(
+            out_catalog,
+            bucket="FILLER_BAD_CONTRACT",
+            receiver_team_id=receiver_team,
+            must_be_aggregation_friendly=True,
+        )
     if not filler:
         return False
 
@@ -2579,13 +2693,22 @@ def _pick_bucket_player(
     out: TeamOutgoingCatalog,
     *,
     bucket: BucketId,
+    receiver_team_id: Optional[str] = None,
     banned_players: Optional[Set[str]] = None,
+    must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
-    ids = list(out.player_ids_by_bucket.get(bucket, tuple()))
-    for pid in ids:
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+    for pid in list(out.player_ids_by_bucket.get(bucket, tuple())):
         if banned_players and pid in banned_players:
             continue
-        return pid
+        c = out.players.get(pid)
+        if c is None:
+            continue
+        if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
+            continue
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+            continue
+        return str(pid)
     return None
 
 
@@ -2614,6 +2737,8 @@ def _pick_lowest_market_player(
 def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str]) -> Optional[str]:
     """버킷에 YOUNG가 없으므로 age 기반 휴리스틱."""
 
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     cands: List[PlayerTradeCandidate] = []
     for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
         for pid in out.player_ids_by_bucket.get(b, tuple()):
@@ -2621,6 +2746,10 @@ def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str])
                 continue
             c = out.players.get(pid)
             if c is None:
+                continue
+            if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
+                continue
+            if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
                 continue
             age = c.snap.age
             if age is not None and float(age) <= 24.5:
@@ -2636,9 +2765,13 @@ def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str])
 def _pick_filler_player_for_salary(
     out: TeamOutgoingCatalog,
     *,
+    receiver_team_id: Optional[str],
     target_salary_m: float,
     banned_players: Set[str],
+    must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     ids: List[str] = []
     for b in ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"):
         ids.extend(list(out.player_ids_by_bucket.get(b, tuple())))
@@ -2650,6 +2783,10 @@ def _pick_filler_player_for_salary(
             continue
         c = out.players.get(pid)
         if c is None:
+            continue
+        if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
+            continue
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             continue
         gap = abs(float(c.salary_m) - float(target_salary_m))
         if gap < best_gap:
