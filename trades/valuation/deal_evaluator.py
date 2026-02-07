@@ -51,6 +51,7 @@ from .types import (
     PlayerSnapshot,
     PickSnapshot,
     SwapSnapshot,
+    PickExpectation,
 )
 
 from .market_pricing import MarketPricer, MarketPricingConfig
@@ -293,6 +294,8 @@ class DealEvaluator:
         pick_exp = None
         resolved_a = None
         resolved_b = None
+        resolved_a_exp: Optional[PickExpectation] = None
+        resolved_b_exp: Optional[PickExpectation] = None        
 
         if kind == AssetKind.PICK and isinstance(snap, PickSnapshot):
             pick_exp = provider.get_pick_expectation(snap.pick_id)
@@ -301,6 +304,9 @@ class DealEvaluator:
             # swap pricing needs both pick snapshots
             resolved_a = provider.get_pick_snapshot(snap.pick_id_a)
             resolved_b = provider.get_pick_snapshot(snap.pick_id_b)
+            # and their expectations (for expected pick number / year discount, etc.)
+            resolved_a_exp = provider.get_pick_expectation(snap.pick_id_a)
+            resolved_b_exp = provider.get_pick_expectation(snap.pick_id_b)
 
         market = self._market.price_snapshot(
             snap,
@@ -308,6 +314,8 @@ class DealEvaluator:
             pick_expectation=pick_exp,
             resolved_pick_a=resolved_a,
             resolved_pick_b=resolved_b,
+            resolved_pick_a_expectation=resolved_a_exp,
+            resolved_pick_b_expectation=resolved_b_exp,
         )
 
         team_val = self._team.value_asset(market, snap, ctx)
