@@ -2126,13 +2126,10 @@ def _repair_roster_limit(cand: DealCandidate, problem_team: str, catalog: TradeA
         return False
 
     already = {a.player_id for a in cand.deal.legs.get(problem_team, []) if isinstance(a, PlayerAsset)}
-    # receiver는 other_team(상대팀): return-ban/aggregation 프리필터 적용
-    filler = _pick_bucket_player(
+    filler = _pick_lowest_market_player(
         prob_out,
-        bucket="FILLER_CHEAP",
-        receiver_team_id=other_team,
+        buckets=("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"),
         banned_players=already,
-        must_be_aggregation_friendly=True,
     )
     if not filler:
         return False
@@ -2715,13 +2712,29 @@ def _pick_bucket_player(
     return None
 
 
-def _pick_youngish_player(
+def _pick_lowest_market_player(
     out: TeamOutgoingCatalog,
     *,
-    receiver_team_id: Optional[str],
+    buckets: Tuple[BucketId, ...],
     banned_players: Set[str],
-    must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
+    """여러 버킷에서 market.total이 가장 낮은 플레이어를 선택(필러용)."""
+
+    best_pid: Optional[str] = None
+    best_mkt = float("inf")
+    for b in buckets:
+        for pid in out.player_ids_by_bucket.get(b, tuple()):
+            if pid in banned_players:
+                continue
+            c = out.players.get(pid)
+            m = float(c.market.total) if c is not None else 0.0
+            if m < best_mkt:
+                best_mkt = m
+                best_pid = pid
+    return best_pid
+
+
+def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str]) -> Optional[str]:
     """버킷에 YOUNG가 없으므로 age 기반 휴리스틱."""
 
     receiver = str(receiver_team_id).upper() if receiver_team_id else None

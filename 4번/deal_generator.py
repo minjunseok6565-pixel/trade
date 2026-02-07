@@ -123,8 +123,12 @@ def _canon_player_id(player_id: Any) -> str:
 
 
 def _deal_fingerprint(deal: Deal) -> str:
-    """Stable fingerprint for de-duplication (independent of ordering noise)."""
-    d = canonicalize_deal(deal)
+    """Stable fingerprint for de-duplication (independent of ordering noise).
+
+    NOTE: `deal` is expected to be canonicalized already (e.g. via canonicalize_deal).
+    This avoids double-canonicalization in tight generation loops.
+    """
+    d = deal
     parts: List[str] = []
     parts.append("|".join(d.teams))
     for team in d.teams:
@@ -358,6 +362,32 @@ class DealGenerator:
         for b in allowed_buckets:
             for pid in out.player_ids_by_bucket.get(b, ()):
                 s.add(_canon_player_id(pid))
+
+        # Optional blockbuster mode: allow a *very small* number of CORE players to be targeted,
+        # but only when the seller context suggests unusual availability (rebuild/sell/high urgency).
+        # This keeps realism while making `allow_core_targets=True` actually meaningful.
+        if self.cfg.allow_core_targets:
+            ts = self.tick_ctx.get_team_situation(tid)
+            posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "").upper()
+            horizon = str(getattr(ts, "time_horizon", "") or "").upper()
+            urgency = float(getattr(ts, "urgency", 0.0) or 0.0)
+
+            if posture in {"SELL", "SOFT_SELL"} or horizon == "REBUILD" or urgency >= 0.85:
+                core_ids = list(out.player_ids_by_bucket.get("CORE", ()) or ())
+                ranked: List[Tuple[float, str]] = []
+                for pid in core_ids:
+                    pidc = _canon_player_id(pid)
+                    cand = out.players.get(pidc)
+                    if cand is None:
+                        continue
+                    # Tradability check; to_team is irrelevant for "market availability" caching.
+                    if not self._is_tradable_player(cand, tid, to_team=None):
+                        continue
+                    ranked.append((float(cand.market.total), pidc))
+                ranked.sort(key=lambda t: (-t[0], t[1]))
+                top_n = 2 if urgency >= 0.92 else 1
+                for _, pidc in ranked[:top_n]:
+                    s.add(pidc)
 
         self._market_listed_players_cache[tid] = s
         return s
@@ -771,21 +801,70 @@ class DealGenerator:
                 self.tick_ctx.validate_deal(deal, integrity_check=False)
                 self._validation_count += 1
                 self._seen_deals.add(fp)
-                # Evaluate
+                # Evaluate (initiator-first to save work on obvious rejects)
                 if self._evaluation_count >= self.cfg.max_evaluations:
                     return None
-                a_dec, a_eval, b_dec, b_eval = self.tick_ctx.evaluate_bilateral(
-                    deal,
-                    initiator,
-                    counterparty,
-                    include_breakdown=False,
-                    include_package_effects=True,
-                    allow_counter=False,
-                    rng=self.rng,
-                    rng_seed=None,
-                    validate=False,
-                )
-                self._evaluation_count += 2
+
+                # Prefer tick_ctx wrapper if available, otherwise fall back to service API.
+                eval_one = getattr(self.tick_ctx, "evaluate_deal_for_team", None)
+                if callable(eval_one):
+                    a_dec, a_eval = eval_one(
+                        deal,
+                        initiator,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                else:
+                    from ..valuation.service import evaluate_deal_for_team as _eval_deal_for_team
+                    a_dec, a_eval = _eval_deal_for_team(
+                        deal,
+                        initiator,
+                        tick_ctx=self.tick_ctx,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                self._evaluation_count += 1
+
+                # If initiator rejects, skip counterparty evaluation entirely.
+                if not _is_accept(a_dec):
+                    return None
+
+                if self._evaluation_count >= self.cfg.max_evaluations:
+                    return None
+
+                if callable(eval_one):
+                    b_dec, b_eval = eval_one(
+                        deal,
+                        counterparty,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                else:
+                    from ..valuation.service import evaluate_deal_for_team as _eval_deal_for_team
+                    b_dec, b_eval = _eval_deal_for_team(
+                        deal,
+                        counterparty,
+                        tick_ctx=self.tick_ctx,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                self._evaluation_count += 1
 
                 # Local sweetener loop when counterparty is close but rejecting.
                 if (not _is_accept(b_dec)) and _is_accept(a_dec):
