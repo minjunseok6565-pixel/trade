@@ -1565,6 +1565,38 @@ class LeagueRepo:
             out.append(d)
         return out
 
+    def get_active_roster_salary_rows(self) -> List[Dict[str, Any]]:
+        """Return active roster rows for fast trade-rule validation.
+
+        This is a narrow SSOT read from the roster table only:
+          - team_id
+          - player_id
+          - salary_amount
+
+        Intended use:
+          - build tick-level indexes (player->team, player->salary, team payroll, team roster counts)
+          - avoid per-deal SQL fan-out during large search (hundreds of thousands of deal validations).
+        """
+        rows = self._conn.execute(
+            "SELECT team_id, player_id, salary_amount FROM roster WHERE status='active';"
+        ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            # Normalize defensively (SSOT should already be canonical).
+            tid = str(normalize_team_id(r["team_id"], strict=True)).upper()
+            pid = str(normalize_player_id(r["player_id"], strict=False, allow_legacy_numeric=True))
+            sal = r["salary_amount"]
+            out.append(
+                {
+                    "team_id": tid,
+                    "player_id": pid,
+                    "salary_amount": int(sal) if sal is not None else None,
+                }
+            )
+        return out
+
+
     def get_team_id_by_player(self, player_id: str) -> str:
         pid = normalize_player_id(player_id, strict=False, allow_legacy_numeric=True)
         row = self._conn.execute(
