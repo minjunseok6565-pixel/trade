@@ -76,7 +76,7 @@ class OwnershipRule:
                 if isinstance(asset, PlayerAsset):
                     try:
                         pid = str(normalize_player_id(asset.player_id, strict=False, allow_legacy_numeric=True))
-                        current_team = ctx.repo.get_team_id_by_player(pid)
+                        current_team = ctx.get_team_id_by_player(pid)
                     except Exception as exc:
                         raise ValueError(
                             f"Player not found in roster: {asset.player_id}"
