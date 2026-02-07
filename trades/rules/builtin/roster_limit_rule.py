@@ -29,7 +29,7 @@ class RosterLimitRule:
 
         for team_id in deal.teams:
             tid = str(normalize_team_id(team_id, strict=True))
-            current_count = len(ctx.repo.get_roster_player_ids(tid))
+            current_count = len(ctx.get_roster_player_ids(tid))
             new_count = current_count - players_out[team_id] + players_in[team_id]
             if new_count > 15:
                 raise TradeError(
