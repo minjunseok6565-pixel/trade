@@ -737,7 +737,8 @@ def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCa
 
     # Sort
     filler.sort(key=lambda c: (float(getattr(c.market, "total", 0.0) or 0.0), float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
-    match.sort(key=lambda c: (abs(float(getattr(c.salary_m, 0.0) or 0.0) - 10.0), -float(getattr(c.market, "total", 0.0) or 0.0), c.player_id))
+    # match: keep salary diversity; do NOT bias to an arbitrary salary anchor (e.g. $10M)
+    match.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), -float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
     consolidate.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), -float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
     young.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
 
@@ -745,7 +746,7 @@ def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCa
     if posture in ("AGGRESSIVE_BUY", "SOFT_BUY"):
         consolidate = consolidate[:4]
 
-    return {"filler": filler[:12], "match": match[:10], "young": young[:6], "consolidate": consolidate[:8]}
+    return {"filler": filler[:14], "match": match[:28], "young": young[:6], "consolidate": consolidate[:8]}
 
 
 def _sample_near_salary(cands: Sequence[PlayerTradeCandidate], target_salary_m: float, *, rng: random.Random, k: int) -> List[PlayerTradeCandidate]:
@@ -839,10 +840,11 @@ def _repair_until_valid(state: _GenState, spec: _DealSpec, *, budgets: _Budgets)
             rule = str(details.get("rule") or "")
             reason = str(details.get("reason") or "")
             method = str(details.get("method") or "")
+            team_id = _canon_team_id(details.get("team_id") or "")
 
             if rule == "salary_matching":
                 if method == "second_apron_one_for_one":
-                    if not _repair_second_apron_one_for_one(state, current):
+                    if not _repair_second_apron_one_for_one(state, current, team_id=team_id):
                         return None
                     continue
                 if not _repair_salary_matching(state, current, details):
@@ -921,45 +923,126 @@ def _repair_roster_limit(state: _GenState, spec: _DealSpec, err: TradeError) -> 
     if not team_id:
         return False
 
-    # In 2-team deal, roster-limit violation happens to the receiver of too many players.
-    # Easiest repair: remove the least important outgoing player from the opposite sender
-    # (i.e., reduce incoming players for this team).
-    # Since our deals mostly send 1 player from seller, this is rare; handle generally.
+    # count is the post-trade roster size for the failing team
+    try:
+        count = int(details.get("count") or 0)
+    except Exception:
+        count = 0
+
     buyer_id = spec.buyer_id
     seller_id = spec.seller_id
+    catalog = state.catalog
 
-    # Determine which side is sending multiple players to team_id
+    # (1) Prefer reducing incoming players for the violating team when possible.
+    # This keeps the deal structure simple (especially for 2-for-1 archetypes).
+    if team_id == buyer_id and len(spec.seller_players_out) > 1:
+        spec.seller_players_out = spec.seller_players_out[:1]
+        spec.tags.append("repair:roster_trim_seller")
+        return True
+
+    if team_id == seller_id and len(spec.buyer_players_out) > 1:
+        spec.buyer_players_out = spec.buyer_players_out[:1]
+        spec.tags.append("repair:roster_trim_buyer")
+        return True
+
+    # (2) Common case: team is already at 15 and receives 1 player (new_count == 16).
+    # Repair by having the violating team send out a low-value filler to make room.
     if team_id == buyer_id:
-        # buyer receives seller players; trim seller outgoing players beyond 1 (keep target)
-        if len(spec.seller_players_out) > 1:
-            spec.seller_players_out = spec.seller_players_out[:1]
-            spec.tags.append("repair:roster_trim_seller")
+        buyer_out = catalog.outgoing_by_team.get(buyer_id)
+        if buyer_out is None:
+            return False
+
+        # Don't create multi-player outgoing if any current outgoing is aggregation solo-only.
+        if any(buyer_out.players.get(pid) and buyer_out.players[pid].aggregation_solo_only for pid in spec.buyer_players_out):
+            return False
+
+        # If count isn't available, still attempt at most one send-out.
+        need_send = 1 if count <= 0 else max(0, count - 15)
+        if need_send <= 0:
+            need_send = 1
+        need_send = min(need_send, 1)
+
+        filler_cands = _collect_buyer_player_candidates(state, buyer_out)["filler"]
+        used = set(spec.buyer_players_out)
+        for c in filler_cands:
+            if c.player_id in used:
+                continue
+            if c.aggregation_solo_only:
+                continue
+            spec.buyer_players_out.append(c.player_id)
+            spec.tags.append("repair:roster_send_filler_buyer")
             return True
+
+        return False
+
     if team_id == seller_id:
-        if len(spec.buyer_players_out) > 1:
-            spec.buyer_players_out = spec.buyer_players_out[:1]
-            spec.tags.append("repair:roster_trim_buyer")
+        # Rare in our generator (mostly triggered by 2-for-1 offers).
+        # If trimming didn't help, attempt to have seller send out one extra low-value player.
+        seller_out = catalog.outgoing_by_team.get(seller_id)
+        if seller_out is None:
+            return False
+
+        if any(seller_out.players.get(pid) and seller_out.players[pid].aggregation_solo_only for pid in spec.seller_players_out):
+            return False
+
+        need_send = 1 if count <= 0 else max(0, count - 15)
+        if need_send <= 0:
+            need_send = 1
+        need_send = min(need_send, 1)
+
+        filler_cands = _collect_buyer_player_candidates(state, seller_out)["filler"]
+        used = set(spec.seller_players_out)
+        for c in filler_cands:
+            if c.player_id in used:
+                continue
+            if c.aggregation_solo_only:
+                continue
+            spec.seller_players_out.append(c.player_id)
+            spec.tags.append("repair:roster_send_filler_seller")
             return True
+
+        return False
+
     return False
 
 
-def _repair_second_apron_one_for_one(state: _GenState, spec: _DealSpec) -> bool:
-    # Enforce 1 outgoing player per team maximum.
-    # Keep the "main" players (seller's target, buyer's best match if any).
+def _repair_second_apron_one_for_one(state: _GenState, spec: _DealSpec, *, team_id: str) -> bool:
+    """Repair for SECOND_APRON one-for-one restriction.
+
+    SalaryMatchingRule enforces that a SECOND_APRON team cannot trade if it would have
+    outgoing_players > 1 OR incoming_players > 1.
+
+    In a 2-team deal, that implies BOTH sides must be capped at 1 player-out, because:
+      - incoming_players for one team == other team's outgoing players (players assets)
+    We only trim lists that actually exceed 1.
+    """
+    tid = _canon_team_id(team_id or "")
     changed = False
+
+    # For 2-team deals, satisfying the apron team's incoming/outgoing constraints
+    # requires both lists to be <= 1. Keep the "primary" player on each side.
     if len(spec.seller_players_out) > 1:
         spec.seller_players_out = spec.seller_players_out[:1]
         changed = True
     if len(spec.buyer_players_out) > 1:
         spec.buyer_players_out = spec.buyer_players_out[:1]
         changed = True
+
     if changed:
-        spec.tags.append("repair:second_apron_1for1")
+        spec.tags.append(f"repair:second_apron_1for1:{tid or 'unknown'}")
     return changed
 
 
 def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str, Any]) -> bool:
-    """Minimal salary-match repair: add/trim filler depending on failing team."""
+    """Meta-driven salary-match repair (bounded).
+
+    Uses SalaryMatchingRule details:
+      - team_id, status, outgoing_salary, incoming_salary, allowed_in, method
+    Strategy:
+      - If failing team needs MORE outgoing salary: add the cheapest-possible salary filler close to the deficit.
+        If SECOND_APRON, prefer swapping to a higher-salary single outgoing instead of adding a 2nd player.
+      - If failing team needs LESS incoming salary: trim extra incoming players first, then swap to a cheaper player.
+    """
     team_id = _canon_team_id(details.get("team_id") or "")
     if not team_id:
         return False
@@ -973,44 +1056,179 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
     if buyer_out is None or seller_out is None:
         return False
 
-    # If buyer fails (incoming > allowed_in), add a filler player to buyer outgoing.
+    # Pull numeric details (dollars)
+    try:
+        incoming_salary = float(details.get("incoming_salary") or 0.0)
+    except Exception:
+        incoming_salary = 0.0
+    try:
+        outgoing_salary = float(details.get("outgoing_salary") or 0.0)
+    except Exception:
+        outgoing_salary = 0.0
+    try:
+        allowed_in = float(details.get("allowed_in") or 0.0)
+    except Exception:
+        allowed_in = 0.0
+
+    status = str(details.get("status") or "")
+    method = str(details.get("method") or "")
+
+    def _salary_m(c: PlayerTradeCandidate) -> float:
+        try:
+            return float(getattr(c, "salary_m", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _value(c: PlayerTradeCandidate) -> float:
+        try:
+            return float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _pool_for(out_cat: TeamOutgoingCatalog) -> List[PlayerTradeCandidate]:
+        packs = _collect_buyer_player_candidates(state, out_cat)
+        filler = list(packs.get("filler") or [])
+        match = list(packs.get("match") or [])
+        seen: Set[str] = set()
+        pool: List[PlayerTradeCandidate] = []
+        for c in filler + match:
+            if not c or not getattr(c, "player_id", None):
+                continue
+            if c.player_id in seen:
+                continue
+            seen.add(c.player_id)
+            pool.append(c)
+        return pool
+
+    # ---------------------------------------------------------------------
+    # Case A: buyer fails (buyer incoming salary too high vs allowed_in) => increase buyer outgoing salary.
+    # ---------------------------------------------------------------------
     if team_id == buyer_id:
-        # cannot add if any outgoing player is solo-only and we'd create 2+
-        if any(buyer_out.players.get(pid, None) and buyer_out.players[pid].aggregation_solo_only for pid in spec.buyer_players_out):
+        # If we're at SECOND_APRON, we cannot add a 2nd outgoing player once we already have one.
+        second_apron_one_for_one = (status == "SECOND_APRON") or (method == "outgoing_second_apron")
+
+        # If adding an extra outgoing would violate aggregation solo-only restriction, don't.
+        if any(buyer_out.players.get(pid) and buyer_out.players[pid].aggregation_solo_only for pid in spec.buyer_players_out):
             return False
 
-        filler_cands = _collect_buyer_player_candidates(state, buyer_out)["filler"]
+        deficit_dollars = max(0.0, incoming_salary - allowed_in) if allowed_in > 0 else max(0.0, incoming_salary)
+        needed_extra_m = deficit_dollars / 1_000_000.0
+
+        pool = _pool_for(buyer_out)
         used = set(spec.buyer_players_out)
-        for c in filler_cands:
-            if c.player_id in used:
-                continue
-            if c.aggregation_solo_only:
-                continue
-            spec.buyer_players_out.append(c.player_id)
-            spec.tags.append("repair:add_filler_buyer")
-            return True
+
+        def pick_best_to_add() -> Optional[PlayerTradeCandidate]:
+            best_c: Optional[PlayerTradeCandidate] = None
+            best_score: Optional[float] = None
+            for c in pool:
+                if c.player_id in used:
+                    continue
+                if c.aggregation_solo_only:
+                    continue
+                sal = _salary_m(c)
+                if sal <= 0:
+                    continue
+                val = _value(c)
+                # Prefer covering most of the deficit with minimal value cost.
+                score = abs(sal - needed_extra_m) + 0.03 * val
+                if needed_extra_m > 0.75 and sal < 0.60 * needed_extra_m:
+                    score += (0.60 * needed_extra_m - sal) * 2.5
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_c = c
+            return best_c
+
+        def pick_best_swap_higher(current_pid: str) -> Optional[PlayerTradeCandidate]:
+            cur = buyer_out.players.get(current_pid)
+            cur_sal = _salary_m(cur) if cur is not None else 0.0
+            min_sal = max(cur_sal + max(0.25, needed_extra_m), cur_sal + 0.25)
+
+            best_c: Optional[PlayerTradeCandidate] = None
+            best_score: Optional[float] = None
+            for c in pool:
+                if c.player_id == current_pid:
+                    continue
+                if c.player_id in used:
+                    continue
+                if c.aggregation_solo_only:
+                    continue
+                sal = _salary_m(c)
+                if sal + 1e-6 < min_sal:
+                    continue
+                val = _value(c)
+                over = sal - min_sal
+                score = over + 0.03 * val
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_c = c
+            return best_c
+
+        # Prefer add when allowed; otherwise swap to keep 1 outgoing player.
+        if not (second_apron_one_for_one and len(spec.buyer_players_out) >= 1):
+            cand = pick_best_to_add()
+            if cand is not None:
+                spec.buyer_players_out.append(cand.player_id)
+                spec.tags.append("repair:add_salary_filler_buyer")
+                return True
+
+        # Fallback: swap a single outgoing to a higher-salary alternative.
+        if len(spec.buyer_players_out) == 1:
+            cur_pid = spec.buyer_players_out[0]
+            cand = pick_best_swap_higher(cur_pid)
+            if cand is not None:
+                spec.buyer_players_out[0] = cand.player_id
+                spec.tags.append("repair:swap_higher_salary_buyer")
+                return True
+
+        # If we had 0 outgoing players (picks-only), adding one is still allowed even under SECOND_APRON.
+        if len(spec.buyer_players_out) == 0:
+            cand = pick_best_to_add()
+            if cand is not None:
+                spec.buyer_players_out.append(cand.player_id)
+                spec.tags.append("repair:add_outgoing_required_buyer")
+                return True
 
         return False
 
-    # If seller fails, buyer outgoing salary is too high relative to seller outgoing.
+    # ---------------------------------------------------------------------
+    # Case B: seller fails (seller incoming salary too high vs allowed_in) => reduce buyer outgoing salary.
+    # ---------------------------------------------------------------------
     if team_id == seller_id:
-        # Trim buyer filler players (keep first), or swap to cheaper candidate.
+        # Trim extra incoming players first (common for 2-for-1).
         if len(spec.buyer_players_out) >= 2:
             spec.buyer_players_out = spec.buyer_players_out[:1]
-            spec.tags.append("repair:trim_filler_buyer")
+            spec.tags.append("repair:trim_incoming_seller")
             return True
-        # If single player but too expensive, try swap to cheaper match candidate
-        if len(spec.buyer_players_out) == 1:
-            current_pid = spec.buyer_players_out[0]
-            current_c = buyer_out.players.get(current_pid)
-            current_salary = float(getattr(current_c, "salary_m", 0.0) or 0.0) if current_c else 0.0
-            match_cands = _collect_buyer_player_candidates(state, buyer_out)["match"]
-            cheaper = [c for c in match_cands if float(getattr(c, "salary_m", 0.0) or 0.0) <= current_salary - 0.25]
-            if cheaper:
-                spec.buyer_players_out[0] = cheaper[0].player_id
-                spec.tags.append("repair:swap_cheaper_buyer")
-                return True
-        return False
+
+        if len(spec.buyer_players_out) != 1:
+            return False
+
+        # Replace buyer outgoing player with a cheaper one that fits seller's allowed_in.
+        allowed_max_m = allowed_in / 1_000_000.0
+        if allowed_max_m <= 0.0:
+            return False
+
+        cur_pid = spec.buyer_players_out[0]
+        pool = _pool_for(buyer_out)
+
+        candidates = []
+        for c in pool:
+            if c.player_id == cur_pid:
+                continue
+            sal = _salary_m(c)
+            if sal <= 0:
+                continue
+            if sal - 1e-6 > allowed_max_m:
+                continue
+            candidates.append(c)
+
+        if not candidates:
+            return False
+
+        candidates.sort(key=lambda c: (-_value(c), -_salary_m(c), c.player_id))
+        spec.buyer_players_out[0] = candidates[0].player_id
+        spec.tags.append("repair:swap_cheaper_buyer_for_seller")
+        return True
 
     return False
 
@@ -1424,5 +1642,4 @@ def _deal_fingerprint_2team(deal: Deal) -> str:
         return h
     except Exception:
         return str(id(deal))
-
 
