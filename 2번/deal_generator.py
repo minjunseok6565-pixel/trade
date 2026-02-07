@@ -305,7 +305,16 @@ class DealGenerator:
         allow_locked_by_deal_id: Optional[str] = None,
         rng_seed: Optional[int] = None,
     ) -> List[DealProposal]:
-        """Generate candidate deals for a given team (2-team deals only)."""
+        """Generate candidate deals for a given team (2-team deals only).
+
+        Modes
+        -----
+        * BUY mode (default): select incoming targets that match this team's needs and build offers.
+        * SELL mode (posture SELL/SOFT_SELL): "shop" this team's outgoing assets to plausible buyers.
+
+        Regardless of mode, hard-rule validity is enforced via tick_ctx.validate_deal and
+        final acceptability is judged ONLY via evaluate_deal_for_team for both teams.
+        """
         tid = _canon_team_id(team_id)
         ts = tick_ctx.get_team_situation(tid)
 
@@ -313,7 +322,8 @@ class DealGenerator:
         if getattr(ts, "constraints", None) is not None:
             if bool(getattr(ts.constraints, "cooldown_active", False)):
                 return []
-        if str(getattr(ts, "trade_posture", "STAND_PAT")).upper() == "STAND_PAT" and float(getattr(ts, "urgency", 0.0) or 0.0) < self.config.stand_pat_min_urgency:
+        posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+        if posture == "STAND_PAT" and float(getattr(ts, "urgency", 0.0) or 0.0) < self.config.stand_pat_min_urgency:
             return []
 
         # Ensure asset catalog exists on tick context
@@ -340,78 +350,12 @@ class DealGenerator:
             stats=stats,
         )
 
-        # Select targets (IncomingPlayerRef list)
-        targets = _select_targets(state, buyer_id=tid, budgets=budgets)
-        targets = targets[: max(0, budgets.max_targets)]
+        if posture in ("SELL", "SOFT_SELL"):
+            results = _generate_sell_mode(state, seller_id=tid, budgets=budgets, max_results=max_results)
+        else:
+            results = _generate_buy_mode(state, buyer_id=tid, budgets=budgets, max_results=max_results)
 
-        results: List[DealProposal] = []
-        per_target_best: DefaultDict[str, List[DealProposal]] = defaultdict(list)
-
-        for ref in targets:
-            seller_id = _canon_team_id(ref.from_team)
-            if not seller_id or seller_id == tid:
-                continue
-
-            # partner spam limit (hard)
-            if stats.partner_counts[seller_id] >= self.config.max_partner_repeats:
-                continue
-
-            # build deal skeletons for this target
-            skeletons = _build_offer_skeletons(state, buyer_id=tid, target_ref=ref)
-            attempts = 0
-
-            for sk in skeletons:
-                if attempts >= budgets.max_attempts_per_target:
-                    break
-                if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
-                    break
-
-                attempts += 1
-                stats.attempts += 1
-
-                # validate / repair
-                deal = _repair_until_valid(state, sk, budgets=budgets)
-                if deal is None:
-                    continue
-
-                # dedupe
-                fp = _deal_fingerprint_2team(deal)
-                if fp in state.seen_fingerprints:
-                    stats.pruned_duplicate += 1
-                    continue
-                state.seen_fingerprints.add(fp)
-
-                # evaluate + score
-                proposal = _evaluate_and_score(state, deal, buyer_id=tid, seller_id=seller_id)
-                if proposal is None:
-                    continue
-
-                # optional sweetener loop for near-miss
-                proposals_to_add = [proposal]
-                if self.config.enable_sweeteners:
-                    proposals_to_add = _sweetener_loop(state, proposal, budgets=budgets)
-
-                for p in proposals_to_add:
-                    per_target_best[ref.player_id].append(p)
-
-                # maintain per-target beam
-                if per_target_best[ref.player_id]:
-                    per_target_best[ref.player_id].sort(key=lambda x: x.score, reverse=True)
-                    per_target_best[ref.player_id] = per_target_best[ref.player_id][: budgets.beam_width]
-
-            # partner count increments only if we produced at least one valid proposal
-            if per_target_best.get(ref.player_id):
-                stats.partner_counts[seller_id] += 1
-
-            # early stop if enough results and budgets tight
-            if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
-                break
-
-        # flatten beams
-        for lst in per_target_best.values():
-            results.extend(lst)
-
-        # global sort + trim
+        # Global sort + trim (helpers already keep things bounded, but be defensive)
         results.sort(key=lambda x: x.score, reverse=True)
         results = results[: max(0, int(max_results))]
 
@@ -425,6 +369,296 @@ class DealGenerator:
         return results
 
 
+# =============================================================================
+# Mode runners (BUY vs SELL)
+# =============================================================================
+def _generate_buy_mode(state: _GenState, *, buyer_id: str, budgets: _Budgets, max_results: int) -> List[DealProposal]:
+    """Standard BUY-mode generation for the initiating team."""
+    cfg = state.cfg
+    stats = state.stats
+
+    # Select targets (IncomingPlayerRef list)
+    targets = _select_targets(state, buyer_id=buyer_id, budgets=budgets)
+    targets = targets[: max(0, budgets.max_targets)]
+
+    results: List[DealProposal] = []
+    per_target_best: DefaultDict[str, List[DealProposal]] = defaultdict(list)
+
+    for ref in targets:
+        seller_id = _canon_team_id(ref.from_team)
+        if not seller_id or seller_id == buyer_id:
+            continue
+
+        # partner spam limit (hard)
+        if stats.partner_counts[seller_id] >= cfg.max_partner_repeats:
+            continue
+
+        # build deal skeletons for this target
+        skeletons = _build_offer_skeletons(state, buyer_id=buyer_id, target_ref=ref)
+        attempts = 0
+
+        for sk in skeletons:
+            if attempts >= budgets.max_attempts_per_target:
+                break
+            if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
+                break
+
+            attempts += 1
+            stats.attempts += 1
+
+            # validate / repair
+            deal = _repair_until_valid(state, sk, budgets=budgets)
+            if deal is None:
+                continue
+
+            # dedupe
+            fp = _deal_fingerprint_2team(deal)
+            if fp in state.seen_fingerprints:
+                stats.pruned_duplicate += 1
+                continue
+            state.seen_fingerprints.add(fp)
+
+            # evaluate + score
+            proposal = _evaluate_and_score(state, deal, buyer_id=buyer_id, seller_id=seller_id, partner_id=seller_id)
+            if proposal is None:
+                continue
+
+            # optional sweetener loop for near-miss
+            proposals_to_add = [proposal]
+            if cfg.enable_sweeteners:
+                proposals_to_add = _sweetener_loop(state, proposal, budgets=budgets, partner_id=seller_id)
+
+            for p in proposals_to_add:
+                per_target_best[ref.player_id].append(p)
+
+            # maintain per-target beam
+            if per_target_best[ref.player_id]:
+                per_target_best[ref.player_id].sort(key=lambda x: x.score, reverse=True)
+                per_target_best[ref.player_id] = per_target_best[ref.player_id][: budgets.beam_width]
+
+        # partner count increments only if we produced at least one valid proposal for this opponent
+        if per_target_best.get(ref.player_id):
+            stats.partner_counts[seller_id] += 1
+
+        # early stop if budgets tight
+        if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
+            break
+
+    for lst in per_target_best.values():
+        results.extend(lst)
+
+    results.sort(key=lambda x: x.score, reverse=True)
+    return results[: max(0, int(max_results))]
+
+
+def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, max_results: int) -> List[DealProposal]:
+    """SELL-mode generation: shop this team's outgoing candidates to plausible buyers."""
+    cfg = state.cfg
+    tick_ctx = state.tick_ctx
+    catalog = state.catalog
+    stats = state.stats
+
+    seller_id = _canon_team_id(seller_id)
+    seller_out = catalog.outgoing_by_team.get(seller_id)
+    if seller_out is None:
+        return []
+
+    sale_assets = _select_sale_assets(state, seller_id=seller_id, budgets=budgets)
+    results: List[DealProposal] = []
+    per_asset_best: DefaultDict[str, List[DealProposal]] = defaultdict(list)
+
+    for sale in sale_assets:
+        if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
+            break
+
+        # Pick plausible buyers for this asset.
+        buyer_rows = _select_buyers_for_sale_asset(state, seller_id=seller_id, sale_player=sale, budgets=budgets)
+
+        for buyer_id, best_tag, _score in buyer_rows:
+            buyer_id = _canon_team_id(buyer_id)
+            if not buyer_id or buyer_id == seller_id:
+                continue
+
+            # partner spam limit (hard) -> in SELL mode, partner is BUYER
+            if stats.partner_counts[buyer_id] >= cfg.max_partner_repeats:
+                continue
+
+            # Create a synthetic incoming ref so we can reuse BUY-mode skeleton builder
+            ref = IncomingPlayerRef(
+                player_id=sale.player_id,
+                from_team=seller_id,
+                tag=str(best_tag),
+                tag_strength=float((sale.supply or {}).get(best_tag, 0.0) or 0.0),
+                market_total=float(getattr(getattr(sale, "market", None), "total", 0.0) or 0.0),
+                salary_m=float(getattr(sale, "salary_m", 0.0) or 0.0),
+                remaining_years=float(getattr(sale, "remaining_years", 0.0) or 0.0),
+                age=getattr(getattr(sale, "snap", None), "age", None),
+            )
+
+            skeletons = _build_offer_skeletons(state, buyer_id=buyer_id, target_ref=ref)
+            attempts = 0
+            produced_for_buyer = False
+
+            for sk in skeletons:
+                if attempts >= budgets.max_attempts_per_target:
+                    break
+                if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
+                    break
+
+                attempts += 1
+                stats.attempts += 1
+
+                deal = _repair_until_valid(state, sk, budgets=budgets)
+                if deal is None:
+                    continue
+
+                fp = _deal_fingerprint_2team(deal)
+                if fp in state.seen_fingerprints:
+                    stats.pruned_duplicate += 1
+                    continue
+                state.seen_fingerprints.add(fp)
+
+                # evaluate + score (buyer is the other team; seller is the initiating team)
+                proposal = _evaluate_and_score(state, deal, buyer_id=buyer_id, seller_id=seller_id, partner_id=buyer_id)
+                if proposal is None:
+                    continue
+
+                proposals_to_add = [proposal]
+                if cfg.enable_sweeteners:
+                    proposals_to_add = _sweetener_loop(state, proposal, budgets=budgets, partner_id=buyer_id)
+
+                for p in proposals_to_add:
+                    per_asset_best[sale.player_id].append(p)
+                produced_for_buyer = True
+
+                if per_asset_best[sale.player_id]:
+                    per_asset_best[sale.player_id].sort(key=lambda x: x.score, reverse=True)
+                    per_asset_best[sale.player_id] = per_asset_best[sale.player_id][: budgets.beam_width]
+
+            # If we generated at least one valid proposal for this buyer (this asset), count them as a partner used.
+            if produced_for_buyer:
+                stats.partner_counts[buyer_id] += 1
+
+            if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
+                break
+
+    for lst in per_asset_best.values():
+        results.extend(lst)
+
+    results.sort(key=lambda x: x.score, reverse=True)
+    return results[: max(0, int(max_results))]
+
+
+def _select_sale_assets(state: _GenState, *, seller_id: str, budgets: _Budgets) -> List[PlayerTradeCandidate]:
+    """Pick outgoing assets to shop in SELL mode (surplus/expiring/vet-sale first)."""
+    tick_ctx = state.tick_ctx
+    catalog = state.catalog
+    rng = state.rng
+
+    seller_id = _canon_team_id(seller_id)
+    seller_out = catalog.outgoing_by_team.get(seller_id)
+    if seller_out is None:
+        return []
+
+    ts = tick_ctx.get_team_situation(seller_id)
+    posture = str(getattr(ts, "trade_posture", "SELL") or "SELL").upper()
+
+    # Priorities roughly emulate NBA: expiring/vet-sale/surplus are most likely to be shopped.
+    bucket_pri = {
+        "VETERAN_SALE": 0,
+        "EXPIRING": 1,
+        "SURPLUS_LOW_FIT": 2,
+        "SURPLUS_REDUNDANT": 3,
+        "FILLER_CHEAP": 4,
+        "FILLER_BAD_CONTRACT": 5,
+        "CONSOLIDATE": 6,
+        "CORE": 99,
+    }
+
+    rows: List[Tuple[int, float, float, float, str, PlayerTradeCandidate]] = []
+    for pid, c in seller_out.players.items():
+        if pid in state.banned_players[seller_id]:
+            continue
+        if _is_locked(c.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+            continue
+        if c.recent_signing_banned_until or c.aggregation_banned_until:
+            continue
+
+        # Exclude CORE in SOFT_SELL; allow ultra-rare CORE in SELL
+        if "CORE" in (c.buckets or ()):
+            if posture != "SELL":
+                continue
+            if rng.random() > 0.04:
+                continue
+
+        pri = min(bucket_pri.get(b, 50) for b in (c.buckets or ("FILLER_CHEAP",)))
+        surplus = float(getattr(c, "surplus_score", 0.0) or 0.0)
+        exp = 1.0 if bool(getattr(c, "is_expiring", False)) else 0.0
+        value = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        rows.append((pri, -surplus, -exp, value, c.player_id, c))
+
+    rows.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+    assets = [r[-1] for r in rows]
+
+    # Small shuffle among close ranks to avoid "same shopping list" every tick.
+    head = assets[: max(6, min(len(assets), budgets.max_targets))]
+    rng.shuffle(head)
+    tail = assets[len(head):]
+    out = head + tail
+
+    return out[: max(0, budgets.max_targets)]
+
+
+def _select_buyers_for_sale_asset(
+    state: _GenState,
+    *,
+    seller_id: str,
+    sale_player: PlayerTradeCandidate,
+    budgets: _Budgets,
+) -> List[Tuple[str, str, float]]:
+    """For a given sale player, pick plausible buyers based on their need_map."""
+    tick_ctx = state.tick_ctx
+    catalog = state.catalog
+
+    seller_id = _canon_team_id(seller_id)
+    max_buyers = max(4, min(14, 2 * budgets.beam_width))
+
+    rows: List[Tuple[float, str, str]] = []
+    tags = list(getattr(sale_player, "top_tags", ()) or ())
+    supply = getattr(sale_player, "supply", {}) or {}
+
+    for tid in catalog.outgoing_by_team.keys():
+        buyer_id = _canon_team_id(tid)
+        if not buyer_id or buyer_id == seller_id:
+            continue
+
+        buyer_ts = tick_ctx.get_team_situation(buyer_id)
+        if bool(getattr(getattr(buyer_ts, "constraints", None), "cooldown_active", False)):
+            continue
+
+        need_map = _get_need_map(tick_ctx, buyer_id)
+        if not need_map:
+            continue
+
+        best_tag = ""
+        best = 0.0
+        for t in tags:
+            w = float(need_map.get(t, 0.0) or 0.0)
+            s = float(supply.get(t, 0.0) or 0.0)
+            sc = w * (0.4 + 0.6 * s)
+            if sc > best:
+                best = sc
+                best_tag = t
+
+        if best <= 0.05:
+            continue
+
+        # Lightly prefer teams with higher urgency to mimic deadline activity.
+        urg = float(getattr(buyer_ts, "urgency", 0.0) or 0.0)
+        rows.append((best * (0.85 + 0.30 * _clamp01(urg)), buyer_id, best_tag))
+
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [(bid, tag, float(sc)) for sc, bid, tag in rows[:max_buyers]]
 # =============================================================================
 # Budgeting + seeds
 # =============================================================================
@@ -495,15 +729,56 @@ def _clamp01(x: float) -> float:
 # =============================================================================
 # Target selection
 # =============================================================================
+def _get_need_map(tick_ctx: TradeGenerationTickContext, team_id: str) -> Dict[str, float]:
+    """Best-effort need_map for a team.
+
+    Primary source: tick_ctx.get_decision_context(team_id).need_map (SSOT for valuation).
+    Fallback: tick_ctx.get_team_situation(team_id).needs -> {tag: weight}
+    """
+    tid = _canon_team_id(team_id)
+    out: Dict[str, float] = {}
+    try:
+        dc = tick_ctx.get_decision_context(tid)
+        nm = getattr(dc, "need_map", {}) or {}
+        if isinstance(nm, dict):
+            for k, v in nm.items():
+                if not k:
+                    continue
+                try:
+                    out[str(k)] = float(v)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    if out:
+        return out
+
+    # Fallback
+    try:
+        ts = tick_ctx.get_team_situation(tid)
+        needs = getattr(ts, "needs", None)
+        if isinstance(needs, list):
+            for n in needs:
+                tag = getattr(n, "tag", None)
+                w = getattr(n, "weight", None)
+                if not tag:
+                    continue
+                try:
+                    out[str(tag)] = float(w)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return out
+
 def _select_targets(state: _GenState, *, buyer_id: str, budgets: _Budgets) -> List[IncomingPlayerRef]:
     cfg = state.cfg
     tick_ctx = state.tick_ctx
     catalog = state.catalog
-
     buyer_dc = tick_ctx.get_decision_context(buyer_id)
-    need_map = getattr(buyer_dc, "need_map", {}) or {}
-    if not isinstance(need_map, dict):
-        need_map = {}
+    need_map = _get_need_map(tick_ctx, buyer_id)
 
     # pick top N tags
     need_items = [(str(k), float(v)) for k, v in need_map.items() if k and v is not None]
@@ -570,18 +845,22 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     if buyer_out is None or seller_out is None:
         return []
 
-    # resolve full target candidate
+    # resolve full target candidate (the player seller would send out)
     target = seller_out.players.get(target_ref.player_id)
     if target is None:
         return []
 
-    # seller willingness prefilter: avoid CORE unless seller posture is SELL-ish
+    # --- counterpart posture/horizon (used to shape archetypes) ---
     seller_ts = tick_ctx.get_team_situation(seller_id)
     seller_posture = str(getattr(seller_ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+    seller_horizon = str(getattr(seller_ts, "time_horizon", "RE_TOOL") or "RE_TOOL").upper()
+    rebuildish = (seller_horizon == "REBUILD") or (seller_posture in ("SELL", "SOFT_SELL"))
+    win_nowish = (seller_horizon == "WIN_NOW")
+
+    # Light prefilter: avoid CORE unless seller is SELL-ish. Even then, make it rare.
     if "CORE" in (target.buckets or ()):
         if seller_posture not in ("SELL", "SOFT_SELL"):
             return []
-        # even in SELL, core sales should be rare; keep but low probability
         if rng.random() > 0.10:
             return []
 
@@ -593,30 +872,55 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
         state.stats.pruned_ineligible += 1
         return []
     if target.recent_signing_banned_until or target.aggregation_banned_until:
-        # can't trade out right now
         state.stats.pruned_ineligible += 1
         return []
+
+    # --- Hard realism guard: if either side is above 2nd apron, avoid multi-player constructions up front.
+    buyer_ts = tick_ctx.get_team_situation(buyer_id)
+    buyer_apron = str(getattr(getattr(buyer_ts, "constraints", None), "apron_status", "") or "")
+    seller_apron = str(getattr(getattr(seller_ts, "constraints", None), "apron_status", "") or "")
+    apron_one_for_one_hint = (buyer_apron == "ABOVE_2ND_APRON") or (seller_apron == "ABOVE_2ND_APRON")
+
+    # Seller need map guides "return player" selection (NBA feel: they ask for fits, not random bodies)
+    seller_need_map = _get_need_map(tick_ctx, seller_id)
 
     # Build candidate sets for buyer outgoing
     buyer_players = _collect_buyer_player_candidates(state, buyer_out)
     filler = buyer_players["filler"]
     match = buyer_players["match"]
     young = buyer_players["young"]
+    cons = buyer_players["consolidate"]
+
+    # Archetype shaping by seller horizon (still bounded by shuffle + final cap)
+    p4p_k = 3 if win_nowish else 2
+    salary_k = 3 if win_nowish else 2
+    picks_pkg_n = 4 if rebuildish else 2
+    young_k = 2 if rebuildish else 1
+    young_pkg_n = 3 if rebuildish else 1
+
+    enable_2for1 = bool(cfg.enable_consolidate_2for1) and (not apron_one_for_one_hint) and win_nowish
 
     skeletons: List[_DealSpec] = []
 
-    # archetype 0: straight player-for-player (simple)
-    for p in _sample_near_salary(match, target.salary_m, rng=rng, k=2):
+    # --- archetype: player-for-player (return player chosen to match seller needs when possible)
+    p4p_pool = _sample_for_counterparty(match, target.salary_m, need_map=seller_need_map, rng=rng, k=p4p_k)
+    for p in p4p_pool:
         sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
         sk.seller_players_out = [target.player_id]
         sk.buyer_players_out = [p.player_id]
         sk.tags.append("archetype:p4p")
         sk.tags.append(f"need:{target_ref.tag}")
+        if seller_horizon:
+            sk.tags.append(f"seller_horizon:{seller_horizon}")
+        rt = _best_need_tag(seller_need_map, p)
+        if rt:
+            sk.tags.append(f"return_need:{rt}")
         skeletons.append(sk)
 
-    # archetype 1: picks-only (only if buyer can absorb via cap room)
+    # --- archetype: picks-only (rebuildish sellers prefer; win-now sellers rare)
     if cfg.enable_picks_only and _buyer_can_absorb_target(tick_ctx, buyer_id, target.salary_m):
-        for picks, swaps, tag in _picks_packages(state, buyer_out, max_packages=3):
+        max_pkg = picks_pkg_n if rebuildish else 1
+        for picks, swaps, tag in _picks_packages(state, buyer_out, max_packages=max_pkg):
             sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
             sk.seller_players_out = [target.player_id]
             sk.buyer_picks_out = list(picks)
@@ -624,12 +928,16 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
             sk.tags.append("archetype:picks_only")
             sk.tags.append(tag)
             sk.tags.append(f"need:{target_ref.tag}")
+            if seller_horizon:
+                sk.tags.append(f"seller_horizon:{seller_horizon}")
             skeletons.append(sk)
 
-    # archetype 2: young + pick (rebuild sellers prefer)
+    # --- archetype: young + pick (rebuildish / re-tool sellers lean this way)
     if young:
-        for p in young[:2]:
-            for picks, swaps, tag in _picks_packages(state, buyer_out, max_packages=2, prefer_second=True):
+        max_young_players = young_k if rebuildish else 1
+        max_young_pkgs = young_pkg_n if rebuildish else 1
+        for p in _sample_for_counterparty(young[: max(1, 2 * max_young_players)], target.salary_m, need_map=seller_need_map, rng=rng, k=max_young_players):
+            for picks, swaps, tag in _picks_packages(state, buyer_out, max_packages=max_young_pkgs, prefer_second=True):
                 sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
                 sk.seller_players_out = [target.player_id]
                 sk.buyer_players_out = [p.player_id]
@@ -638,40 +946,56 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
                 sk.tags.append("archetype:young+pick")
                 sk.tags.append(tag)
                 sk.tags.append(f"need:{target_ref.tag}")
+                if seller_horizon:
+                    sk.tags.append(f"seller_horizon:{seller_horizon}")
+                rt = _best_need_tag(seller_need_map, p)
+                if rt:
+                    sk.tags.append(f"return_need:{rt}")
                 skeletons.append(sk)
 
-    # archetype 3: salary match focus (filler + small sweetener)
-    for p in _sample_near_salary(filler, target.salary_m, rng=rng, k=2):
+    # --- archetype: salary match focus (win-now sellers tend to want immediate contributors)
+    salary_pool = match if win_nowish else filler
+    for p in _sample_for_counterparty(salary_pool, target.salary_m, need_map=seller_need_map, rng=rng, k=salary_k):
         sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
         sk.seller_players_out = [target.player_id]
         sk.buyer_players_out = [p.player_id]
         sk.tags.append("archetype:salary_match")
         sk.tags.append(f"need:{target_ref.tag}")
+        if seller_horizon:
+            sk.tags.append(f"seller_horizon:{seller_horizon}")
+        rt = _best_need_tag(seller_need_map, p)
+        if rt:
+            sk.tags.append(f"return_need:{rt}")
         skeletons.append(sk)
 
-    # archetype 4: consolidate 2-for-1 (bounded)
-    if cfg.enable_consolidate_2for1:
-        # avoid creating multi-player outgoing if we might hit aggregation solo restrictions frequently
-        cons = buyer_players["consolidate"]
-        if cons and filler:
-            top_a = cons[:2]
-            top_b = filler[:3]
-            for a in top_a:
-                for b in top_b:
-                    if a.player_id == b.player_id:
-                        continue
-                    if a.aggregation_solo_only or b.aggregation_solo_only:
-                        continue
-                    sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
-                    sk.seller_players_out = [target.player_id]
-                    sk.buyer_players_out = [a.player_id, b.player_id]
-                    sk.tags.append("archetype:2for1")
-                    sk.tags.append(f"need:{target_ref.tag}")
-                    skeletons.append(sk)
+    # --- archetype: consolidate (2-for-1) (mostly a win-now depth play; disabled for 2nd apron hint)
+    if enable_2for1 and cons and filler:
+        top_a = _rank_for_need(cons[:6], need_map=seller_need_map)[:2]
+        top_b = _rank_for_need(filler[:10], need_map=seller_need_map)[:4]
+        for a in top_a:
+            for b in top_b:
+                if a.player_id == b.player_id:
+                    continue
+                if a.aggregation_solo_only or b.aggregation_solo_only:
+                    continue
+                sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
+                sk.seller_players_out = [target.player_id]
+                sk.buyer_players_out = [a.player_id, b.player_id]
+                sk.tags.append("archetype:2for1")
+                sk.tags.append(f"need:{target_ref.tag}")
+                if seller_horizon:
+                    sk.tags.append(f"seller_horizon:{seller_horizon}")
+                rta = _best_need_tag(seller_need_map, a)
+                rtb = _best_need_tag(seller_need_map, b)
+                if rta:
+                    sk.tags.append(f"return_need:{rta}")
+                if rtb and rtb != rta:
+                    sk.tags.append(f"return_need:{rtb}")
+                skeletons.append(sk)
 
     # shuffle + keep only a small bounded set per target
     rng.shuffle(skeletons)
-    return skeletons[: max(5, min(14, 2 * state.cfg.beam_width))]
+    return skeletons[: max(6, min(16, 2 * state.cfg.beam_width))]
 
 
 def _buyer_can_absorb_target(tick_ctx: TradeGenerationTickContext, buyer_id: str, target_salary_m: float) -> bool:
@@ -760,6 +1084,87 @@ def _sample_near_salary(cands: Sequence[PlayerTradeCandidate], target_salary_m: 
         rows.append((abs(s - float(target_salary_m)), -float(getattr(c.market, "total", 0.0) or 0.0), c.player_id, c))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     top = [r[3] for r in rows[: max(2, min(8, len(rows)))]]
+    rng.shuffle(top)
+    return top[: max(0, k)]
+
+
+def _need_fit_score(need_map: Mapping[str, float], cand: PlayerTradeCandidate) -> float:
+    """How well a candidate matches a team's needs (0..~)."""
+    if not need_map:
+        return 0.0
+    supply = getattr(cand, "supply", {}) or {}
+    tags = getattr(cand, "top_tags", ()) or ()
+    score = 0.0
+    for t in tags:
+        try:
+            w = float(need_map.get(t, 0.0) or 0.0)
+            s = float(supply.get(t, 0.0) or 0.0)
+        except Exception:
+            continue
+        score += w * (0.4 + 0.6 * s)
+    return float(score)
+
+
+def _best_need_tag(need_map: Mapping[str, float], cand: PlayerTradeCandidate) -> str:
+    """Return the best-matching need tag for narrative tags (or empty)."""
+    if not need_map:
+        return ""
+    supply = getattr(cand, "supply", {}) or {}
+    tags = getattr(cand, "top_tags", ()) or ()
+    best_t = ""
+    best = 0.0
+    for t in tags:
+        try:
+            w = float(need_map.get(t, 0.0) or 0.0)
+            s = float(supply.get(t, 0.0) or 0.0)
+            sc = w * (0.4 + 0.6 * s)
+        except Exception:
+            continue
+        if sc > best:
+            best = sc
+            best_t = str(t)
+    return best_t if best > 0.05 else ""
+
+
+def _rank_for_need(cands: Sequence[PlayerTradeCandidate], *, need_map: Mapping[str, float]) -> List[PlayerTradeCandidate]:
+    """Deterministic ranking of candidates by need fit (then by market value, then salary)."""
+    rows = []
+    for c in cands:
+        nf = _need_fit_score(need_map, c)
+        mv = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+        rows.append((nf, mv, sal, c.player_id, c))
+    rows.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    return [r[-1] for r in rows]
+
+
+def _sample_for_counterparty(
+    cands: Sequence[PlayerTradeCandidate],
+    target_salary_m: float,
+    *,
+    need_map: Mapping[str, float],
+    rng: random.Random,
+    k: int,
+) -> List[PlayerTradeCandidate]:
+    """Sample candidates with a blend of salary proximity and need fit.
+
+    This is purely a heuristic for *plausible* packages; SSOT evaluation decides acceptance later.
+    """
+    rows = []
+    for c in cands:
+        try:
+            sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+        except Exception:
+            sal = 0.0
+        mv = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        nf = _need_fit_score(need_map, c)
+        dist = abs(sal - float(target_salary_m))
+        # Higher is better: need fit dominates slightly; salary distance keeps things plausible.
+        score = (1.45 * nf) - (0.14 * dist) - (0.015 * max(0.0, mv - 18.0))
+        rows.append((score, -nf, dist, mv, c.player_id, c))
+
+    rows.sort(key=lambda x: (x[0], x[1], -x[2], x[4]), reverse=True)
+    top = [r[-1] for r in rows[: max(2, min(10, len(rows)))]]
     rng.shuffle(top)
     return top[: max(0, k)]
 
@@ -1360,7 +1765,7 @@ def _spec_to_deal(state: _GenState, spec: _DealSpec) -> Optional[Deal]:
 # =============================================================================
 # Evaluate + scoring
 # =============================================================================
-def _evaluate_and_score(state: _GenState, deal: Deal, *, buyer_id: str, seller_id: str) -> Optional[DealProposal]:
+def _evaluate_and_score(state: _GenState, deal: Deal, *, buyer_id: str, seller_id: str, partner_id: Optional[str] = None) -> Optional[DealProposal]:
     cfg = state.cfg
     tick_ctx = state.tick_ctx
 
@@ -1389,8 +1794,9 @@ def _evaluate_and_score(state: _GenState, deal: Deal, *, buyer_id: str, seller_i
     score = _score_deal(cfg, buyer_decision, buyer_eval, seller_decision, seller_eval)
     tags = tuple(_extract_tags_from_deal(deal))
 
-    # partner spam penalty: discourage repetitive same opponent
-    repeats = max(0, int(state.stats.partner_counts.get(seller_id, 0)))
+    # partner spam penalty: discourage repetitive same opponent (mode-aware)
+    opp = _canon_team_id(partner_id) if partner_id else seller_id
+    repeats = max(0, int(state.stats.partner_counts.get(opp, 0)))
     if repeats > 0:
         score -= cfg.partner_repeat_penalty * float(repeats)
 
@@ -1475,7 +1881,7 @@ def _extract_tags_from_deal(deal: Deal) -> List[str]:
 # =============================================================================
 # Sweetener loop (minimal counter-ish)
 # =============================================================================
-def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budgets) -> List[DealProposal]:
+def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budgets, partner_id: Optional[str] = None) -> List[DealProposal]:
     cfg = state.cfg
     buyer_id = proposal.buyer_id
     seller_id = proposal.seller_id
@@ -1569,7 +1975,7 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
             continue
         state.seen_fingerprints.add(fp)
 
-        p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id)
+        p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
         if p2 is None:
             continue
         new_props.append(p2)
@@ -1642,4 +2048,3 @@ def _deal_fingerprint_2team(deal: Deal) -> str:
         return h
     except Exception:
         return str(id(deal))
-
