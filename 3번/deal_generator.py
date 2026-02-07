@@ -23,6 +23,8 @@ from datetime import date
 from math import exp
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+import hashlib
+import json
 import random
 
 from ..errors import (
@@ -183,16 +185,22 @@ def _protected_player_ids_from_meta(deal: Deal) -> Set[str]:
 
 
 def _hash_deal_for_dedupe(deal: Deal) -> str:
-    # canonicalize + serialize = stable representation.
-    # Keep hash as string to store in python set.
+    """Stable content hash for dedupe.
+
+    Important:
+    - Must be deterministic across processes (so do NOT use Python's built-in hash()).
+    - Keep representation compact (sha1) to reduce memory.
+    """
     try:
         canon = canonicalize_deal(deal)
     except Exception:
         canon = deal
     payload = serialize_deal(canon)
-    # stable: sort keys recursively not required; Python dict order preserved by creation,
-    # but serialize_deal is deterministic on canonicalized deal.
-    return str(payload)
+    try:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except Exception:
+        raw = str(payload).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -571,6 +579,10 @@ class DealGenerator:
 
         # Exploration state
         proposals: List[DealProposal] = []
+        # Dedupe sets:
+        # - seen_skeletons: pre-repair deals (cheap early pruning)
+        # - seen_deals: final deals after repair/validation (prevents duplicates from different repair paths)
+        seen_skeletons: Set[str] = set()
         seen_deals: Set[str] = set()
         opponent_seen: Dict[str, int] = {}
         target_seen: Dict[str, int] = {}
@@ -620,11 +632,11 @@ class DealGenerator:
                 attempts += 1
                 deal = skel_deal
 
-                # Dedupe early
-                h = _hash_deal_for_dedupe(deal)
-                if h in seen_deals:
+                # Dedupe early (pre-repair)
+                h_skel = _hash_deal_for_dedupe(deal)
+                if h_skel in seen_skeletons:
                     continue
-                seen_deals.add(h)
+                seen_skeletons.add(h_skel)
 
                 # Repair loop: validate + minimal repairs
                 deal_valid = False
@@ -662,6 +674,12 @@ class DealGenerator:
 
                 if not deal_valid:
                     continue
+
+                # Final dedupe (post-repair / post-validation)
+                h_final = _hash_deal_for_dedupe(deal)
+                if h_final in seen_deals:
+                    continue
+                seen_deals.add(h_final)
 
                 # Asset count / player count sanity (avoid heavy packages)
                 if _deal_num_assets(deal) > int(budgets["max_assets"]):
@@ -801,7 +819,8 @@ class DealGenerator:
     # ---------------------------------------------------------------------
     def _default_seed(self, current_date: date, team_id: str) -> int:
         base = f"{current_date.isoformat()}::{_canon_team_id(team_id)}::{int(self.cfg.rng_salt)}"
-        return abs(hash(base)) % (2**31 - 1)
+        # IMPORTANT: don't use Python's built-in hash(); it is randomized per process.
+        return int(hashlib.sha1(base.encode("utf-8")).hexdigest(), 16) % (2**31 - 1)
 
     def _compute_budgets(
         self,
@@ -1293,6 +1312,7 @@ class DealGenerator:
         if outcat is None:
             return False
         existing = _deal_outgoing_pick_ids(deal, from_team_u)
+        rejected: Set[str] = set()  # picks tried and rejected (e.g., Stepien)
 
         # Candidate picks ordered by bucket preference.
         buckets: List[str] = ["SECOND"]
@@ -1310,7 +1330,7 @@ class DealGenerator:
             best_bucket: Optional[str] = None
             for b in buckets:
                 for pid in list(outcat.pick_ids_by_bucket.get(b, tuple()) or tuple()):
-                    if pid in existing:
+                    if pid in existing or pid in rejected:
                         continue
                     cand = outcat.picks.get(pid)
                     if cand is None:
@@ -1332,9 +1352,8 @@ class DealGenerator:
             pid = str(best.pick_id)
             if not catalog.stepien.is_compliant_after(team_id=from_team_u, outgoing_pick_ids=existing | {pid}, incoming_pick_ids=set()):
                 # if this pick makes Stepien illegal, skip it.
-                # try a different pick by removing it from ordering.
-                # (Cheap path: mark as used for this loop)
-                existing.add(pid)
+                # IMPORTANT: do NOT add it to `existing` because it is not actually in the deal.
+                rejected.add(pid)
                 continue
 
             a = _pick_asset(pid, outcat)
@@ -1393,6 +1412,7 @@ class DealGenerator:
         seconds_added = 0
         deal = Deal(teams=list(base_deal.teams), legs={k: list(v) for k, v in base_deal.legs.items()}, meta=dict(base_deal.meta or {}))
         protected = _protected_player_ids_from_meta(deal)
+        local_seen: Set[str] = set()  # local pre-validate dedupe for sweetener exploration
         # attempt up to 2 additions
         added = 0
         for kind, bucket in actions:
@@ -1411,11 +1431,11 @@ class DealGenerator:
             if not changed:
                 continue
 
-            # dedupe
-            h = _hash_deal_for_dedupe(deal)
-            if h in seen_deals:
+            # dedupe (local pre-check; global dedupe happens after repair/validation)
+            h_pre = _hash_deal_for_dedupe(deal)
+            if h_pre in local_seen:
                 continue
-            seen_deals.add(h)
+            local_seen.add(h_pre)
 
             # validate with minimal repair if needed
             try:
@@ -1441,6 +1461,12 @@ class DealGenerator:
                     validations_counter(1)
                 except Exception:
                     continue
+
+            # Global dedupe after repair/validation (prevents duplicates from repair paths)
+            h_final = _hash_deal_for_dedupe(deal)
+            if h_final in seen_deals:
+                continue
+            seen_deals.add(h_final)
 
             added += 1
             # early exit if we've added something meaningful
