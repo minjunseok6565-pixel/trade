@@ -188,7 +188,7 @@ def build_week_summary_context() -> str:
     db_path = get_db_path()
     try:
         repo = LeagueRepo(db_path)
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         tx_rows = repo.list_transactions(limit=500, since_date=week_start.isoformat())
     except Exception as e:
         _warn_limited("NEWS_TX_DB_FAILED", f"db_path={db_path!r} exc_type={type(e).__name__}", limit=3)

@@ -174,7 +174,12 @@ def extract_text_from_gemini_response(resp: Any) -> str:
 # -------------------------------------------------------------------------
 @app.post("/api/simulate-game")
 async def api_simulate_game(req: SimGameRequest):
-    """matchengine_v3를 사용해 한 경기를 시뮬레이션한다."""
+    """matchengine_v3를 사용해 한 경기를 시뮬레이션한다.
+
+    NOTE (SSOT 계약):
+    - Home/Away SSOT는 league_sim.simulate_single_game 내부에서 GameContext로 생성/주입된다.
+    - server는 엔진을 직접 호출하지 않으며(직접 호출 금지), 결과는 어댑터+validator 관문을 통과한 V2만 반환한다.
+    """
     try:
         result = simulate_single_game(
             home_team_id=req.home_team_id,
@@ -422,7 +427,7 @@ def _trade_error_response(error: TradeError) -> JSONResponse:
 
 def _validate_repo_integrity(db_path: str) -> None:
     with LeagueRepo(db_path) as repo:
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         repo.validate_integrity()
 
 
@@ -531,7 +536,7 @@ async def roster_summary(team_id: str):
     db_path = state.get_db_path()
     team_id = str(normalize_team_id(team_id, strict=True))
     with LeagueRepo(db_path) as repo:
-        repo.init_db()
+        # DB schema is guaranteed during server startup (state.startup_init_state()).
         roster = repo.get_team_roster(team_id)
 
     if not roster:
@@ -564,11 +569,17 @@ async def team_schedule(team_id: str):
     if team_id not in ALL_TEAM_IDS:
         raise HTTPException(status_code=404, detail=f"Team '{team_id}' not found in league")
 
-    # 마스터 스케줄이 없다면 생성
-    state.initialize_master_schedule_if_needed()
+    # (startup 보장 전제) 마스터 스케줄은 이미 초기화되어 있어야 함
     league = state.export_full_state_snapshot().get("league", {})
     master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
+
+    if not games:
+        raise HTTPException(
+            status_code=500,
+            detail="Master schedule is not initialized. Expected server startup_init_state() to run.",
+        )
+        
 
     team_games: List[Dict[str, Any]] = [
         g for g in games
@@ -631,7 +642,7 @@ async def state_summary():
     db_path = state.get_db_path()
     try:
         with LeagueRepo(db_path) as repo:
-            repo.init_db()
+            # DB schema is guaranteed during server startup (state.startup_init_state()).
             db_snapshot: Dict[str, Any] = {
                 "ok": True,
                 "db_path": db_path,
@@ -660,6 +671,9 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
+
+
 
 
 

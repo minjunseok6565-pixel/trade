@@ -70,9 +70,6 @@ def _run_ai_gm_tick_if_needed(target_date: date) -> None:
 
 def _attempt_ai_trade(target_date: Optional[date] = None) -> bool:
     _init_players_and_teams_if_needed()
-    from state import initialize_master_schedule_if_needed
-
-    initialize_master_schedule_if_needed()
     league = export_full_state_snapshot().get("league", {})
     db_path = get_db_path()
     repo = LeagueRepo(db_path)

@@ -19,11 +19,10 @@ def _warn_limited(code: str, msg: str, *, limit: int = 5) -> None:
 
 from derived_formulas import compute_derived
 from state import (
-    ensure_cap_model_populated_if_needed,
     export_full_state_snapshot,
+    export_workflow_state,
     get_db_path,
     get_league_context_snapshot,
-    initialize_master_schedule_if_needed,
     players_get,
     players_set,
     teams_get,
@@ -50,16 +49,8 @@ def _repo_ctx() -> "LeagueRepo":
 
     db_path = get_db_path()
     with LeagueRepo(db_path) as repo:
-        try:
-            repo.init_db()
-        except Exception as exc:
-            logger.exception(
-                "[DB_INIT_FAILED] team_utils._repo_ctx repo.init_db() failed (db_path=%s)",
-                db_path,
-            )
-            raise
+        # DB schema is guaranteed during server startup (state.startup_init_state()). repo
         yield repo
-
 
 def _list_active_team_ids() -> List[str]:
     """Return active team ids from DB if possible.
@@ -223,8 +214,7 @@ def _compute_team_payroll(team_id: str) -> float:
 
 def _compute_cap_space(team_id: str) -> float:
     payroll = _compute_team_payroll(team_id)
-    # Keep legacy behavior: cap/aprons should be populated when season_year is known and unset/zero.
-    ensure_cap_model_populated_if_needed()
+    # Assumes cap model (salary_cap/aprons) is already populated during server startup/hydration.
     league_context = get_league_context_snapshot()
     trade_rules = league_context.get("trade_rules", {})
     try:
@@ -237,11 +227,15 @@ def _compute_cap_space(team_id: str) -> float:
 
 def _compute_team_records() -> Dict[str, Dict[str, Any]]:
     """Compute W/L and points from master_schedule."""
-    initialize_master_schedule_if_needed()
     league = export_full_state_snapshot().get("league", {})
     master_schedule = league.get("master_schedule", {})
     games = master_schedule.get("games") or []
 
+    if not games:
+        raise RuntimeError(
+            "Master schedule is not initialized. Expected state.startup_init_state() to run before calling team_utils._compute_team_records()."
+        )
+    
     team_ids = _list_active_team_ids()
     records: Dict[str, Dict[str, Any]] = {
         tid: {"wins": 0, "losses": 0, "pf": 0, "pa": 0}
@@ -277,7 +271,6 @@ def _compute_team_records() -> Dict[str, Dict[str, Any]]:
 
 def get_conference_standings() -> Dict[str, List[Dict[str, Any]]]:
     """Return standings grouped by conference."""
-    _init_players_and_teams_if_needed()
     records = _compute_team_records()
 
     standings = {"east": [], "west": []}
@@ -441,6 +434,11 @@ def get_team_detail(team_id: str) -> Dict[str, Any]:
         "summary": summary,
         "roster": roster_sorted,
     }
+
+
+
+
+
 
 
 
