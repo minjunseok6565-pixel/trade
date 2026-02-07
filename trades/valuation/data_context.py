@@ -564,12 +564,7 @@ def build_repo_valuation_data_context(
             if meta.get("current_season_year") is None or meta.get("current_season_year") == "":
                 meta["current_season_year"] = int(current_season_year)
 
-            key = str(getattr(exp, "pick_id", None) or pick_id)
-            try:
-                pe_norm[key] = replace(exp, pick_id=key, meta=meta)
-            except Exception:
-                # Fallback: preserve original expectation if replace fails.
-                pe_norm[key] = exp
+            pe_norm[pick_id] = replace(exp, meta=meta)
         pe = pe_norm
 
     return RepoValuationDataContext(
