@@ -5,7 +5,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, Optional, TYPE_CHECKING
 
 from league_repo import LeagueRepo
-from schema import normalize_player_id
+from schema import normalize_player_id, normalize_team_id
 
 from . import rule_player_meta
 
@@ -28,6 +28,10 @@ def _canonical_player_id(value: object) -> str:
     return str(normalize_player_id(value, strict=False, allow_legacy_numeric=True))
 
 
+def _canonical_team_id(value: object) -> str:
+    return str(normalize_team_id(value, strict=True)).upper()
+
+
 @dataclass
 class TradeRuleTickContext:
     db_path: str
@@ -42,6 +46,72 @@ class TradeRuleTickContext:
     integrity_validated: bool = False
     # Prepared once per tick: enabled rules sorted by (priority, rule_id)
     prepared_rules: list["Rule"] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Fast per-tick indexes for rules (avoid per-deal SQL fan-out)
+    # ------------------------------------------------------------------
+    active_roster_index_built: bool = False
+    player_team_map: Dict[str, str] = field(default_factory=dict)          # player_id -> team_id
+    player_salary_map: Dict[str, Optional[int]] = field(default_factory=dict)  # player_id -> salary_amount
+    team_roster_ids_map: Dict[str, set[str]] = field(default_factory=dict) # team_id -> {player_id}
+    team_payroll_before_map: Dict[str, float] = field(default_factory=dict)    # team_id -> payroll_before
+
+    def ensure_active_roster_index(self) -> None:
+        """Build indexes from the active roster once per tick.
+
+        This removes the biggest remaining bottleneck when validating hundreds of thousands
+        of candidate deals: rules should not issue DB queries per deal for roster/team/salary.
+        """
+        if self.active_roster_index_built:
+            return
+
+        # Preferred: one narrow SSOT query.
+        if hasattr(self.repo, "get_active_roster_salary_rows"):
+            rows = self.repo.get_active_roster_salary_rows()
+        else:
+            # Fallback (shouldn't happen): query roster directly via repo API.
+            rows = []
+            try:
+                # Accessing _conn is not ideal, but keep a safe fallback.
+                conn = getattr(self.repo, "_conn", None)
+                if conn is not None:
+                    rows = [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT team_id, player_id, salary_amount FROM roster WHERE status='active';"
+                        ).fetchall()
+                    ]
+            except Exception:
+                rows = []
+
+        player_team: Dict[str, str] = {}
+        player_salary: Dict[str, Optional[int]] = {}
+        team_roster_ids: Dict[str, set[str]] = {}
+        team_payroll: Dict[str, float] = {}
+
+        for r in rows or []:
+            try:
+                tid = _canonical_team_id(r.get("team_id"))
+                pid = _canonical_player_id(r.get("player_id"))
+            except Exception:
+                continue
+            sal = r.get("salary_amount")
+            try:
+                sal_int = int(sal) if sal is not None else None
+            except Exception:
+                sal_int = None
+
+            player_team[pid] = tid
+            player_salary[pid] = sal_int
+            team_roster_ids.setdefault(tid, set()).add(pid)
+            team_payroll[tid] = float(team_payroll.get(tid, 0.0) + float(sal_int or 0))
+
+        # Publish built maps.
+        self.player_team_map = player_team
+        self.player_salary_map = player_salary
+        self.team_roster_ids_map = team_roster_ids
+        self.team_payroll_before_map = team_payroll
+        self.active_roster_index_built = True
 
     def ensure_players_meta(self, player_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
         canonical: list[str] = []
