@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 import hashlib
 import json
 import random
+import re
 
 from ..errors import (
     DEAL_INVALIDATED,
@@ -79,6 +80,13 @@ class DealGeneratorConfig:
     max_second_rounders_as_sweetener: int = 2
     allow_swaps_as_sweetener: bool = True
     allow_first_sensitive_as_last_resort: bool = False
+
+    # Sweetener activation window (performance + realism)
+    # We only try sweeteners when seller is "close" to accept.
+    # DecisionPolicy's counter corridor defaults to ~0.06*scale; we use 2x that as a starting point.
+    sweetener_close_corridor_ratio: float = 0.12
+    sweetener_close_floor: float = 0.6
+    sweetener_close_cap: float = 8.0
 
     # --- Heuristics / realism
     need_tags_max: int = 4
@@ -267,6 +275,158 @@ def _choose_top_need_tags(tick_ctx: TradeGenerationTickContext, team_id: str, cf
     return out
 
 
+def _team_need_map(tick_ctx: TradeGenerationTickContext, team_id: str) -> Dict[str, float]:
+    """Safely extract need_map for a team (string->float)."""
+    try:
+        dc = tick_ctx.get_decision_context(team_id)
+        nm = getattr(dc, "need_map", None) or {}
+        if not isinstance(nm, Mapping):
+            return {}
+        out: Dict[str, float] = {}
+        for k, v in nm.items():
+            if k is None:
+                continue
+            kk = str(k)
+            if not kk:
+                continue
+            try:
+                out[kk] = float(v or 0.0)
+            except Exception:
+                out[kk] = 0.0
+        return out
+    except Exception:
+        return {}
+
+
+def _need_fit_score(supply: Any, need_map: Mapping[str, float]) -> float:
+    """Dot(supply, need_map). supply is expected to be Mapping[tag->strength]."""
+    if not need_map:
+        return 0.0
+    if not isinstance(supply, Mapping) or not supply:
+        return 0.0
+    s = 0.0
+    for tag, sv in supply.items():
+        try:
+            s += float(sv or 0.0) * float(need_map.get(str(tag), 0.0) or 0.0)
+        except Exception:
+            continue
+    return float(s)
+
+
+def _extract_fit_fail_tags(dec: Any) -> Set[str]:
+    """Extract focused tags/needs that caused FIT_FAILS (if present).
+
+    Reason objects differ by implementation, so we try multiple fields:
+      - r.meta / r.details / r.data (mapping)
+      - keys: 'tags', 'need_tags', 'missing_tags', 'failed_tags', 'positions'
+    Returns an uppercased tag set for robust matching.
+    """
+    out: Set[str] = set()
+    if dec is None:
+        return out
+    reasons = getattr(dec, "reasons", None) or tuple()
+    for r in reasons:
+        try:
+            code = str(getattr(r, "code", "") or "")
+        except Exception:
+            code = ""
+        if code != "FIT_FAILS":
+            continue
+        meta = None
+        for attr in ("meta", "details", "data"):
+            v = getattr(r, attr, None)
+            if isinstance(v, Mapping):
+                meta = v
+                break
+        if not isinstance(meta, Mapping):
+            continue
+        for k in ("need_tags", "tags", "missing_tags", "failed_tags", "positions"):
+            v = meta.get(k)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple, set)):
+                for t in v:
+                    tt = str(t or "").strip()
+                    if tt:
+                        out.add(tt.upper())
+            else:
+                # allow comma/space separated string
+                s = str(v or "")
+                for part in re.split(r"[,\s]+", s):
+                    part = part.strip()
+                    if part:
+                        out.add(part.upper())
+    return out
+
+
+def _infer_focus_tags_from_eval(team_eval: Any, need_map: Mapping[str, float], *, top_needs: int = 5, out_k: int = 2) -> Set[str]:
+    """Infer which need tags are most *unmet* among failing incoming fit assessments.
+
+    Uses valuation output (TeamDealEvaluation.side.incoming[*].fit.matched_needs) rather than DecisionReason.meta,
+    because decision_policy's FIT_FAILS meta is summarized around samples, not explicit tags.
+
+    Returns uppercased tags.
+    """
+    if team_eval is None or not need_map:
+        return set()
+
+    # Normalize need_map keys
+    nm: Dict[str, float] = {}
+    for k, v in (need_map or {}).items():
+        kk = str(k or "").strip().upper()
+        if not kk:
+            continue
+        try:
+            nm[kk] = float(v or 0.0)
+        except Exception:
+            nm[kk] = 0.0
+
+    if not nm:
+        return set()
+
+    top = sorted(nm.items(), key=lambda kv: kv[1], reverse=True)[: int(top_needs)]
+    top_tags = [k for k, w in top if float(w) > 0.0]
+    if not top_tags:
+        return set()
+
+    side = getattr(team_eval, "side", None)
+    incoming = getattr(side, "incoming", None) or tuple()
+
+    unmet: Dict[str, float] = {}
+    for tv in incoming:
+        fit = getattr(tv, "fit", None)
+        if fit is None:
+            continue
+        if bool(getattr(fit, "passed", True)):
+            continue
+        matched = getattr(fit, "matched_needs", None) or {}
+        if not isinstance(matched, Mapping):
+            matched = {}
+        for t in top_tags:
+            w = float(nm.get(t, 0.0) or 0.0)
+            if w <= 0.0:
+                continue
+            try:
+                mv = matched.get(t, matched.get(t.lower(), 0.0))
+                mval = float(mv or 0.0)
+            except Exception:
+                mval = 0.0
+            unmet[t] = float(unmet.get(t, 0.0) + w * (1.0 - max(0.0, min(1.0, mval))))
+
+    if not unmet:
+        return set()
+
+    ranked = sorted(unmet.items(), key=lambda kv: kv[1], reverse=True)
+    out: Set[str] = set()
+    for tag, score in ranked:
+        if score <= 1e-6:
+            continue
+        out.add(str(tag).upper())
+        if len(out) >= int(out_k):
+            break
+    return out
+
+
 def _pick_from_buckets(
     outcat: TeamOutgoingCatalog,
     buckets: Sequence[str],
@@ -275,6 +435,7 @@ def _pick_from_buckets(
     to_team: str,
     max_n: int,
     prefer_low_market: bool = True,
+    receiver_need_map: Optional[Mapping[str, float]] = None,
 ) -> List[PlayerTradeCandidate]:
     """Select player candidates from outgoing buckets.
 
@@ -298,10 +459,18 @@ def _pick_from_buckets(
         if len(selected) >= int(max_n):
             break
 
+    def _fit(c: PlayerTradeCandidate) -> float:
+        try:
+            return _need_fit_score(getattr(c, "supply", None) or {}, receiver_need_map or {})
+        except Exception:
+            return 0.0
+
     if prefer_low_market:
-        selected.sort(key=lambda c: (float(c.market.total), float(c.salary_m), c.player_id))
+        # fillers: keep market low; fit is a tie-breaker for plausibility
+        selected.sort(key=lambda c: (float(c.market.total), float(c.salary_m), -_fit(c), c.player_id))
     else:
-        selected.sort(key=lambda c: (-float(c.market.total), -float(c.salary_m), c.player_id))
+        # value pieces: prioritize receiver fit, then market
+        selected.sort(key=lambda c: (-_fit(c), -float(c.market.total), -float(c.salary_m), c.player_id))
     return selected[: int(max_n)]
 
 
@@ -312,6 +481,7 @@ def _closest_salary_players(
     exclude_players: Set[str],
     to_team: str,
     max_n: int,
+    receiver_need_map: Optional[Mapping[str, float]] = None,
 ) -> List[PlayerTradeCandidate]:
     # pool from all non-core outgoing buckets
     pool_ids: List[str] = []
@@ -338,7 +508,14 @@ def _closest_salary_players(
             continue
         pool.append(cand)
 
-    pool.sort(key=lambda c: (abs(float(c.salary_m) - float(target_salary_m)), float(c.market.total), c.player_id))
+    def _fit(c: PlayerTradeCandidate) -> float:
+        try:
+            return _need_fit_score(getattr(c, "supply", None) or {}, receiver_need_map or {})
+        except Exception:
+            return 0.0
+
+    # prioritize salary closeness, then receiver fit, then lower market (avoid overpay artifacts)
+    pool.sort(key=lambda c: (abs(float(c.salary_m) - float(target_salary_m)), -_fit(c), float(c.market.total), c.player_id))
     return pool[: int(max_n)]
 
 
@@ -420,6 +597,7 @@ def _add_one_outgoing_filler_player(
     catalog: TradeAssetCatalog,
     exclude_players: Set[str],
     max_outgoing_players: int,
+    target_add_salary_m: Optional[float] = None,
 ) -> bool:
     if len(deal.teams) != 2:
         return False
@@ -433,15 +611,27 @@ def _add_one_outgoing_filler_player(
     if len(current_out_players) >= int(max_outgoing_players):
         return False
 
-    # Choose lowest-cost filler.
+    # Choose filler. If we know "needed salary gap", prefer salary that closes it while keeping market low.
     candidates = _pick_from_buckets(
         outcat,
         buckets=("FILLER_CHEAP", "FILLER_BAD_CONTRACT", "EXPIRING", "SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT"),
         exclude_players=exclude_players,
         to_team=to_team_u,
-        max_n=6,
+        max_n=10,
         prefer_low_market=True,
     )
+    if target_add_salary_m is not None:
+        gap = max(0.0, float(target_add_salary_m))
+        # Prefer candidates that meet/exceed the gap (more likely to fix matching),
+        # then closest to the gap, then lowest market.
+        candidates.sort(
+            key=lambda c: (
+                0 if float(c.salary_m) >= gap else 1,
+                abs(float(c.salary_m) - gap),
+                float(c.market.total),
+                c.player_id,
+            )
+        )
     for c in candidates:
         # aggregation solo-only cannot be aggregated with others.
         if bool(c.aggregation_solo_only) and len(current_out_players) >= 1:
@@ -717,23 +907,78 @@ class DealGenerator:
                         except Exception:
                             validations += 0
 
-                    deal2 = self._try_sweeteners(
-                        base_deal=deal,
-                        buyer_id=buyer_id,
-                        seller_id=seller_id,
-                        target_player_id=target_pid,
-                        buyer_decision=buyer_decision,
-                        buyer_eval=buyer_eval,
-                        seller_decision=seller_decision,
-                        seller_eval=seller_eval,
-                        tick_ctx=tick_ctx,
-                        catalog=catalog,
-                        budgets=budgets,
-                        rng=rng,
-                        allow_locked_by_deal_id=allow_locked_by_deal_id,
-                        seen_deals=seen_deals,
-                        validations_counter=_inc_validations,
+                    # DecisionReason 기반 분기:
+                    # - FIT_FAILS: picks로 때우기보다 "받는 선수"를 교체(플레이어 스왑)해 현실감 ↑
+                    # - INSUFFICIENT_SURPLUS: 픽/스윗너로 미세조정
+                    def _has_reason(dec: DealDecision, code: str) -> bool:
+                        try:
+                            for r in (dec.reasons or tuple()):
+                                if str(getattr(r, "code", "") or "") == code:
+                                    return True
+                        except Exception:
+                            return False
+                        return False
+
+                    deal2: Optional[Deal] = None
+                    if _has_reason(seller_decision, "FIT_FAILS"):
+                        deal2 = self._try_swap_outgoing_player_for_fit(
+                            base_deal=deal,
+                            buyer_id=buyer_id,
+                            seller_id=seller_id,
+                            target_player_id=target_pid,
+                            seller_decision=seller_decision,
+                            seller_eval=seller_eval,
+                            tick_ctx=tick_ctx,
+                            catalog=catalog,
+                            budgets=budgets,
+                            rng=rng,
+                            allow_locked_by_deal_id=allow_locked_by_deal_id,
+                            validations_counter=_inc_validations,
+                        )
+
+                    # If no fit swap (or not applicable), fall back to sweeteners ONLY when the seller is "close".
+                    # This avoids unrealistic "pick spam" and saves validations.
+                    seller_margin = float(seller_eval.net_surplus) - float(seller_decision.required_surplus)
+                    seller_scale = max(float(seller_eval.outgoing_total), 6.0)
+                    sweetener_close = min(
+                        float(self.cfg.sweetener_close_cap),
+                        max(float(self.cfg.sweetener_close_floor), float(self.cfg.sweetener_close_corridor_ratio) * seller_scale),
                     )
+                    has_fit_fails = _has_reason(seller_decision, "FIT_FAILS")
+                    has_insufficient = _has_reason(seller_decision, "INSUFFICIENT_SURPLUS")
+                    allow_sweetener = (
+                        seller_margin < 0.0
+                        and seller_margin >= -sweetener_close
+                        and (has_insufficient or not has_fit_fails)
+                    )
+                    if deal2 is None and allow_sweetener:
+                        deal2 = self._try_sweeteners(
+                            base_deal=deal,
+                            buyer_id=buyer_id,
+                            seller_id=seller_id,
+                            target_player_id=target_pid,
+                            buyer_decision=buyer_decision,
+                            buyer_eval=buyer_eval,
+                            seller_decision=seller_decision,
+                            seller_eval=seller_eval,
+                            tick_ctx=tick_ctx,
+                            catalog=catalog,
+                            budgets=budgets,
+                            rng=rng,
+                            allow_locked_by_deal_id=allow_locked_by_deal_id,
+                            seen_deals=seen_deals,
+                            validations_counter=_inc_validations,
+                        )
+                    if deal2 is not None:
+                        # Post-tuning caps (sweeteners/swap may increase complexity)
+                        if _deal_num_assets(deal2) > int(budgets["max_assets"]) or _deal_num_players_moved(deal2) > int(budgets["max_players_moved"]):
+                            deal2 = None
+                        else:
+                            h2 = _hash_deal_for_dedupe(deal2)
+                            if h2 in seen_deals:
+                                deal2 = None
+                            else:
+                                seen_deals.add(h2)
                     if deal2 is not None:
                         deal = deal2
                         try:
@@ -1124,6 +1369,9 @@ class DealGenerator:
         target_salary_m = float(target.salary_m)
         target_market = float(target.market.total)
 
+        # Seller need-map used to build "what seller wants to receive"
+        seller_need_map = _team_need_map(tick_ctx, seller_id)
+
         tags_base: Set[str] = set()
         if tag_hint:
             tags_base.add(f"need:{tag_hint}")
@@ -1159,6 +1407,7 @@ class DealGenerator:
                 to_team=seller_id,
                 max_n=4,
                 prefer_low_market=False,
+                receiver_need_map=seller_need_map,
             )
             for c in young[:2]:
                 d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
@@ -1177,6 +1426,7 @@ class DealGenerator:
             exclude_players=set(),
             to_team=seller_id,
             max_n=3,
+            receiver_need_map=seller_need_map,
         )
         for c in p2p[:2]:
             d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
@@ -1199,6 +1449,7 @@ class DealGenerator:
                 to_team=seller_id,
                 max_n=3,
                 prefer_low_market=False,
+                receiver_need_map=seller_need_map,
             )
             filler = _pick_from_buckets(
                 buyer_out,
@@ -1207,6 +1458,7 @@ class DealGenerator:
                 to_team=seller_id,
                 max_n=4,
                 prefer_low_market=True,
+                receiver_need_map=seller_need_map,
             )
             if cons and filler:
                 d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
@@ -1392,9 +1644,16 @@ class DealGenerator:
 
         Returns a *new* deal if improved, else None.
         """
-        # Only if margin is small negative (don't overfit)
+        # Only when seller is close (performance + realism)
         seller_margin = float(seller_eval.net_surplus) - float(seller_decision.required_surplus)
-        if seller_margin < -12.0 or seller_margin > -0.5:
+        if seller_margin >= 0.0:
+            return None
+        seller_scale = max(float(seller_eval.outgoing_total), 6.0)
+        sweetener_close = min(
+            float(self.cfg.sweetener_close_cap),
+            max(float(self.cfg.sweetener_close_floor), float(self.cfg.sweetener_close_corridor_ratio) * seller_scale),
+        )
+        if seller_margin < -sweetener_close:
             return None
 
         max_seconds = int(self.cfg.max_second_rounders_as_sweetener)
@@ -1466,7 +1725,6 @@ class DealGenerator:
             h_final = _hash_deal_for_dedupe(deal)
             if h_final in seen_deals:
                 continue
-            seen_deals.add(h_final)
 
             added += 1
             # early exit if we've added something meaningful
@@ -1479,6 +1737,223 @@ class DealGenerator:
         if deal.meta is not None and isinstance(deal.meta, dict):
             deal.meta["protected_player_ids"] = list(sorted(protected))
         return deal
+
+    def _try_swap_outgoing_player_for_fit(
+        self,
+        *,
+        base_deal: Deal,
+        buyer_id: str,
+        seller_id: str,
+        target_player_id: str,
+        seller_decision: Any,
+        seller_eval: Any,
+        tick_ctx: TradeGenerationTickContext,
+        catalog: TradeAssetCatalog,
+        budgets: Mapping[str, int],
+        rng: random.Random,
+        allow_locked_by_deal_id: Optional[str],
+        validations_counter,
+    ) -> Optional[Deal]:
+        """If seller rejects due to FIT_FAILS, try swapping a buyer outgoing player to better fit seller needs.
+
+        - Keep salary roughly similar to reduce salary-matching churn.
+        - Validate and do at most one minimal repair.
+        """
+        buyer_id = _canon_team_id(buyer_id)
+        seller_id = _canon_team_id(seller_id)
+
+        seller_need_map = _team_need_map(tick_ctx, seller_id)
+        if not seller_need_map:
+            return None
+
+        # Focused tags from valuation (preferred) / FIT_FAILS meta (fallback)
+        focus_tags = _infer_focus_tags_from_eval(seller_eval, seller_need_map)
+        if not focus_tags:
+            focus_tags = _extract_fit_fail_tags(seller_decision)
+
+        # Seller horizon / rebuildness to adjust weighting
+        seller_ts = tick_ctx.get_team_situation(seller_id)
+        horizon = str(_team_time_horizon(seller_ts) or "").upper()
+        rebuild_like = _is_rebuildish(seller_ts) or horizon in {"REBUILD", "RE_TOOL", "RETOOL"}
+        win_now_like = horizon in {"WIN_NOW", "CONTEND", "COMPETE"} or str(_team_posture(seller_ts) or "").upper() in {
+            "AGGRESSIVE_BUY",
+            "SOFT_BUY",
+        }
+
+        # Only if there is at least one outgoing player from buyer to seller
+        buyer_leg = list(base_deal.legs.get(buyer_id, []) or [])
+        outgoing_players = [a for a in buyer_leg if isinstance(a, PlayerAsset)]
+        if not outgoing_players:
+            return None
+
+        protected = _protected_player_ids_from_meta(base_deal) | {str(target_player_id)}
+
+        buyer_out = catalog.outgoing_by_team.get(buyer_id)
+        if buyer_out is None:
+            return None
+
+        # Compute current fit for each outgoing player to seller; swap the worst one.
+        def _fit_pid(pid: str) -> float:
+            c = buyer_out.players.get(pid)
+            if c is None:
+                return 0.0
+            supply = getattr(c, "supply", None) or {}
+            base_fit = _need_fit_score(supply, seller_need_map)
+            if focus_tags:
+                focused = 0.0
+                for t in focus_tags:
+                    try:
+                        focused += float(supply.get(t, 0.0) or 0.0) * float(seller_need_map.get(t, 1.0) or 1.0)
+                    except Exception:
+                        continue
+                return float(focused)
+            return float(base_fit)
+
+        worst_pid: Optional[str] = None
+        worst_fit = 1e9
+        worst_salary = 0.0
+        for a in outgoing_players:
+            pid = str(a.player_id)
+            if pid in protected:
+                continue
+            f = _fit_pid(pid)
+            if f < worst_fit:
+                worst_fit = f
+                worst_pid = pid
+                c = buyer_out.players.get(pid)
+                worst_salary = float(c.salary_m) if c else 0.0
+
+        if worst_pid is None:
+            return None
+
+        # Candidate replacements: prefer receiver fit, keep salary close
+        exclude = {str(a.player_id) for a in outgoing_players} | set(protected)
+        pool = _pick_from_buckets(
+            buyer_out,
+            buckets=("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "CONSOLIDATE", "EXPIRING", "FILLER_CHEAP"),
+            exclude_players=exclude,
+            to_team=seller_id,
+            max_n=16,
+            prefer_low_market=False,
+            receiver_need_map=seller_need_map,
+        )
+
+        if not pool:
+            return None
+
+        # rank by horizon-aware primary score, then salary closeness, then market realism
+        def _age_years(c: PlayerTradeCandidate) -> Tuple[Optional[float], float]:
+            age = None
+            try:
+                snap = getattr(c, "snap", None)
+                if snap is not None and getattr(snap, "age", None) is not None:
+                    age = float(getattr(snap, "age"))
+            except Exception:
+                age = None
+            try:
+                ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
+            except Exception:
+                ry = 0.0
+            return age, ry
+
+        def _focused_fit(c: PlayerTradeCandidate) -> float:
+            supply = getattr(c, "supply", None) or {}
+            if not focus_tags:
+                return _need_fit_score(supply, seller_need_map)
+            s = 0.0
+            for t in focus_tags:
+                try:
+                    s += float(supply.get(t, 0.0) or 0.0) * float(seller_need_map.get(t, 1.0) or 1.0)
+                except Exception:
+                    continue
+            return float(s)
+
+        def _primary_score(c: PlayerTradeCandidate) -> float:
+            ff = _focused_fit(c)
+            base_fit = _need_fit_score(getattr(c, "supply", None) or {}, seller_need_map)
+            market = float(c.market.total)
+            market_norm = market / 50.0  # scale helper (rough)
+            age, ry = _age_years(c)
+            youth = 0.0
+            if age is not None:
+                youth += max(0.0, 30.0 - float(age)) / 10.0
+            youth += min(4.0, max(0.0, float(ry))) / 4.0
+
+            # If decision gave focused tags, prioritize solving those first
+            if rebuild_like:
+                # rebuild/retool: youth + years matter most, then focused fit (so it still looks coherent)
+                return float(0.55 * youth + 0.30 * ff + 0.15 * base_fit - 0.05 * market_norm)
+            if win_now_like:
+                # win-now: fit/quality matter most; don't overweight youth
+                return float(0.65 * ff + 0.25 * market_norm + 0.10 * base_fit)
+            # neutral: balanced
+            return float(0.55 * ff + 0.20 * market_norm + 0.15 * youth + 0.10 * base_fit)
+
+        ranked: List[Tuple[float, float, float, str]] = []
+        for c in pool:
+            # aggregation solo-only cannot be aggregated with others.
+            if bool(c.aggregation_solo_only) and len(outgoing_players) >= 2:
+                continue
+            ff = _focused_fit(c)
+            # If we know which tags failed, require the replacement to address them at least a bit
+            if focus_tags and float(ff) <= 0.01:
+                continue
+            primary = _primary_score(c)
+            ranked.append((float(primary), abs(float(c.salary_m) - float(worst_salary)), float(c.market.total), c.player_id))
+        ranked.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+
+        # Try a few top replacements (bounded)
+        for f, _, __, new_pid in ranked[:6]:
+            # require meaningful improvement
+            if float(f) <= float(worst_fit) + 0.03:
+                continue
+
+            new_deal = Deal(
+                teams=list(base_deal.teams),
+                legs={k: list(v) for k, v in base_deal.legs.items()},
+                meta=dict(base_deal.meta or {}),
+            )
+            leg = list(new_deal.legs.get(buyer_id, []) or [])
+            replaced = False
+            for i in range(len(leg)):
+                if isinstance(leg[i], PlayerAsset) and str(leg[i].player_id) == str(worst_pid):
+                    leg[i] = _player_asset(str(new_pid))
+                    replaced = True
+                    break
+            if not replaced:
+                continue
+            new_deal.legs[buyer_id] = leg
+
+            # validate + optional minimal repair
+            try:
+                tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+                validations_counter(1)
+                return new_deal
+            except TradeError as exc:
+                # count the failed validation too (same convention as sweeteners)
+                validations_counter(1)
+                rep = self._repair_until_valid(
+                    new_deal,
+                    exc,
+                    buyer_id=buyer_id,
+                    seller_id=seller_id,
+                    target_player_id=target_player_id,
+                    tick_ctx=tick_ctx,
+                    catalog=catalog,
+                    budgets=budgets,
+                    rng=rng,
+                )
+                if not rep:
+                    continue
+                try:
+                    tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+                    validations_counter(1)
+                    return new_deal
+                except Exception:
+                    validations_counter(1)
+                    continue
+
+        return None
 
     # ---------------------------------------------------------------------
     # Repair
@@ -1506,6 +1981,49 @@ class DealGenerator:
 
         protected = _protected_player_ids_from_meta(deal) | {str(target_player_id)}
 
+        def _salary_to_m(x: Any) -> Optional[float]:
+            try:
+                if x is None:
+                    return None
+                v = float(x)
+                if v <= 0:
+                    return 0.0
+                # if looks like dollars, convert to millions
+                if v >= 100000.0:
+                    return v / 1_000_000.0
+                return v
+            except Exception:
+                return None
+
+        def _estimate_needed_filler_salary_m(d: Mapping[str, Any]) -> Optional[float]:
+            """Estimate additional outgoing salary (in millions) needed for the failing team."""
+            inc = _salary_to_m(d.get("incoming_salary"))
+            allowed = _salary_to_m(d.get("allowed_in"))
+            out = _salary_to_m(d.get("outgoing_salary"))
+            method = str(d.get("method") or "")
+            if inc is None:
+                return None
+            if allowed is None:
+                # "outgoing_required" case or missing: make a conservative guess
+                return max(0.5, 0.40 * float(inc))
+            delta = max(0.0, float(inc) - float(allowed))
+            if delta <= 0.0:
+                return None
+            # Infer slope from allowed/outgoing ratio when possible
+            slope = 1.0
+            if out and float(out) > 0.0 and float(allowed) > 0.0:
+                ratio = float(allowed) / float(out)
+                if ratio >= 1.75:
+                    slope = 2.0
+                elif ratio >= 1.20:
+                    slope = 1.25
+                elif ratio >= 1.05:
+                    slope = max(1.0, ratio)
+            # additional outgoing needed ~= delta / slope
+            need = float(delta) / float(slope)
+            # bound to avoid extreme filler grabs
+            return max(0.25, min(25.0, need))
+
         # 1) salary matching
         if rule == "salary_matching" or (exc.code == DEAL_INVALIDATED and str(details.get("rule")) == "salary_matching"):
             team_fail = _canon_team_id(details.get("team_id") or "")
@@ -1519,6 +2037,7 @@ class DealGenerator:
                 other = seller_id if team_fail == buyer_id else buyer_id
                 # Respect "ABOVE_2ND_APRON" heuristic by limiting outgoing players.
                 max_out_players = 1 if _team_apron_status(tick_ctx.get_team_situation(team_fail)) == "ABOVE_2ND_APRON" else 4
+                gap_m = _estimate_needed_filler_salary_m(details)
                 return _add_one_outgoing_filler_player(
                     deal,
                     from_team=team_fail,
@@ -1526,6 +2045,7 @@ class DealGenerator:
                     catalog=catalog,
                     exclude_players=set(protected),
                     max_outgoing_players=max_out_players,
+                    target_add_salary_m=gap_m,
                 )
 
             # fallback: try remove one incoming player (non-target)
