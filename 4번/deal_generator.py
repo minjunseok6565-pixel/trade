@@ -122,6 +122,40 @@ def _canon_player_id(player_id: Any) -> str:
     return str(normalize_player_id(str(player_id), strict=False, allow_legacy_numeric=True))
 
 
+def _resolve_asset_catalog(
+    tick_ctx: TradeGenerationTickContext,
+    supplied: Optional[TradeAssetCatalog],
+) -> TradeAssetCatalog:
+    """Resolve the tick-scoped TradeAssetCatalog without requiring generation_tick.py changes.
+
+    Priority:
+    1) explicit `supplied`
+    2) tick_ctx.get_asset_catalog() if present
+    3) tick_ctx.asset_catalog if present and not None
+    4) lazy build + (best-effort) assign to tick_ctx.asset_catalog
+    """
+    if supplied is not None:
+        return supplied
+
+    getter = getattr(tick_ctx, "get_asset_catalog", None)
+    if callable(getter):
+        return getter()
+
+    existing = getattr(tick_ctx, "asset_catalog", None)
+    if existing is not None:
+        return existing
+
+    # Lazy build (defensive: some call sites may construct tick_ctx without pre-building the catalog)
+    from .asset_catalog import build_trade_asset_catalog
+
+    built = build_trade_asset_catalog(tick_ctx=tick_ctx)
+    try:
+        setattr(tick_ctx, "asset_catalog", built)
+    except Exception:
+        pass
+    return built
+
+
 def _deal_fingerprint(deal: Deal) -> str:
     """Stable fingerprint for de-duplication (independent of ordering noise).
 
@@ -248,7 +282,7 @@ class DealGenerator:
         rng: Optional[random.Random] = None,
     ) -> None:
         self.tick_ctx = tick_ctx
-        self.catalog = asset_catalog or tick_ctx.get_asset_catalog()
+        self.catalog = _resolve_asset_catalog(tick_ctx, asset_catalog)
         self.cfg = config or DealGeneratorConfig()
 
         if rng is not None:
