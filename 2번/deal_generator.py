@@ -1841,13 +1841,21 @@ def _count_assets(be: TeamDealEvaluation, se: TeamDealEvaluation) -> int:
 
 
 def _count_players(be: TeamDealEvaluation, se: TeamDealEvaluation) -> int:
+    def _is_player(tv) -> bool:
+        k = getattr(tv, "kind", None)
+        if k is None:
+            return False
+        # AssetKind Enum이면 .value가 "player" 형태. (str(Enum)은 "AssetKind.PLAYER"가 될 수 있음)
+        v = getattr(k, "value", k)
+        return str(v).strip().lower() == "player"
+
     def _n_players(side):
         n = 0
         for tv in getattr(side, "incoming", ()):
-            if str(getattr(tv, "kind", "")).lower() == "player":
+            if _is_player(tv):
                 n += 1
         for tv in getattr(side, "outgoing", ()):
-            if str(getattr(tv, "kind", "")).lower() == "player":
+            if _is_player(tv):
                 n += 1
         return n
     try:
