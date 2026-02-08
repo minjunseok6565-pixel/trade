@@ -81,6 +81,13 @@ class DealGeneratorConfig:
     allow_swaps_as_sweetener: bool = True
     allow_first_sensitive_as_last_resort: bool = False
 
+    # Sweetener activation window (performance + realism)
+    # We only try sweeteners when seller is "close" to accept.
+    # DecisionPolicy's counter corridor defaults to ~0.06*scale; we use 2x that as a starting point.
+    sweetener_close_corridor_ratio: float = 0.12
+    sweetener_close_floor: float = 0.6
+    sweetener_close_cap: float = 8.0
+
     # --- Heuristics / realism
     need_tags_max: int = 4
     need_tags_min_weight: float = 0.30
@@ -1544,9 +1551,16 @@ class DealGenerator:
 
         Returns a *new* deal if improved, else None.
         """
-        # Only if margin is small negative (don't overfit)
+        # Only when seller is close (performance + realism)
         seller_margin = float(seller_eval.net_surplus) - float(seller_decision.required_surplus)
-        if seller_margin < -12.0 or seller_margin > -0.5:
+        if seller_margin >= 0.0:
+            return None
+        seller_scale = max(float(seller_eval.outgoing_total), 6.0)
+        sweetener_close = min(
+            float(self.cfg.sweetener_close_cap),
+            max(float(self.cfg.sweetener_close_floor), float(self.cfg.sweetener_close_corridor_ratio) * seller_scale),
+        )
+        if seller_margin < -sweetener_close:
             return None
 
         max_seconds = int(self.cfg.max_second_rounders_as_sweetener)
@@ -1618,7 +1632,6 @@ class DealGenerator:
             h_final = _hash_deal_for_dedupe(deal)
             if h_final in seen_deals:
                 continue
-            seen_deals.add(h_final)
 
             added += 1
             # early exit if we've added something meaningful
