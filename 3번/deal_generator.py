@@ -359,74 +359,6 @@ def _extract_fit_fail_tags(dec: Any) -> Set[str]:
     return out
 
 
-def _infer_focus_tags_from_eval(team_eval: Any, need_map: Mapping[str, float], *, top_needs: int = 5, out_k: int = 2) -> Set[str]:
-    """Infer which need tags are most *unmet* among failing incoming fit assessments.
-
-    Uses valuation output (TeamDealEvaluation.side.incoming[*].fit.matched_needs) rather than DecisionReason.meta,
-    because decision_policy's FIT_FAILS meta is summarized around samples, not explicit tags.
-
-    Returns uppercased tags.
-    """
-    if team_eval is None or not need_map:
-        return set()
-
-    # Normalize need_map keys
-    nm: Dict[str, float] = {}
-    for k, v in (need_map or {}).items():
-        kk = str(k or "").strip().upper()
-        if not kk:
-            continue
-        try:
-            nm[kk] = float(v or 0.0)
-        except Exception:
-            nm[kk] = 0.0
-
-    if not nm:
-        return set()
-
-    top = sorted(nm.items(), key=lambda kv: kv[1], reverse=True)[: int(top_needs)]
-    top_tags = [k for k, w in top if float(w) > 0.0]
-    if not top_tags:
-        return set()
-
-    side = getattr(team_eval, "side", None)
-    incoming = getattr(side, "incoming", None) or tuple()
-
-    unmet: Dict[str, float] = {}
-    for tv in incoming:
-        fit = getattr(tv, "fit", None)
-        if fit is None:
-            continue
-        if bool(getattr(fit, "passed", True)):
-            continue
-        matched = getattr(fit, "matched_needs", None) or {}
-        if not isinstance(matched, Mapping):
-            matched = {}
-        for t in top_tags:
-            w = float(nm.get(t, 0.0) or 0.0)
-            if w <= 0.0:
-                continue
-            try:
-                mv = matched.get(t, matched.get(t.lower(), 0.0))
-                mval = float(mv or 0.0)
-            except Exception:
-                mval = 0.0
-            unmet[t] = float(unmet.get(t, 0.0) + w * (1.0 - max(0.0, min(1.0, mval))))
-
-    if not unmet:
-        return set()
-
-    ranked = sorted(unmet.items(), key=lambda kv: kv[1], reverse=True)
-    out: Set[str] = set()
-    for tag, score in ranked:
-        if score <= 1e-6:
-            continue
-        out.add(str(tag).upper())
-        if len(out) >= int(out_k):
-            break
-    return out
-
-
 def _pick_from_buckets(
     outcat: TeamOutgoingCatalog,
     buckets: Sequence[str],
@@ -927,7 +859,6 @@ class DealGenerator:
                             seller_id=seller_id,
                             target_player_id=target_pid,
                             seller_decision=seller_decision,
-                            seller_eval=seller_eval,
                             tick_ctx=tick_ctx,
                             catalog=catalog,
                             budgets=budgets,
@@ -936,22 +867,8 @@ class DealGenerator:
                             validations_counter=_inc_validations,
                         )
 
-                    # If no fit swap (or not applicable), fall back to sweeteners ONLY when the seller is "close".
-                    # This avoids unrealistic "pick spam" and saves validations.
-                    seller_margin = float(seller_eval.net_surplus) - float(seller_decision.required_surplus)
-                    seller_scale = max(float(seller_eval.outgoing_total), 6.0)
-                    sweetener_close = min(
-                        float(self.cfg.sweetener_close_cap),
-                        max(float(self.cfg.sweetener_close_floor), float(self.cfg.sweetener_close_corridor_ratio) * seller_scale),
-                    )
-                    has_fit_fails = _has_reason(seller_decision, "FIT_FAILS")
-                    has_insufficient = _has_reason(seller_decision, "INSUFFICIENT_SURPLUS")
-                    allow_sweetener = (
-                        seller_margin < 0.0
-                        and seller_margin >= -sweetener_close
-                        and (has_insufficient or not has_fit_fails)
-                    )
-                    if deal2 is None and allow_sweetener:
+                    # If no fit swap (or not applicable), fall back to sweeteners (surplus short)
+                    if deal2 is None and (_has_reason(seller_decision, "INSUFFICIENT_SURPLUS") or True):
                         deal2 = self._try_sweeteners(
                             base_deal=deal,
                             buyer_id=buyer_id,
@@ -969,16 +886,6 @@ class DealGenerator:
                             seen_deals=seen_deals,
                             validations_counter=_inc_validations,
                         )
-                    if deal2 is not None:
-                        # Post-tuning caps (sweeteners/swap may increase complexity)
-                        if _deal_num_assets(deal2) > int(budgets["max_assets"]) or _deal_num_players_moved(deal2) > int(budgets["max_players_moved"]):
-                            deal2 = None
-                        else:
-                            h2 = _hash_deal_for_dedupe(deal2)
-                            if h2 in seen_deals:
-                                deal2 = None
-                            else:
-                                seen_deals.add(h2)
                     if deal2 is not None:
                         deal = deal2
                         try:
@@ -1746,7 +1653,6 @@ class DealGenerator:
         seller_id: str,
         target_player_id: str,
         seller_decision: Any,
-        seller_eval: Any,
         tick_ctx: TradeGenerationTickContext,
         catalog: TradeAssetCatalog,
         budgets: Mapping[str, int],
@@ -1766,10 +1672,8 @@ class DealGenerator:
         if not seller_need_map:
             return None
 
-        # Focused tags from valuation (preferred) / FIT_FAILS meta (fallback)
-        focus_tags = _infer_focus_tags_from_eval(seller_eval, seller_need_map)
-        if not focus_tags:
-            focus_tags = _extract_fit_fail_tags(seller_decision)
+        # Focused tags from FIT_FAILS meta (if available)
+        focus_tags = _extract_fit_fail_tags(seller_decision)
 
         # Seller horizon / rebuildness to adjust weighting
         seller_ts = tick_ctx.get_team_situation(seller_id)
