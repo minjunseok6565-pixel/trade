@@ -36,6 +36,7 @@ from schema import normalize_player_id, normalize_team_id
 from ..errors import TradeError, DEAL_INVALIDATED, ROSTER_LIMIT
 from ..models import Deal, PlayerAsset, PickAsset, SwapAsset, canonicalize_deal, asset_key
 from ..valuation.types import DealDecision, TeamDealEvaluation
+from ..valuation.fit_engine import FitEngine, FitEngineConfig
 
 from .generation_tick import TradeGenerationTickContext
 from .asset_catalog import (
@@ -121,9 +122,47 @@ def _canon_player_id(player_id: Any) -> str:
     return str(normalize_player_id(str(player_id), strict=False, allow_legacy_numeric=True))
 
 
+def _resolve_asset_catalog(
+    tick_ctx: TradeGenerationTickContext,
+    supplied: Optional[TradeAssetCatalog],
+) -> TradeAssetCatalog:
+    """Resolve the tick-scoped TradeAssetCatalog without requiring generation_tick.py changes.
+
+    Priority:
+    1) explicit `supplied`
+    2) tick_ctx.get_asset_catalog() if present
+    3) tick_ctx.asset_catalog if present and not None
+    4) lazy build + (best-effort) assign to tick_ctx.asset_catalog
+    """
+    if supplied is not None:
+        return supplied
+
+    getter = getattr(tick_ctx, "get_asset_catalog", None)
+    if callable(getter):
+        return getter()
+
+    existing = getattr(tick_ctx, "asset_catalog", None)
+    if existing is not None:
+        return existing
+
+    # Lazy build (defensive: some call sites may construct tick_ctx without pre-building the catalog)
+    from .asset_catalog import build_trade_asset_catalog
+
+    built = build_trade_asset_catalog(tick_ctx=tick_ctx)
+    try:
+        setattr(tick_ctx, "asset_catalog", built)
+    except Exception:
+        pass
+    return built
+
+
 def _deal_fingerprint(deal: Deal) -> str:
-    """Stable fingerprint for de-duplication (independent of ordering noise)."""
-    d = canonicalize_deal(deal)
+    """Stable fingerprint for de-duplication (independent of ordering noise).
+
+    NOTE: `deal` is expected to be canonicalized already (e.g. via canonicalize_deal).
+    This avoids double-canonicalization in tight generation loops.
+    """
+    d = deal
     parts: List[str] = []
     parts.append("|".join(d.teams))
     for team in d.teams:
@@ -243,7 +282,7 @@ class DealGenerator:
         rng: Optional[random.Random] = None,
     ) -> None:
         self.tick_ctx = tick_ctx
-        self.catalog = asset_catalog or tick_ctx.get_asset_catalog()
+        self.catalog = _resolve_asset_catalog(tick_ctx, asset_catalog)
         self.cfg = config or DealGeneratorConfig()
 
         if rng is not None:
@@ -260,6 +299,9 @@ class DealGenerator:
         self._seen_deals: Set[str] = set()
         self._validation_count = 0
         self._evaluation_count = 0
+
+        # Fit engine (SSOT) for counterparty-oriented return-piece selection
+        self._fit_engine = FitEngine(config=FitEngineConfig())
 
         # Cache: team_id -> set(player_id) that are plausibly "on the market" this tick.
         # Built from non-CORE outgoing buckets, to avoid targeting untouchables.
@@ -354,6 +396,32 @@ class DealGenerator:
         for b in allowed_buckets:
             for pid in out.player_ids_by_bucket.get(b, ()):
                 s.add(_canon_player_id(pid))
+
+        # Optional blockbuster mode: allow a *very small* number of CORE players to be targeted,
+        # but only when the seller context suggests unusual availability (rebuild/sell/high urgency).
+        # This keeps realism while making `allow_core_targets=True` actually meaningful.
+        if self.cfg.allow_core_targets:
+            ts = self.tick_ctx.get_team_situation(tid)
+            posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "").upper()
+            horizon = str(getattr(ts, "time_horizon", "") or "").upper()
+            urgency = float(getattr(ts, "urgency", 0.0) or 0.0)
+
+            if posture in {"SELL", "SOFT_SELL"} or horizon == "REBUILD" or urgency >= 0.85:
+                core_ids = list(out.player_ids_by_bucket.get("CORE", ()) or ())
+                ranked: List[Tuple[float, str]] = []
+                for pid in core_ids:
+                    pidc = _canon_player_id(pid)
+                    cand = out.players.get(pidc)
+                    if cand is None:
+                        continue
+                    # Tradability check; to_team is irrelevant for "market availability" caching.
+                    if not self._is_tradable_player(cand, tid, to_team=None):
+                        continue
+                    ranked.append((float(cand.market.total), pidc))
+                ranked.sort(key=lambda t: (-t[0], t[1]))
+                top_n = 2 if urgency >= 0.92 else 1
+                for _, pidc in ranked[:top_n]:
+                    s.add(pidc)
 
         self._market_listed_players_cache[tid] = s
         return s
@@ -583,6 +651,31 @@ class DealGenerator:
 
         seeds: List[_BilateralDealBuilder] = []
 
+        # Seed 0: need-fit return piece + picks.
+        seller_win_now, seller_rebuild = self._counterparty_intent(ts_s)
+        return_piece = self._choose_return_player_for_counterparty(
+            from_team=buyer,
+            to_team=seller,
+            from_out=b_out,
+            counter_ts=ts_s,
+            counter_dc=dc_s,
+            required_salary_m=(target_salary_m if seller_win_now else None),
+            max_market_total=(18.0 if seller_win_now else 16.0 if seller_rebuild else 18.0),
+        )
+        if return_piece is not None:
+            b0 = _BilateralDealBuilder(buyer, seller)
+            b0.add_player(seller, target.player_id, to_team=buyer)
+            b0.add_player(buyer, return_piece.player_id, to_team=seller)
+            self._add_picks_for_value(
+                b0,
+                from_team=buyer,
+                to_team=seller,
+                desired_value=max(0.0, desired - float(return_piece.market.total)),
+                b_out=b_out,
+                soft=bool(seller_rebuild and not seller_win_now),
+            )
+            seeds.append(b0)
+
         # Seed A: picks-only (only when buyer has cap room to absorb)
         if can_picks_only:
             b = _BilateralDealBuilder(buyer, seller)
@@ -628,6 +721,8 @@ class DealGenerator:
 
         ts_b = self.tick_ctx.get_team_situation(buyer)
         dc_b = self.tick_ctx.get_decision_context(buyer)
+        ts_s = self.tick_ctx.get_team_situation(seller)
+        dc_s = self.tick_ctx.get_decision_context(seller)
 
         b_second = str(getattr(getattr(ts_b, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
 
@@ -637,6 +732,31 @@ class DealGenerator:
         desired = max(0.0, desired - 0.35 * min_surplus_buyer)
 
         seeds: List[_BilateralDealBuilder] = []
+
+        # Seed 0: need-fit return piece + picks (seller's perspective).
+        seller_win_now, seller_rebuild = self._counterparty_intent(ts_s)
+        return_piece = self._choose_return_player_for_counterparty(
+            from_team=buyer,
+            to_team=seller,
+            from_out=b_out,
+            counter_ts=ts_s,
+            counter_dc=dc_s,
+            required_salary_m=(float(sell_cand.salary_m or 0.0) if seller_win_now else None),
+            max_market_total=(18.0 if seller_win_now else 16.0 if seller_rebuild else 18.0),
+        )
+        if return_piece is not None:
+            b0 = _BilateralDealBuilder(seller, buyer)
+            b0.add_player(seller, sell_cand.player_id, to_team=buyer)
+            b0.add_player(buyer, return_piece.player_id, to_team=seller)
+            self._add_picks_for_value(
+                b0,
+                from_team=buyer,
+                to_team=seller,
+                desired_value=max(0.0, desired - float(return_piece.market.total)),
+                b_out=b_out,
+                soft=bool(seller_rebuild and not seller_win_now),
+            )
+            seeds.append(b0)
 
         # Seed A: buyer sends picks only if cap room.
         cap_space_m = float(getattr(getattr(ts_b, "constraints", None), "cap_space", 0.0) or 0.0) / 1_000_000.0
@@ -715,21 +835,70 @@ class DealGenerator:
                 self.tick_ctx.validate_deal(deal, integrity_check=False)
                 self._validation_count += 1
                 self._seen_deals.add(fp)
-                # Evaluate
+                # Evaluate (initiator-first to save work on obvious rejects)
                 if self._evaluation_count >= self.cfg.max_evaluations:
                     return None
-                a_dec, a_eval, b_dec, b_eval = self.tick_ctx.evaluate_bilateral(
-                    deal,
-                    initiator,
-                    counterparty,
-                    include_breakdown=False,
-                    include_package_effects=True,
-                    allow_counter=False,
-                    rng=self.rng,
-                    rng_seed=None,
-                    validate=False,
-                )
-                self._evaluation_count += 2
+
+                # Prefer tick_ctx wrapper if available, otherwise fall back to service API.
+                eval_one = getattr(self.tick_ctx, "evaluate_deal_for_team", None)
+                if callable(eval_one):
+                    a_dec, a_eval = eval_one(
+                        deal,
+                        initiator,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                else:
+                    from ..valuation.service import evaluate_deal_for_team as _eval_deal_for_team
+                    a_dec, a_eval = _eval_deal_for_team(
+                        deal,
+                        initiator,
+                        tick_ctx=self.tick_ctx,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                self._evaluation_count += 1
+
+                # If initiator rejects, skip counterparty evaluation entirely.
+                if not _is_accept(a_dec):
+                    return None
+
+                if self._evaluation_count >= self.cfg.max_evaluations:
+                    return None
+
+                if callable(eval_one):
+                    b_dec, b_eval = eval_one(
+                        deal,
+                        counterparty,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                else:
+                    from ..valuation.service import evaluate_deal_for_team as _eval_deal_for_team
+                    b_dec, b_eval = _eval_deal_for_team(
+                        deal,
+                        counterparty,
+                        tick_ctx=self.tick_ctx,
+                        include_breakdown=False,
+                        include_package_effects=True,
+                        allow_counter=False,
+                        rng=self.rng,
+                        rng_seed=None,
+                        validate=False,
+                    )
+                self._evaluation_count += 1
 
                 # Local sweetener loop when counterparty is close but rejecting.
                 if (not _is_accept(b_dec)) and _is_accept(a_dec):
@@ -1278,6 +1447,144 @@ class DealGenerator:
         # Keep only the most plausible few.
         return [tid for _, tid in scored[:8]]
 
+    def _counterparty_intent(self, ts: Any) -> Tuple[bool, bool]:
+        """Classify what the counterparty is likely to want *right now*.
+
+        Returns (is_win_now, is_rebuild).
+        """
+        tier = str(getattr(ts, "competitive_tier", "") or "").upper()
+        posture = str(getattr(ts, "trade_posture", "") or "").upper()
+        horizon = str(getattr(ts, "time_horizon", "") or "").upper()
+
+        is_win_now = (horizon == "WIN_NOW") or (tier in {"CONTENDER", "PLAYOFF_BUYER"}) or (posture in {"AGGRESSIVE_BUY", "SOFT_BUY"})
+        is_rebuild = (horizon == "REBUILD") or (tier in {"REBUILD", "TANK"}) or (posture in {"SELL", "SOFT_SELL"})
+        return bool(is_win_now), bool(is_rebuild)
+
+    def _choose_return_player_for_counterparty(
+        self,
+        *,
+        from_team: str,
+        to_team: str,
+        from_out: TeamOutgoingCatalog,
+        counter_ts: Any,
+        counter_dc: Any,
+        exclude_player_ids: Optional[Set[str]] = None,
+        required_salary_m: Optional[float] = None,
+        max_market_total: float = 20.0,
+    ) -> Optional[PlayerTradeCandidate]:
+        """Pick a player return piece that the counterparty is likely to value.
+
+        Uses FitEngine SSOT to score fit vs counterparty needs, with different preferences for:
+        - WIN_NOW: higher fit + higher market.now (immediate impact)
+        - REBUILD: youth / expiring / short contracts; fit is secondary
+        """
+        ft = _canon_team_id(from_team)
+        tt = _canon_team_id(to_team)
+
+        is_win_now, is_rebuild = self._counterparty_intent(counter_ts)
+        need_map = dict(getattr(counter_dc, "need_map", {}) or {})
+        exclude: Set[str] = set(_canon_player_id(p) for p in (exclude_player_ids or set()))
+
+        priorities = ["CONSOLIDATE", "SURPLUS_REDUNDANT", "SURPLUS_LOW_FIT", "EXPIRING", "FILLER_BAD_CONTRACT", "FILLER_CHEAP"]
+        if is_rebuild and not is_win_now:
+            priorities = ["EXPIRING", "SURPLUS_REDUNDANT", "SURPLUS_LOW_FIT", "CONSOLIDATE", "FILLER_BAD_CONTRACT", "FILLER_CHEAP"]
+
+        def fit_score(c: PlayerTradeCandidate) -> float:
+            if not need_map:
+                return 0.50
+            try:
+                f, _, _ = self._fit_engine.score_fit(need_map, c.supply or {})
+                return float(f)
+            except Exception:
+                # Defensive fallback: crude weighted dot-product
+                s = 0.0
+                total_w = 0.0
+                for tag, w in need_map.items():
+                    ww = float(w or 0.0)
+                    if ww <= 0.0:
+                        continue
+                    total_w += ww
+                    s += ww * float((c.supply or {}).get(tag, 0.0) or 0.0)
+                return float(s / total_w) if total_w > 1e-9 else 0.50
+
+        def youth_factor(c: PlayerTradeCandidate) -> float:
+            age = getattr(getattr(c, "snap", None), "age", None)
+            a = float(age) if age is not None else 99.0
+            if a <= 24.5:
+                return 1.00
+            if a <= 26.5:
+                return 0.72
+            if a <= 29.5:
+                return 0.45
+            return 0.25
+
+        scored: List[Tuple[float, PlayerTradeCandidate]] = []
+        seen: Set[str] = set()
+
+        for b in priorities:
+            ids = list(from_out.player_ids_by_bucket.get(b, ()))[:28]
+            for pid in ids:
+                pidc = _canon_player_id(pid)
+                if pidc in seen or pidc in exclude:
+                    continue
+                seen.add(pidc)
+                cand = from_out.players.get(pidc)
+                if cand is None:
+                    continue
+                if not self._is_tradable_player(cand, ft, to_team=tt):
+                    continue
+                if not self.cfg.allow_core_targets and ("CORE" in (cand.buckets or ())):
+                    continue
+                if float(cand.market.total) > float(max_market_total):
+                    continue
+
+                sal = float(cand.salary_m or 0.0)
+                if sal <= 0.0:
+                    continue
+
+                f = fit_score(cand)
+                now = float(cand.market.now or 0.0)
+                tot = float(cand.market.total or 0.0)
+
+                if is_win_now and not is_rebuild:
+                    util = 0.62 * f + 0.30 * _clamp(now / 12.0, 0.0, 1.0) + 0.08 * _clamp(tot / 15.0, 0.0, 1.0)
+                    if b in {"FILLER_CHEAP", "FILLER_BAD_CONTRACT"}:
+                        util -= 0.10
+                elif is_rebuild and not is_win_now:
+                    y = youth_factor(cand)
+                    exp = 1.0 if bool(getattr(cand, "is_expiring", False)) else 0.0
+                    short = 1.0 if float(getattr(cand, "remaining_years", 99.0) or 99.0) <= 2.0 + 1e-9 else 0.0
+                    util = 0.55 * y + 0.18 * exp + 0.17 * short + 0.10 * f
+                    if b == "FILLER_BAD_CONTRACT" and y < 0.70:
+                        util -= 0.12
+                else:
+                    y = youth_factor(cand)
+                    util = 0.45 * f + 0.25 * _clamp(now / 12.0, 0.0, 1.0) + 0.20 * y + 0.10 * (1.0 if cand.is_expiring else 0.0)
+
+                if b in {"SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT"}:
+                    util += 0.08
+                elif b == "EXPIRING":
+                    util += 0.05
+                elif b == "CONSOLIDATE":
+                    util += 0.03
+
+                if required_salary_m is not None:
+                    req = float(required_salary_m or 0.0)
+                    util -= 0.04 * abs(sal - req)
+
+                util -= 0.025 * tot
+                scored.append((util, cand))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda t: (-t[0], t[1].player_id))
+        top = scored[:6]
+        base = top[-1][0]
+        weights = [max(0.01, (s - base) + 0.02) for s, _ in top]
+        idx = int(self.rng.choices(list(range(len(top))), weights=weights, k=1)[0])
+        return top[idx][1]
+
     # ------------------------
     # Package components
     # ------------------------
@@ -1510,4 +1817,3 @@ class DealGenerator:
         if self._evaluation_count >= self.cfg.max_evaluations:
             return True
         return False
-
