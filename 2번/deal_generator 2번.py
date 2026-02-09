@@ -43,7 +43,6 @@ import json
 import math
 import random
 from datetime import date
-from weakref import WeakKeyDictionary
 
 try:
     from schema import normalize_team_id  # type: ignore
@@ -301,7 +300,13 @@ class DealGenerator:
     def __init__(self, config: Optional[DealGeneratorConfig] = None) -> None:
         self.config = config or DealGeneratorConfig()
         self.last_stats: Optional[DealGenerationStats] = None
-        self._asset_catalog_cache: WeakKeyDictionary[TradeGenerationTickContext, Dict[str, TradeAssetCatalog]] = WeakKeyDictionary()
+        # Cache for per-call asset catalogs built with allow_locked_by_deal_id.
+        #
+        # NOTE: TradeGenerationTickContext is a @dataclass(slots=True) and is NOT weakref-able,
+        # so we cannot safely use WeakKeyDictionary. Instead we keep a single-tick cache keyed by
+        # allow_locked_by_deal_id, and clear it whenever the tick_ctx instance changes.
+        self._asset_catalog_cache_tick_id: Optional[int] = None
+        self._asset_catalog_cache: Dict[str, TradeAssetCatalog] = {}
 
     def _get_asset_catalog_for_call(
         self,
@@ -321,25 +326,31 @@ class DealGenerator:
                     return None
             return tick_ctx.asset_catalog
 
-        key = str(allow_locked_by_deal_id)
-        per_tick = self._asset_catalog_cache.get(tick_ctx)
-        if per_tick is None:
-            per_tick = {}
-            try:
-                self._asset_catalog_cache[tick_ctx] = per_tick
-            except Exception:
-                # Fallback: if tick_ctx cannot be weak-referenced, do not cache.
-                pass
+        # Treat empty string as "no allow-locked" to avoid pointless rebuilds.
+        if not str(allow_locked_by_deal_id or "").strip():
+            if tick_ctx.asset_catalog is None:
+                try:
+                    tick_ctx.asset_catalog = build_trade_asset_catalog(tick_ctx=tick_ctx)  # type: ignore[arg-type]
+                except Exception:
+                    return None
+            return tick_ctx.asset_catalog
 
-        if per_tick is not None and key in per_tick:
-            return per_tick[key]
+        # Single-tick cache: clear whenever tick_ctx identity changes.
+        tick_id = id(tick_ctx)
+        if self._asset_catalog_cache_tick_id != tick_id:
+            self._asset_catalog_cache_tick_id = tick_id
+            self._asset_catalog_cache.clear()
+
+        key = str(allow_locked_by_deal_id)
+        cached = self._asset_catalog_cache.get(key)
+        if cached is not None:
+            return cached
 
         try:
             cat = build_trade_asset_catalog(tick_ctx=tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)  # type: ignore[arg-type]
         except Exception:
             return None
-        if per_tick is not None:
-            per_tick[key] = cat
+        self._asset_catalog_cache[key] = cat
         return cat
 
 
