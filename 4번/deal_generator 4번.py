@@ -971,12 +971,16 @@ class DealGenerator:
             if self._validation_count >= self.cfg.max_validations:
                 return None
 
-            deal = cur.build(meta={"gen_mode": mode, "target": target_pid})
-            fp = _deal_fingerprint(deal)
-            if fp in self._seen_deals:
-                return None
-
+            deal: Optional[Deal] = None
+            fp: Optional[str] = None
+            stage = "build/fingerprint"
             try:
+                deal = cur.build(meta={"gen_mode": mode, "target": target_pid})
+                fp = _deal_fingerprint(deal)
+                if fp in self._seen_deals:
+                    return None
+
+                stage = "validate/evaluate"
                 self.tick_ctx.validate_deal(deal, integrity_check=False)
                 self._validation_count += 1
                 self._seen_deals.add(fp)
@@ -1108,7 +1112,7 @@ class DealGenerator:
                 # Unknown error (bug, unexpected snapshot shape, etc.).
                 # Do not allow generation to crash the orchestration tick.
                 self._validation_count += 1
-                self._log_internal_exception(e, stage="validate/evaluate", initiator=initiator, counterparty=counterparty, fp=fp)
+                self._log_internal_exception(e, stage=stage, initiator=initiator, counterparty=counterparty, fp=fp)
                 return None
 
         # Failed to produce a valid/evaluable deal.
