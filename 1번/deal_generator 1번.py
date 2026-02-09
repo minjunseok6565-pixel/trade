@@ -2466,9 +2466,13 @@ def _repair_second_apron_salary_mismatch(
     if incoming_salary <= outgoing_salary:
         return False
 
-    incoming_m = incoming_salary / 1_000_000.0
-    outgoing_m = outgoing_salary / 1_000_000.0
-    eps_m = 0.02  # floor/반올림 여유
+    # dollars 기반 비교: validate(SSOT)와 정렬해 float/rounding으로 인한 재실패를 줄인다.
+    # 상업용 기본값: 0.001M(=1,000달러) 수준의 최소 여유
+    EPS_M = 0.001
+    eps_d = int(round(EPS_M * 1_000_000.0))
+
+    incoming_d = int(round(incoming_salary))
+    outgoing_d = int(round(outgoing_salary))
 
     all_pids = {
         a.player_id
@@ -2489,10 +2493,10 @@ def _repair_second_apron_salary_mismatch(
             return False
 
         receiver_team = other
-        required_m = incoming_m + eps_m  # outgoing >= incoming을 목표
+        required_out_d = incoming_d + eps_d  # SECOND_APRON: incoming <= outgoing(달러) 목표
 
         best_pid: Optional[str] = None
-        best_key: Optional[Tuple[float, float, float]] = None  # (overshoot, market, salary)
+        best_key: Optional[Tuple[int, float, int]] = None  # (overshoot_d, market, salary_d)
 
         scan_buckets: Tuple[BucketId, ...] = (
             "FILLER_BAD_CONTRACT",
@@ -2516,13 +2520,13 @@ def _repair_second_apron_salary_mismatch(
                 if bool(getattr(c, "aggregation_solo_only", False)):
                     continue
 
-                sal = float(c.salary_m)
-                if sal + 1e-9 < required_m:
+                sal_d = int(round(float(c.salary_m) * 1_000_000.0))
+                if sal_d < required_out_d:
                     continue
 
-                overshoot = sal - required_m
+                overshoot_d = sal_d - required_out_d
                 mkt = float(c.market.total)
-                key = (overshoot, mkt, sal)
+                key = (overshoot_d, mkt, sal_d)
                 if best_key is None or key < best_key:
                     best_key = key
                     best_pid = str(pid)
@@ -2549,10 +2553,12 @@ def _repair_second_apron_salary_mismatch(
         return False
 
     receiver_team = team
-    max_in_m = outgoing_m - eps_m  # incoming <= outgoing 목표
+    max_in_d = outgoing_d - eps_d  # incoming <= outgoing(달러) 목표
+    if max_in_d < 0:
+        return False
 
     best_pid: Optional[str] = None
-    best_key: Optional[Tuple[float, float]] = None  # (slack, market)
+    best_key: Optional[Tuple[int, float]] = None  # (slack_d, market)
 
     scan_buckets2: Tuple[BucketId, ...] = (
         "FILLER_CHEAP",
@@ -2576,13 +2582,13 @@ def _repair_second_apron_salary_mismatch(
             if bool(getattr(c, "aggregation_solo_only", False)):
                 continue
 
-            sal = float(c.salary_m)
-            if sal - 1e-9 > max_in_m:
+            sal_d = int(round(float(c.salary_m) * 1_000_000.0))
+            if sal_d > max_in_d:
                 continue
 
-            slack = max_in_m - sal  # 0에 가까울수록(outgoing에 가까울수록) 좋음
+            slack_d = max_in_d - sal_d  # 0에 가까울수록(outgoing에 가까울수록) 좋음
             mkt = float(c.market.total)
-            key = (slack, mkt)
+            key = (slack_d, mkt)
             if best_key is None or key < best_key:
                 best_key = key
                 best_pid = str(pid)
