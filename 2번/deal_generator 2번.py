@@ -200,6 +200,16 @@ class DealGenerationStats:
     # partners
     partner_counts: DefaultDict[str, int] = field(default_factory=lambda: defaultdict(int))
 
+    # sweetener loop
+    sweetener_trials: int = 0
+    sweetener_commits: int = 0
+    sweetener_rollbacks: int = 0
+    sweetener_commit_by_token: DefaultDict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+    # pick rule prechecks
+    stepien_precheck_blocked: int = 0
+    stepien_soft_drops: int = 0
+
     def record_error(self, err: TradeError) -> None:
         self.fail_by_code[str(err.code)] += 1
         details = getattr(err, "details", None)
@@ -225,11 +235,14 @@ class DealGenerationStats:
             "fail_by_rule": dict(self.fail_by_rule),
             "fail_by_method": dict(self.fail_by_method),
             "partner_counts": dict(self.partner_counts),
+            "sweetener_trials": self.sweetener_trials,
+            "sweetener_commits": self.sweetener_commits,
+            "sweetener_rollbacks": self.sweetener_rollbacks,
+            "sweetener_commit_by_token": dict(self.sweetener_commit_by_token),
+            "stepien_precheck_blocked": self.stepien_precheck_blocked,
+            "stepien_soft_drops": self.stepien_soft_drops,
         }
 
-
-# =============================================================================
-# Internal helper types
 # =============================================================================
 @dataclass(slots=True)
 class _Budgets:
@@ -1243,11 +1256,15 @@ def _picks_packages(state: _GenState, buyer_out: TeamOutgoingCatalog, *, max_pac
     """Build a few pick/swap packages for the buyer.
 
     prefer_second=True biases toward SECOND-based packages and uses FIRST picks only as fallback.
+
+    NOTE: We apply a lightweight Stepien precheck here to avoid generating obviously
+    invalid first-pick combinations and wasting validation budget.
     """
-    picks_second = [pid for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()) if pid not in state.banned_picks[buyer_out.team_id]]
-    picks_first_safe = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()) if pid not in state.banned_picks[buyer_out.team_id]]
-    picks_first_sens = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()) if pid not in state.banned_picks[buyer_out.team_id]]
-    swaps = [sid for sid in buyer_out.swap_ids if sid not in state.banned_swaps[buyer_out.team_id]]
+    team_id = buyer_out.team_id
+    picks_second = [pid for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()) if pid not in state.banned_picks[team_id]]
+    picks_first_safe = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()) if pid not in state.banned_picks[team_id]]
+    picks_first_sens = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()) if pid not in state.banned_picks[team_id]]
+    swaps = [sid for sid in buyer_out.swap_ids if sid not in state.banned_swaps[team_id]]
 
     seconds_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
     swap_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
@@ -1281,7 +1298,19 @@ def _picks_packages(state: _GenState, buyer_out: TeamOutgoingCatalog, *, max_pac
         ordered.extend(swap_pkgs[:1])
         ordered.extend(first_pkgs)
 
-    return ordered[: max(0, int(max_packages))]
+    # Stepien precheck (best-effort): only checks the outgoing picks in the package itself.
+    stepien = getattr(state.catalog, "stepien", None)
+    filtered: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
+    for picks_out, swaps_out, tag in ordered:
+        if picks_out and stepien is not None:
+            if not _stepien_ok_after(stepien, team_id, outgoing_pick_ids=set(picks_out)):
+                state.stats.stepien_precheck_blocked += 1
+                continue
+        filtered.append((picks_out, swaps_out, tag))
+        if len(filtered) >= max(0, int(max_packages)):
+            break
+
+    return filtered
 
 
 # =============================================================================
@@ -1737,37 +1766,66 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
 
 
 def _repair_pick_rules(state: _GenState, spec: _DealSpec, details: Dict[str, Any]) -> bool:
-    """Downgrade/remove picks to satisfy Stepien or pick horizon."""
+    """Downgrade/remove picks to satisfy Stepien or pick horizon.
+
+    IMPORTANT POLICY:
+    - stepien_violation is typically a *combination* issue; do NOT hard-ban a pick_id.
+      We only drop the last-added asset (soft drop) and let exploration try other combos.
+    - pick_too_far (horizon) is effectively intrinsic for that pick, so hard-banning is OK.
+    """
+    reason = str(details.get("reason") or "")
+    hard_ban = reason in ("pick_too_far",)
+
     # Simple strategy: remove the last-added pick/swap from the side indicated.
     team_id = _canon_team_id(details.get("team_id") or "")
     if not team_id:
         # If missing, assume buyer side (most common)
         team_id = spec.buyer_id
 
-    if team_id == spec.buyer_id:
-        if spec.buyer_picks_out:
-            removed = spec.buyer_picks_out.pop()
-            state.banned_picks[spec.buyer_id].add(str(removed))
-            spec.tags.append("repair:drop_pick")
-            return True
-        if spec.buyer_swaps_out:
-            removed = spec.buyer_swaps_out.pop()
-            state.banned_swaps[spec.buyer_id].add(str(removed))
-            spec.tags.append("repair:drop_swap")
-            return True
-    if team_id == spec.seller_id:
-        if spec.seller_picks_out:
-            removed = spec.seller_picks_out.pop()
-            state.banned_picks[spec.seller_id].add(str(removed))
-            spec.tags.append("repair:drop_pick_seller")
-            return True
-        if spec.seller_swaps_out:
-            removed = spec.seller_swaps_out.pop()
-            state.banned_swaps[spec.seller_id].add(str(removed))
-            spec.tags.append("repair:drop_swap_seller")
-            return True
+    def _drop_pick(team: str, *, seller_side: bool) -> bool:
+        if team == spec.buyer_id:
+            if spec.buyer_picks_out:
+                removed = str(spec.buyer_picks_out.pop())
+                if hard_ban:
+                    state.banned_picks[spec.buyer_id].add(removed)
+                else:
+                    state.stats.stepien_soft_drops += 1
+                spec.tags.append("repair:drop_pick" + ("_seller" if seller_side else ""))
+                return True
+            if spec.buyer_swaps_out:
+                removed = str(spec.buyer_swaps_out.pop())
+                if hard_ban:
+                    state.banned_swaps[spec.buyer_id].add(removed)
+                else:
+                    # swaps rarely cause stepien_violation; still keep policy consistent
+                    state.stats.stepien_soft_drops += 1
+                spec.tags.append("repair:drop_swap" + ("_seller" if seller_side else ""))
+                return True
+        if team == spec.seller_id:
+            if spec.seller_picks_out:
+                removed = str(spec.seller_picks_out.pop())
+                if hard_ban:
+                    state.banned_picks[spec.seller_id].add(removed)
+                else:
+                    state.stats.stepien_soft_drops += 1
+                spec.tags.append("repair:drop_pick_seller")
+                return True
+            if spec.seller_swaps_out:
+                removed = str(spec.seller_swaps_out.pop())
+                if hard_ban:
+                    state.banned_swaps[spec.seller_id].add(removed)
+                else:
+                    state.stats.stepien_soft_drops += 1
+                spec.tags.append("repair:drop_swap_seller")
+                return True
+        return False
 
-    return False
+    if team_id == spec.buyer_id:
+        return _drop_pick(spec.buyer_id, seller_side=False)
+    if team_id == spec.seller_id:
+        return _drop_pick(spec.seller_id, seller_side=True)
+    # Fallback
+    return _drop_pick(spec.buyer_id, seller_side=False)
 
 
 def _spec_to_deal(state: _GenState, spec: _DealSpec) -> Optional[Deal]:
@@ -1982,18 +2040,27 @@ def _extract_tags_from_deal(deal: Deal) -> List[str]:
 # Sweetener loop (minimal counter-ish)
 # =============================================================================
 def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budgets, partner_id: Optional[str] = None) -> List[DealProposal]:
+    """Try adding small sweeteners to salvage a near-miss.
+
+    Fixes:
+    - Transactional: trial spec only; commit only on success.
+    - Limit is on *committed* sweeteners (not attempts).
+    - Avoid pick_rules repair that would silently drop the sweetener and still return a valid deal.
+    """
     cfg = state.cfg
     buyer_id = proposal.buyer_id
     seller_id = proposal.seller_id
 
-    # compute seller margin
-    seller_margin = float(getattr(proposal.seller_eval, "net_surplus", 0.0) or 0.0) - float(getattr(proposal.seller_decision, "required_surplus", 0.0) or 0.0)
+    def _margin(p: DealProposal) -> float:
+        return float(getattr(p.seller_eval, "net_surplus", 0.0) or 0.0) - float(getattr(p.seller_decision, "required_surplus", 0.0) or 0.0)
+
+    seller_margin = _margin(proposal)
     if seller_margin >= 0:
         return [proposal]
     if seller_margin < -float(cfg.near_miss_margin_max):
         return [proposal]
 
-    # Only try if seller rejects (or counters). If they accept, no need.
+    # If they already accept, nothing to do.
     if getattr(proposal.seller_decision, "verdict", None) == DealVerdict.ACCEPT:
         return [proposal]
 
@@ -2002,31 +2069,41 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
         return [proposal]
 
     stepien = state.catalog.stepien
+
     new_props: List[DealProposal] = [proposal]
-    current_spec = _deal_to_spec_guess(proposal.deal, buyer_id=buyer_id, seller_id=seller_id)
+    current_best = proposal
+    current_spec = _deal_to_spec_guess(current_best.deal, buyer_id=buyer_id, seller_id=seller_id)
     if current_spec is None:
         return [proposal]
-
-    used_picks = set(current_spec.buyer_picks_out)
-    used_swaps = set(current_spec.buyer_swaps_out)
 
     max_add = max(0, int(cfg.max_sweeteners))
     if max_add <= 0:
         return [proposal]
 
+    # Track already-added 2RPs (limit at 2).
     second_ids = set(buyer_out.pick_ids_by_bucket.get("SECOND", ()))
-    seconds_added = sum(1 for pid in used_picks if pid in second_ids)
-    added_count = 0
+
+    def _count_seconds(spec: _DealSpec) -> int:
+        return sum(1 for pid in spec.buyer_picks_out if pid in second_ids)
+
+    committed = 0
+
+    verdict_rank = {DealVerdict.REJECT: 0, DealVerdict.COUNTER: 1, DealVerdict.ACCEPT: 2}
 
     for token in cfg.sweetener_order:
-        if added_count >= max_add:
+        if committed >= max_add:
             break
-
         if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
             break
 
-        # choose next asset
-        added = False
+        # Candidates: keep it cheap (try first viable only) to avoid increasing budgets.
+        cand_pick: Optional[str] = None
+        cand_swap: Optional[str] = None
+
+        used_picks = set(current_spec.buyer_picks_out)
+        used_swaps = set(current_spec.buyer_swaps_out)
+        seconds_added = _count_seconds(current_spec)
+
         if token == "SECOND":
             if seconds_added >= 2:
                 continue
@@ -2035,10 +2112,7 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                current_spec.buyer_picks_out.append(pid)
-                used_picks.add(pid)
-                current_spec.tags.append("sweetener:2RP")
-                added = True
+                cand_pick = pid
                 break
 
         elif token == "FIRST_SAFE":
@@ -2047,10 +2121,7 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                current_spec.buyer_picks_out.append(pid)
-                used_picks.add(pid)
-                current_spec.tags.append("sweetener:1RP_SAFE")
-                added = True
+                cand_pick = pid
                 break
 
         elif token == "FIRST_SENSITIVE":
@@ -2059,45 +2130,79 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                current_spec.buyer_picks_out.append(pid)
-                used_picks.add(pid)
-                current_spec.tags.append("sweetener:1RP_SENSITIVE")
-                added = True
+                cand_pick = pid
                 break
 
         elif token == "SWAP":
             for sid in buyer_out.swap_ids:
                 if sid in used_swaps or sid in state.banned_swaps[buyer_id]:
                     continue
-                current_spec.buyer_swaps_out.append(sid)
-                used_swaps.add(sid)
-                current_spec.tags.append("sweetener:swap")
-                added = True
+                cand_swap = sid
                 break
 
-        if not added:
+        if cand_pick is None and cand_swap is None:
             continue
 
-        added_count += 1
-        if token == "SECOND":
-            seconds_added += 1
+        # Trial (transactional)
+        trial_spec = current_spec.copy()
+        if cand_pick is not None:
+            trial_spec.buyer_picks_out.append(cand_pick)
+            trial_spec.tags.append({
+                "SECOND": "sweetener:2RP",
+                "FIRST_SAFE": "sweetener:1RP_SAFE",
+                "FIRST_SENSITIVE": "sweetener:1RP_SENSITIVE",
+            }.get(token, "sweetener:pick"))
+        if cand_swap is not None:
+            trial_spec.buyer_swaps_out.append(cand_swap)
+            trial_spec.tags.append("sweetener:swap")
 
-        # validate + evaluate new deal
-        deal2 = _repair_until_valid(state, current_spec, budgets=budgets)
-        if deal2 is None:
+        # Validate without repair (sweetener must remain attached).
+        state.stats.sweetener_trials += 1
+        deal2 = _spec_to_deal(state, trial_spec)
+        if deal2 is None or _deal_complexity_exceeds(cfg, deal2):
+            state.stats.sweetener_rollbacks += 1
             continue
+
+        try:
+            state.tick_ctx.validate_deal(deal2, allow_locked_by_deal_id=state.allow_locked_by_deal_id)
+            state.stats.validations += 1
+        except TradeError as err:
+            state.stats.validations += 1
+            state.stats.record_error(err)
+            # If this is an intrinsic pick horizon issue, ban the candidate pick.
+            details = err.details if isinstance(err.details, dict) else {}
+            if str(details.get("rule") or "") == "pick_rules" and str(details.get("reason") or "") == "pick_too_far":
+                if cand_pick is not None:
+                    state.banned_picks[buyer_id].add(str(cand_pick))
+                    state.stats.pruned_stepien += 1
+            state.stats.sweetener_rollbacks += 1
+            continue
+
         fp = _deal_fingerprint_2team(deal2)
         if fp in state.seen_fingerprints:
             state.stats.pruned_duplicate += 1
+            state.stats.sweetener_rollbacks += 1
             continue
         state.seen_fingerprints.add(fp)
 
         p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
         if p2 is None:
+            state.stats.sweetener_rollbacks += 1
             continue
         new_props.append(p2)
 
-        # stop if seller accepted
+        # Commit only if it improves seller outcome (verdict or margin).
+        old_v = getattr(current_best.seller_decision, "verdict", DealVerdict.REJECT)
+        new_v = getattr(p2.seller_decision, "verdict", DealVerdict.REJECT)
+        improve = verdict_rank.get(new_v, 0) > verdict_rank.get(old_v, 0) or (_margin(p2) > _margin(current_best) + 1e-6)
+        if improve:
+            current_best = p2
+            current_spec = trial_spec
+            committed += 1
+            state.stats.sweetener_commits += 1
+            state.stats.sweetener_commit_by_token[str(token)] += 1
+
+        # Stop early if both accept.
         if getattr(p2.seller_decision, "verdict", None) == DealVerdict.ACCEPT and getattr(p2.buyer_decision, "verdict", None) == DealVerdict.ACCEPT:
             break
 
