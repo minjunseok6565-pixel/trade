@@ -1584,7 +1584,6 @@ def build_offer_skeletons_buy(
             str(buyer_id).upper(): [],
             str(seller_id).upper(): [PlayerAsset(kind="player", player_id=target.player_id)],
         },
-        meta={"generated": True, "mode": "BUY", "focal": target.player_id},
     )
 
     out: List[DealCandidate] = []
@@ -1764,7 +1763,6 @@ def build_offer_skeletons_sell(
             str(buyer_id).upper(): [],
             str(seller_id).upper(): [PlayerAsset(kind="player", player_id=pid)],
         },
-        meta={"generated": True, "mode": "SELL", "focal": pid},
     )
 
     ts_seller = tick_ctx.get_team_situation(seller_id)
@@ -1989,7 +1987,6 @@ def expand_variants(
                 buyer: [],
                 seller: [PlayerAsset(kind="player", player_id=target.player_id)],
             },
-            meta={"generated": True, "mode": "BUY", "focal": target.player_id},
         )
 
     # --- archetype: picks-only variants
@@ -2947,8 +2944,16 @@ def score_deal(
 
 
 def dedupe_hash(deal: Deal) -> str:
+    """Deal identity hash for dedupe.
+
+    IMPORTANT:
+    - MUST ignore deal.meta (tags/debug fields) so the same transaction (teams+legs)
+      does not survive as duplicates with only meta differences.
+    """
     canon = canonicalize_deal(deal)
     payload = serialize_deal(canon)
+    # Ignore meta completely for dedupe (A)
+    payload.pop("meta", None)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
@@ -2957,7 +2962,8 @@ def _clone_deal(deal: Deal) -> Deal:
     return Deal(
         teams=list(deal.teams),
         legs={tid: list(assets) for tid, assets in deal.legs.items()},
-        meta=dict(deal.meta or {}),
+        # Keep deals lean: generator does not rely on Deal.meta
+        meta={},
     )
 
 
