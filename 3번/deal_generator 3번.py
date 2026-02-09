@@ -129,6 +129,46 @@ class DealProposal:
 # =============================================================================
 
 
+@dataclass(slots=True)
+class _BudgetTracker:
+    """Hard-cap budget tracker.
+
+    We count *attempted* validations/evaluations (success or failure) because
+    the cost is incurred by the call itself.
+    """
+
+    max_validations: int
+    max_evaluations: int
+    validations_used: int = 0
+    evaluations_used: int = 0
+
+    def can_consume_validations(self, n: int = 1) -> bool:
+        try:
+            nn = int(n)
+        except Exception:
+            nn = 1
+        return (self.validations_used + max(0, nn)) <= int(self.max_validations)
+
+    def can_consume_evaluations(self, n: int = 1) -> bool:
+        try:
+            nn = int(n)
+        except Exception:
+            nn = 1
+        return (self.evaluations_used + max(0, nn)) <= int(self.max_evaluations)
+
+    def try_consume_validations(self, n: int = 1) -> bool:
+        if not self.can_consume_validations(n):
+            return False
+        self.validations_used += max(0, int(n))
+        return True
+
+    def try_consume_evaluations(self, n: int = 1) -> bool:
+        if not self.can_consume_evaluations(n):
+            return False
+        self.evaluations_used += max(0, int(n))
+        return True
+
+
 def _canon_team_id(team_id: Any) -> str:
     raw = str(team_id or "").strip()
     if not raw:
@@ -699,6 +739,11 @@ class DealGenerator:
         budgets = self._compute_budgets(posture, urgency, deadline_pressure, max_results=max_results)
         max_results_eff = int(budgets["max_results"])
 
+        budget = _BudgetTracker(
+            max_validations=int(budgets["max_validations"]),
+            max_evaluations=int(budgets["max_evaluations"]),
+        )
+
         # Exploration state
         proposals: List[DealProposal] = []
         # Dedupe sets:
@@ -708,8 +753,7 @@ class DealGenerator:
         seen_deals: Set[str] = set()
         opponent_seen: Dict[str, int] = {}
         target_seen: Dict[str, int] = {}
-        validations = 0
-        evaluations = 0
+        hard_stop = False
         failures_by_rule: Dict[str, int] = {}
 
         # Select target pairs
@@ -724,7 +768,9 @@ class DealGenerator:
         )
 
         for pair in target_pairs:
-            if validations >= budgets["max_validations"] or evaluations >= budgets["max_evaluations"]:
+            if hard_stop:
+                break
+            if budget.validations_used >= budget.max_validations or budget.evaluations_used >= budget.max_evaluations:
                 break
             if len(proposals) >= max_results_eff:
                 break
@@ -748,7 +794,9 @@ class DealGenerator:
             for skel_deal, skel_tags in skeletons:
                 if attempts >= budgets["max_attempts_per_target"]:
                     break
-                if validations >= budgets["max_validations"] or evaluations >= budgets["max_evaluations"]:
+                if hard_stop:
+                    break
+                if budget.validations_used >= budget.max_validations or budget.evaluations_used >= budget.max_evaluations:
                     break
 
                 attempts += 1
@@ -764,13 +812,15 @@ class DealGenerator:
                 deal_valid = False
                 repairs_left = int(budgets["max_repairs"])
                 while True:
+                    if not budget.try_consume_validations(1):
+                        hard_stop = True
+                        deal_valid = False
+                        break
                     try:
                         tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
-                        validations += 1
                         deal_valid = True
                         break
                     except TradeError as exc:
-                        validations += 1
                         rule_id = _extract_rule_id(exc)
                         failures_by_rule[rule_id] = failures_by_rule.get(rule_id, 0) + 1
 
@@ -810,6 +860,9 @@ class DealGenerator:
                     continue
 
                 # Evaluate both teams (no validate; already valid)
+                if not budget.try_consume_evaluations(2):
+                    hard_stop = True
+                    break
                 try:
                     buyer_decision, buyer_eval = evaluate_deal_for_team(
                         deal,
@@ -825,87 +878,87 @@ class DealGenerator:
                         include_breakdown=False,
                         validate=False,
                     )
-                    evaluations += 2
                 except Exception:
                     # valuation should be robust, but never crash generation
                     continue
 
                 # Optional sweetener loop when "just a bit" short (seller reject most common)
+                # NOTE: This stage can incur extra validate/eval calls. We must respect hard budgets here too.
                 if (seller_decision.verdict.value if hasattr(seller_decision.verdict, "value") else str(seller_decision.verdict)) == "REJECT":
-                    def _inc_validations(n: int) -> None:
-                        nonlocal validations
-                        try:
-                            validations += int(n)
-                        except Exception:
-                            validations += 0
-
-                    # DecisionReason 기반 분기:
-                    # - FIT_FAILS: picks로 때우기보다 "받는 선수"를 교체(플레이어 스왑)해 현실감 ↑
-                    # - INSUFFICIENT_SURPLUS: 픽/스윗너로 미세조정
-                    def _has_reason(dec: DealDecision, code: str) -> bool:
-                        try:
-                            for r in (dec.reasons or tuple()):
-                                if str(getattr(r, "code", "") or "") == code:
-                                    return True
-                        except Exception:
+                    # If we can't afford a re-evaluation, don't attempt counter-style adjustments.
+                    if budget.can_consume_evaluations(2):
+                        # DecisionReason 기반 분기:
+                        # - FIT_FAILS: picks로 때우기보다 "받는 선수"를 교체(플레이어 스왑)해 현실감 ↑
+                        # - INSUFFICIENT_SURPLUS: 픽/스윗너로 미세조정
+                        def _has_reason(dec: DealDecision, code: str) -> bool:
+                            try:
+                                for r in (dec.reasons or tuple()):
+                                    if str(getattr(r, "code", "") or "") == code:
+                                        return True
+                            except Exception:
+                                return False
                             return False
-                        return False
 
-                    deal2: Optional[Deal] = None
-                    if _has_reason(seller_decision, "FIT_FAILS"):
-                        deal2 = self._try_swap_outgoing_player_for_fit(
-                            base_deal=deal,
-                            buyer_id=buyer_id,
-                            seller_id=seller_id,
-                            target_player_id=target_pid,
-                            seller_decision=seller_decision,
-                            tick_ctx=tick_ctx,
-                            catalog=catalog,
-                            budgets=budgets,
-                            rng=rng,
-                            allow_locked_by_deal_id=allow_locked_by_deal_id,
-                            validations_counter=_inc_validations,
-                        )
+                        deal2: Optional[Deal] = None
+                        if _has_reason(seller_decision, "FIT_FAILS"):
+                            deal2 = self._try_swap_outgoing_player_for_fit(
+                                base_deal=deal,
+                                buyer_id=buyer_id,
+                                seller_id=seller_id,
+                                target_player_id=target_pid,
+                                seller_decision=seller_decision,
+                                tick_ctx=tick_ctx,
+                                catalog=catalog,
+                                budgets=budgets,
+                                rng=rng,
+                                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                                budget=budget,
+                            )
 
-                    # If no fit swap (or not applicable), fall back to sweeteners (surplus short)
-                    if deal2 is None and (_has_reason(seller_decision, "INSUFFICIENT_SURPLUS") or True):
-                        deal2 = self._try_sweeteners(
-                            base_deal=deal,
-                            buyer_id=buyer_id,
-                            seller_id=seller_id,
-                            target_player_id=target_pid,
-                            buyer_decision=buyer_decision,
-                            buyer_eval=buyer_eval,
-                            seller_decision=seller_decision,
-                            seller_eval=seller_eval,
-                            tick_ctx=tick_ctx,
-                            catalog=catalog,
-                            budgets=budgets,
-                            rng=rng,
-                            allow_locked_by_deal_id=allow_locked_by_deal_id,
-                            seen_deals=seen_deals,
-                            validations_counter=_inc_validations,
-                        )
-                    if deal2 is not None:
-                        deal = deal2
-                        try:
-                            buyer_decision, buyer_eval = evaluate_deal_for_team(
-                                deal,
-                                buyer_id,
+                        # If no fit swap (or not applicable), fall back to sweeteners (surplus short)
+                        if deal2 is None and _has_reason(seller_decision, "INSUFFICIENT_SURPLUS") and not _has_reason(
+                            seller_decision, "FIT_FAILS"
+                        ):
+                            deal2 = self._try_sweeteners(
+                                base_deal=deal,
+                                buyer_id=buyer_id,
+                                seller_id=seller_id,
+                                target_player_id=target_pid,
+                                buyer_decision=buyer_decision,
+                                buyer_eval=buyer_eval,
+                                seller_decision=seller_decision,
+                                seller_eval=seller_eval,
                                 tick_ctx=tick_ctx,
-                                include_breakdown=False,
-                                validate=False,
+                                catalog=catalog,
+                                budgets=budgets,
+                                rng=rng,
+                                allow_locked_by_deal_id=allow_locked_by_deal_id,
+                                seen_deals=seen_deals,
+                                budget=budget,
                             )
-                            seller_decision, seller_eval = evaluate_deal_for_team(
-                                deal,
-                                seller_id,
-                                tick_ctx=tick_ctx,
-                                include_breakdown=False,
-                                validate=False,
-                            )
-                            evaluations += 2
-                        except Exception:
-                            pass
+                        # Re-evaluate only if we can afford it.
+                        if deal2 is not None:
+                            if not budget.try_consume_evaluations(2):
+                                hard_stop = True
+                            else:
+                                deal = deal2
+                                try:
+                                    buyer_decision, buyer_eval = evaluate_deal_for_team(
+                                        deal,
+                                        buyer_id,
+                                        tick_ctx=tick_ctx,
+                                        include_breakdown=False,
+                                        validate=False,
+                                    )
+                                    seller_decision, seller_eval = evaluate_deal_for_team(
+                                        deal,
+                                        seller_id,
+                                        tick_ctx=tick_ctx,
+                                        include_breakdown=False,
+                                        validate=False,
+                                    )
+                                except Exception:
+                                    pass
 
                 # Score
                 score = self._score_deal(
@@ -1545,7 +1598,7 @@ class DealGenerator:
         rng: random.Random,
         allow_locked_by_deal_id: Optional[str],
         seen_deals: Set[str],
-        validations_counter,
+        budget: _BudgetTracker,
     ) -> Optional[Deal]:
         """If seller is slightly short, add 1-2 sweeteners and re-validate.
 
@@ -1603,10 +1656,11 @@ class DealGenerator:
                 continue
             local_seen.add(h_pre)
 
-            # validate with minimal repair if needed
+            # validate with minimal repair if needed (counts attempted validations regardless of outcome)
+            if not budget.try_consume_validations(1):
+                return None
             try:
                 tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
-                validations_counter(1)
             except TradeError as exc:
                 # small repair attempt
                 rep = self._repair_until_valid(
@@ -1622,11 +1676,14 @@ class DealGenerator:
                 )
                 if not rep:
                     continue
+                if not budget.try_consume_validations(1):
+                    return None
                 try:
                     tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
-                    validations_counter(1)
                 except Exception:
                     continue
+            except Exception:
+                continue
 
             # Global dedupe after repair/validation (prevents duplicates from repair paths)
             h_final = _hash_deal_for_dedupe(deal)
@@ -1658,7 +1715,7 @@ class DealGenerator:
         budgets: Mapping[str, int],
         rng: random.Random,
         allow_locked_by_deal_id: Optional[str],
-        validations_counter,
+        budget: _BudgetTracker,
     ) -> Optional[Deal]:
         """If seller rejects due to FIT_FAILS, try swapping a buyer outgoing player to better fit seller needs.
 
@@ -1828,14 +1885,13 @@ class DealGenerator:
                 continue
             new_deal.legs[buyer_id] = leg
 
-            # validate + optional minimal repair
+            # validate + optional minimal repair (counts attempted validations regardless of outcome)
+            if not budget.try_consume_validations(1):
+                return None
             try:
                 tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
-                validations_counter(1)
                 return new_deal
             except TradeError as exc:
-                # count the failed validation too (same convention as sweeteners)
-                validations_counter(1)
                 rep = self._repair_until_valid(
                     new_deal,
                     exc,
@@ -1849,13 +1905,15 @@ class DealGenerator:
                 )
                 if not rep:
                     continue
+                if not budget.try_consume_validations(1):
+                    return None
                 try:
                     tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
-                    validations_counter(1)
                     return new_deal
                 except Exception:
-                    validations_counter(1)
                     continue
+            except Exception:
+                continue
 
         return None
 
