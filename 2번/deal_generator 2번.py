@@ -118,6 +118,8 @@ class DealGeneratorConfig:
     max_sweeteners: int = 2
     near_miss_margin_max: float = 2.0  # try sweetener if seller margin in [-near_miss_margin_max, 0)
     sweetener_order: Tuple[str, ...] = ("SECOND", "SWAP", "FIRST_SAFE", "SECOND", "FIRST_SENSITIVE")
+    # Try up to N candidates per token and commit the best (budget-capped inside loop).
+    sweetener_candidate_width: int = 3
 
     # --- target selection ---
     max_need_tags: int = 4
@@ -2096,14 +2098,34 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
         if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
             break
 
-        # Candidates: keep it cheap (try first viable only) to avoid increasing budgets.
-        cand_pick: Optional[str] = None
-        cand_swap: Optional[str] = None
+        # Compare top 2~3 candidates per token (budget-capped) and commit the best.
+        base_spec = current_spec
+        used_picks = set(base_spec.buyer_picks_out)
+        used_swaps = set(base_spec.buyer_swaps_out)
+        seconds_added = _count_seconds(base_spec)
 
-        used_picks = set(current_spec.buyer_picks_out)
-        used_swaps = set(current_spec.buyer_swaps_out)
-        seconds_added = _count_seconds(current_spec)
+        # Budget-aware candidate width (each candidate costs ~1 validation + 2 evaluations)
+        cand_limit = int(getattr(cfg, "sweetener_candidate_width", 3) or 3)
+        cand_limit = max(1, min(3, cand_limit))
+        rem_v = max(0, int(budgets.max_validations - state.stats.validations))
+        rem_e = max(0, int(budgets.max_evaluations - state.stats.evaluations))
+        cand_limit = min(cand_limit, rem_v)  # 1 validation per candidate
+        cand_limit = min(cand_limit, rem_e // 2)  # 2 evals per candidate
+        if cand_limit <= 0:
+            break
 
+        # If seller is still far (beyond ~1 point), sweeteners rarely fix it; avoid spending trials.
+        if _margin(current_best) < -1.0:
+            cand_limit = min(cand_limit, 1)
+
+        cand_tag = {
+            "SECOND": "sweetener:2RP",
+            "FIRST_SAFE": "sweetener:1RP_SAFE",
+            "FIRST_SENSITIVE": "sweetener:1RP_SENSITIVE",
+            "SWAP": "sweetener:swap",
+        }.get(token, "sweetener:asset")
+
+        candidates: List[Tuple[Optional[str], Optional[str]]] = []
         if token == "SECOND":
             if seconds_added >= 2:
                 continue
@@ -2112,8 +2134,9 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                cand_pick = pid
-                break
+                candidates.append((pid, None))
+                if len(candidates) >= cand_limit:
+                    break
 
         elif token == "FIRST_SAFE":
             for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()):
@@ -2121,8 +2144,9 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                cand_pick = pid
-                break
+                candidates.append((pid, None))
+                if len(candidates) >= cand_limit:
+                    break
 
         elif token == "FIRST_SENSITIVE":
             for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()):
@@ -2130,80 +2154,99 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
                     continue
                 if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
                     continue
-                cand_pick = pid
-                break
+                candidates.append((pid, None))
+                if len(candidates) >= cand_limit:
+                    break
 
         elif token == "SWAP":
             for sid in buyer_out.swap_ids:
                 if sid in used_swaps or sid in state.banned_swaps[buyer_id]:
                     continue
-                cand_swap = sid
+                candidates.append((None, sid))
+                if len(candidates) >= cand_limit:
+                    break
+
+        if not candidates:
+            continue
+
+        best_p: Optional[DealProposal] = None
+        best_spec: Optional[_DealSpec] = None
+        best_key: Optional[Tuple[int, float, float]] = None
+
+        for cand_pick, cand_swap in candidates:
+            if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
                 break
 
-        if cand_pick is None and cand_swap is None:
-            continue
+            trial_spec = base_spec.copy()
+            if cand_pick is not None:
+                trial_spec.buyer_picks_out.append(cand_pick)
+                trial_spec.tags.append(cand_tag if token != "SWAP" else "sweetener:pick")
+            if cand_swap is not None:
+                trial_spec.buyer_swaps_out.append(cand_swap)
+                trial_spec.tags.append("sweetener:swap")
 
-        # Trial (transactional)
-        trial_spec = current_spec.copy()
-        if cand_pick is not None:
-            trial_spec.buyer_picks_out.append(cand_pick)
-            trial_spec.tags.append({
-                "SECOND": "sweetener:2RP",
-                "FIRST_SAFE": "sweetener:1RP_SAFE",
-                "FIRST_SENSITIVE": "sweetener:1RP_SENSITIVE",
-            }.get(token, "sweetener:pick"))
-        if cand_swap is not None:
-            trial_spec.buyer_swaps_out.append(cand_swap)
-            trial_spec.tags.append("sweetener:swap")
+            # Validate without repair (sweetener must remain attached).
+            state.stats.sweetener_trials += 1
+            deal2 = _spec_to_deal(state, trial_spec)
+            if deal2 is None or _deal_complexity_exceeds(cfg, deal2):
+                state.stats.sweetener_rollbacks += 1
+                continue
 
-        # Validate without repair (sweetener must remain attached).
-        state.stats.sweetener_trials += 1
-        deal2 = _spec_to_deal(state, trial_spec)
-        if deal2 is None or _deal_complexity_exceeds(cfg, deal2):
-            state.stats.sweetener_rollbacks += 1
-            continue
+            try:
+                state.tick_ctx.validate_deal(deal2, allow_locked_by_deal_id=state.allow_locked_by_deal_id)
+                state.stats.validations += 1
+            except TradeError as err:
+                state.stats.validations += 1
+                state.stats.record_error(err)
+                details = err.details if isinstance(err.details, dict) else {}
+                # Intrinsic horizon: hard-ban the candidate pick only in that case.
+                if str(details.get("rule") or "") == "pick_rules" and str(details.get("reason") or "") == "pick_too_far":
+                    if cand_pick is not None:
+                        state.banned_picks[buyer_id].add(str(cand_pick))
+                        state.stats.pruned_stepien += 1
+                state.stats.sweetener_rollbacks += 1
+                continue
 
-        try:
-            state.tick_ctx.validate_deal(deal2, allow_locked_by_deal_id=state.allow_locked_by_deal_id)
-            state.stats.validations += 1
-        except TradeError as err:
-            state.stats.validations += 1
-            state.stats.record_error(err)
-            # If this is an intrinsic pick horizon issue, ban the candidate pick.
-            details = err.details if isinstance(err.details, dict) else {}
-            if str(details.get("rule") or "") == "pick_rules" and str(details.get("reason") or "") == "pick_too_far":
-                if cand_pick is not None:
-                    state.banned_picks[buyer_id].add(str(cand_pick))
-                    state.stats.pruned_stepien += 1
-            state.stats.sweetener_rollbacks += 1
-            continue
+            fp = _deal_fingerprint_2team(deal2)
+            if fp in state.seen_fingerprints:
+                state.stats.pruned_duplicate += 1
+                state.stats.sweetener_rollbacks += 1
+                continue
+            state.seen_fingerprints.add(fp)
 
-        fp = _deal_fingerprint_2team(deal2)
-        if fp in state.seen_fingerprints:
-            state.stats.pruned_duplicate += 1
-            state.stats.sweetener_rollbacks += 1
-            continue
-        state.seen_fingerprints.add(fp)
+            p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
+            if p2 is None:
+                state.stats.sweetener_rollbacks += 1
+                continue
+            new_props.append(p2)
 
-        p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
-        if p2 is None:
-            state.stats.sweetener_rollbacks += 1
+            new_v = getattr(p2.seller_decision, "verdict", DealVerdict.REJECT)
+            key = (verdict_rank.get(new_v, 0), _margin(p2), float(getattr(p2, "score", 0.0) or 0.0))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_p = p2
+                best_spec = trial_spec
+
+            # If we hit full accept, no need to compare further candidates for this token.
+            if getattr(p2.seller_decision, "verdict", None) == DealVerdict.ACCEPT and getattr(p2.buyer_decision, "verdict", None) == DealVerdict.ACCEPT:
+                break
+
+        if best_p is None or best_spec is None:
             continue
-        new_props.append(p2)
 
         # Commit only if it improves seller outcome (verdict or margin).
         old_v = getattr(current_best.seller_decision, "verdict", DealVerdict.REJECT)
-        new_v = getattr(p2.seller_decision, "verdict", DealVerdict.REJECT)
-        improve = verdict_rank.get(new_v, 0) > verdict_rank.get(old_v, 0) or (_margin(p2) > _margin(current_best) + 1e-6)
+        new_v = getattr(best_p.seller_decision, "verdict", DealVerdict.REJECT)
+        improve = verdict_rank.get(new_v, 0) > verdict_rank.get(old_v, 0) or (_margin(best_p) > _margin(current_best) + 1e-6)
         if improve:
-            current_best = p2
-            current_spec = trial_spec
+            current_best = best_p
+            current_spec = best_spec
             committed += 1
             state.stats.sweetener_commits += 1
             state.stats.sweetener_commit_by_token[str(token)] += 1
 
         # Stop early if both accept.
-        if getattr(p2.seller_decision, "verdict", None) == DealVerdict.ACCEPT and getattr(p2.buyer_decision, "verdict", None) == DealVerdict.ACCEPT:
+        if getattr(current_best.seller_decision, "verdict", None) == DealVerdict.ACCEPT and getattr(current_best.buyer_decision, "verdict", None) == DealVerdict.ACCEPT:
             break
 
     new_props.sort(key=lambda x: x.score, reverse=True)
