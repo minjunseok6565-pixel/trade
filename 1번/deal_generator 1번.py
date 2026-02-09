@@ -2962,8 +2962,6 @@ def _clone_deal(deal: Deal) -> Deal:
     return Deal(
         teams=list(deal.teams),
         legs={tid: list(assets) for tid, assets in deal.legs.items()},
-        # Keep deals lean: generator does not rely on Deal.meta
-        meta={},
     )
 
 
