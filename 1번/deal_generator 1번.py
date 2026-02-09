@@ -1455,9 +1455,6 @@ def build_offer_skeletons_buy(
         banned_players=banned_players,
         must_be_aggregation_friendly=True,
     )
-    if young_id and not buyer_one_for_one_soft:
-        # soft guard: ABOVE_2ND_APRON에서도 1명 outgoing은 OK, 이 archetype은 1명
-        pass
     if young_id:
         deal2 = _clone_deal(base)
         deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
@@ -2914,7 +2911,13 @@ def _pick_lowest_market_player(
     return best_pid
 
 
-def _pick_youngish_player(out: TeamOutgoingCatalog, *, banned_players: Set[str]) -> Optional[str]:
+def _pick_youngish_player(
+    out: TeamOutgoingCatalog,
+    *,
+    banned_players: Set[str],
+    receiver_team_id: Optional[str] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> Optional[str]:
     """버킷에 YOUNG가 없으므로 age 기반 휴리스틱."""
 
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
