@@ -1348,19 +1348,50 @@ def select_targets_buy(
         tags = tags[:2]
     tags = tags[: int(config.need_tags_max)]
 
+    buyer_u = str(buyer_id).upper()
+    seller_out_cache: Dict[str, Optional[TeamOutgoingCatalog]] = {}
+    seller_cooldown_cache: Dict[str, bool] = {}
+
     out: List[TargetCandidate] = []
     for tag in tags:
         refs: Sequence[IncomingPlayerRef] = catalog.incoming_by_need_tag.get(tag, tuple())
         if not refs and bool(config.incoming_use_cheap_pool):
             refs = catalog.incoming_cheap_by_need_tag.get(tag, tuple())
-        refs = refs[: int(config.incoming_pool_per_tag)]
         w_need = float(need_map.get(tag, 0.0) or 0.0)
 
-        for r in refs:
-            if str(r.from_team).upper() == str(buyer_id).upper():
+        # CORE가 섞여 있을 수 있으므로, 후보를 먼저 자르지 말고 일정 범위 내에서 "채울 때까지" 스캔한다.
+        need_n = int(config.incoming_pool_per_tag)
+        scan_limit = min(len(refs), need_n * 3)  # 3배 스캔 상한(고정)
+
+        added_for_tag = 0
+        for r in refs[:scan_limit]:
+            from_team = str(r.from_team).upper()
+            if from_team == buyer_u:
                 continue
             if r.player_id in banned_players:
                 continue
+
+            # seller outgoing catalog 확보(캐시)
+            seller_out = seller_out_cache.get(from_team)
+            if seller_out is None and from_team not in seller_out_cache:
+                seller_out = catalog.outgoing_by_team.get(from_team)
+                seller_out_cache[from_team] = seller_out
+            if seller_out is None:
+                continue
+
+            # seller cooldown 미리 컷(캐시)
+            cd = seller_cooldown_cache.get(from_team)
+            if cd is None:
+                ts_seller = tick_ctx.get_team_situation(from_team)
+                cd = bool(getattr(ts_seller, "constraints", None) and ts_seller.constraints.cooldown_active)
+                seller_cooldown_cache[from_team] = cd
+            if cd:
+                continue
+
+            # CORE/비매물 컷(타깃 단계에서)
+            if not _is_seller_willing_to_move_player(r.player_id, seller_out):
+                continue
+
             # 가벼운 rank score는 정렬에만 사용
             rank = float(r.tag_strength) * (0.55 + 0.45 * w_need) + 0.02 * float(r.market_total)
             rank -= 0.015 * float(r.salary_m)
@@ -1368,7 +1399,7 @@ def select_targets_buy(
             out.append(
                 TargetCandidate(
                     player_id=r.player_id,
-                    from_team=str(r.from_team).upper(),
+                    from_team=from_team,
                     need_tag=str(tag),
                     tag_strength=float(rank),
                     market_total=float(r.market_total),
@@ -1377,6 +1408,10 @@ def select_targets_buy(
                     age=r.age,
                 )
             )
+
+            added_for_tag += 1
+            if added_for_tag >= need_n:
+                break
 
     out.sort(key=lambda t: (-t.tag_strength, -t.market_total, t.salary_m, t.player_id))
     return out[: int(budget.max_targets)]
@@ -2328,7 +2363,11 @@ def _repair_salary_matching(
     """
 
     status = str(failure.status or "")
+    method = str(failure.method or "")
     if status == "SECOND_APRON":
+        # second_apron_one_for_one은 RuleFailureKind.SECOND_APRON_ONE_FOR_ONE로 별도 수리된다.
+        if method == "outgoing_second_apron":
+            return _repair_second_apron_salary_mismatch(cand, failing_team, catalog, config, failure)
         return False
 
     out_catalog = catalog.outgoing_by_team.get(failing_team)
@@ -2380,6 +2419,193 @@ def _repair_salary_matching(
 
     cand.deal.legs[failing_team].append(PlayerAsset(kind="player", player_id=filler))
     cand.tags.append("repair:add_filler_salary")
+    return True
+
+
+def _repair_second_apron_salary_mismatch(
+    cand: DealCandidate,
+    failing_team: str,
+    catalog: TradeAssetCatalog,
+    config: DealGeneratorConfig,
+    failure: RuleFailure,
+) -> bool:
+    """SECOND_APRON + method=outgoing_second_apron salary mismatch 수리.
+
+    원칙:
+    - one-for-one 형태는 유지(양쪽 leg에서 PlayerAsset 1명씩인 케이스만)
+    - focal_player_id(타깃)는 가능하면 바꾸지 않는다.
+      * failing_team outgoing이 focal이 아니면: failing_team outgoing을 더 비싼 선수로 교체(outgoing↑)
+      * failing_team outgoing이 focal이면: 상대팀 outgoing(=failing_team incoming)을 더 싼 선수로 교체(incoming↓)
+    """
+
+    team = str(failing_team).upper()
+    others = [t for t in cand.deal.teams if str(t).upper() != team]
+    if not others:
+        return False
+    other = str(others[0]).upper()
+
+    # --- one-for-one 형태만 다룬다(안전/비용 제한)
+    out_players = [a for a in cand.deal.legs.get(team, []) if isinstance(a, PlayerAsset)]
+    if len(out_players) != 1:
+        return False
+
+    incoming_players: List[PlayerAsset] = []
+    for a in cand.deal.legs.get(other, []) or []:
+        if not isinstance(a, PlayerAsset):
+            continue
+        recv = str(resolve_asset_receiver(cand.deal, other, a)).upper()
+        if recv == team:
+            incoming_players.append(a)
+    if len(incoming_players) != 1:
+        return False
+
+    incoming_salary = float(failure.details.get("incoming_salary") or 0.0)
+    outgoing_salary = float(failure.details.get("outgoing_salary") or 0.0)
+    if incoming_salary <= 0.0 or outgoing_salary <= 0.0:
+        return False
+    if incoming_salary <= outgoing_salary:
+        return False
+
+    incoming_m = incoming_salary / 1_000_000.0
+    outgoing_m = outgoing_salary / 1_000_000.0
+    eps_m = 0.02  # floor/반올림 여유
+
+    all_pids = {
+        a.player_id
+        for leg in cand.deal.legs.values()
+        for a in (leg or [])
+        if isinstance(a, PlayerAsset)
+    }
+
+    out_pid = str(out_players[0].player_id)
+    focal_pid = str(cand.focal_player_id or "")
+
+    # =========================================================
+    # Case A: failing_team outgoing이 focal이 아니면 -> outgoing을 올리는 교체
+    # =========================================================
+    if out_pid != focal_pid:
+        out_cat = catalog.outgoing_by_team.get(team)
+        if out_cat is None:
+            return False
+
+        receiver_team = other
+        required_m = incoming_m + eps_m  # outgoing >= incoming을 목표
+
+        best_pid: Optional[str] = None
+        best_key: Optional[Tuple[float, float, float]] = None  # (overshoot, market, salary)
+
+        scan_buckets: Tuple[BucketId, ...] = (
+            "FILLER_BAD_CONTRACT",
+            "EXPIRING",
+            "FILLER_CHEAP",
+            "CONSOLIDATE",
+            "SURPLUS_REDUNDANT",
+            "SURPLUS_LOW_FIT",
+            "VETERAN_SALE",
+        )
+
+        for b in scan_buckets:
+            for pid in out_cat.player_ids_by_bucket.get(b, tuple()):
+                if pid in all_pids:
+                    continue
+                c = out_cat.players.get(pid)
+                if c is None:
+                    continue
+                if receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
+                    continue
+                if bool(getattr(c, "aggregation_solo_only", False)):
+                    continue
+
+                sal = float(c.salary_m)
+                if sal + 1e-9 < required_m:
+                    continue
+
+                overshoot = sal - required_m
+                mkt = float(c.market.total)
+                key = (overshoot, mkt, sal)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_pid = str(pid)
+
+        if not best_pid:
+            return False
+
+        # failing_team leg에서 out_pid를 best_pid로 치환
+        new_leg = []
+        for a in cand.deal.legs.get(team, []) or []:
+            if isinstance(a, PlayerAsset) and str(a.player_id) == out_pid:
+                new_leg.append(PlayerAsset(kind="player", player_id=best_pid))
+            else:
+                new_leg.append(a)
+        cand.deal.legs[team] = new_leg
+        cand.tags.append("repair:second_apron_swap_out_up")
+        return True
+
+    # =========================================================
+    # Case B: failing_team outgoing이 focal이면 -> incoming을 내리는 교체(상대팀 leg 교체)
+    # =========================================================
+    other_cat = catalog.outgoing_by_team.get(other)
+    if other_cat is None:
+        return False
+
+    receiver_team = team
+    max_in_m = outgoing_m - eps_m  # incoming <= outgoing 목표
+
+    best_pid: Optional[str] = None
+    best_key: Optional[Tuple[float, float]] = None  # (slack, market)
+
+    scan_buckets2: Tuple[BucketId, ...] = (
+        "FILLER_CHEAP",
+        "EXPIRING",
+        "FILLER_BAD_CONTRACT",
+        "SURPLUS_REDUNDANT",
+        "SURPLUS_LOW_FIT",
+        "CONSOLIDATE",
+        "VETERAN_SALE",
+    )
+
+    for b in scan_buckets2:
+        for pid in other_cat.player_ids_by_bucket.get(b, tuple()):
+            if pid in all_pids:
+                continue
+            c = other_cat.players.get(pid)
+            if c is None:
+                continue
+            if receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
+                continue
+            if bool(getattr(c, "aggregation_solo_only", False)):
+                continue
+
+            sal = float(c.salary_m)
+            if sal - 1e-9 > max_in_m:
+                continue
+
+            slack = max_in_m - sal  # 0에 가까울수록(outgoing에 가까울수록) 좋음
+            mkt = float(c.market.total)
+            key = (slack, mkt)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_pid = str(pid)
+
+    if not best_pid:
+        return False
+
+    old_in_pid = str(incoming_players[0].player_id)
+
+    # other leg에서 old_in_pid(=failing_team으로 가는 incoming player)를 best_pid로 치환
+    new_leg = []
+    for a in cand.deal.legs.get(other, []) or []:
+        if isinstance(a, PlayerAsset) and str(a.player_id) == old_in_pid:
+            recv = str(resolve_asset_receiver(cand.deal, other, a)).upper()
+            if recv == team:
+                new_leg.append(PlayerAsset(kind="player", player_id=best_pid))
+            else:
+                new_leg.append(a)
+        else:
+            new_leg.append(a)
+
+    cand.deal.legs[other] = new_leg
+    cand.tags.append("repair:second_apron_swap_in_down")
     return True
 
 
