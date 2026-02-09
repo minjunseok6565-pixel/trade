@@ -111,6 +111,16 @@ class DealGeneratorConfig:
     # If True, generator will attempt to build asset catalog when missing.
     build_catalog_if_missing: bool = True
 
+    # Dedupe
+    dedupe_ignore_meta: bool = True
+
+    # Young-asset heuristic for 'young + pick' archetype
+    young_max_age: float = 25.0
+    young_min_remaining_years: float = 2.0
+    young_allow_unknown_age: bool = True
+    young_unknown_age_min_remaining_years: float = 2.5
+    young_avoid_expiring: bool = True
+
 
 @dataclass(frozen=True, slots=True)
 class DealProposal:
@@ -271,18 +281,30 @@ def _protected_player_ids_from_meta(deal: Deal) -> Set[str]:
     return set()
 
 
-def _hash_deal_for_dedupe(deal: Deal) -> str:
+def _hash_deal_for_dedupe(deal: Deal, *, ignore_meta: bool = True) -> str:
     """Stable content hash for dedupe.
 
     Important:
     - Must be deterministic across processes (so do NOT use Python's built-in hash()).
     - Keep representation compact (sha1) to reduce memory.
+
+    Note: deal.meta is intentionally ignored by default because meta may contain
+    debug/telemetry fields that should not affect structural dedupe.
     """
     try:
         canon = canonicalize_deal(deal)
     except Exception:
         canon = deal
-    payload = serialize_deal(canon)
+
+    if ignore_meta:
+        try:
+            canon_for_hash = Deal(teams=list(canon.teams), legs={k: list(v) for k, v in (canon.legs or {}).items()}, meta={})
+        except Exception:
+            canon_for_hash = canon
+    else:
+        canon_for_hash = canon
+
+    payload = serialize_deal(canon_for_hash)
     try:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     except Exception:
@@ -511,6 +533,54 @@ def _is_rebuildish(ts: Any) -> bool:
     return th in {"REBUILD"} or tier in {"REBUILD", "RESET", "TANK"}
 
 
+def _is_young_candidate(c: PlayerTradeCandidate, cfg: DealGeneratorConfig) -> bool:
+    """Heuristic for selecting 'young' assets for the young+pick archetype.
+
+    We rely only on fields that exist in PlayerTradeCandidate / PlayerSnapshot:
+    - c.snap.age (optional)
+    - c.remaining_years
+    - c.is_expiring
+    """
+    try:
+        remaining = float(getattr(c, 'remaining_years', 0.0) or 0.0)
+    except Exception:
+        remaining = 0.0
+
+    # Prefer non-expiring control for 'young' pieces.
+    if bool(getattr(cfg, 'young_avoid_expiring', True)) and bool(getattr(c, 'is_expiring', False)):
+        return False
+
+    # Minimum remaining years gate.
+    if remaining < float(getattr(cfg, 'young_min_remaining_years', 0.0) or 0.0):
+        return False
+
+    age = None
+    try:
+        age = getattr(getattr(c, 'snap', None), 'age', None)
+    except Exception:
+        age = None
+
+    if age is None:
+        if not bool(getattr(cfg, 'young_allow_unknown_age', True)):
+            return False
+        # Fallback: require more remaining control if age is unknown.
+        if remaining < float(getattr(cfg, 'young_unknown_age_min_remaining_years', 0.0) or 0.0):
+            return False
+        return True
+
+    try:
+        age_f = float(age)
+    except Exception:
+        # Treat unparseable age as unknown.
+        if not bool(getattr(cfg, 'young_allow_unknown_age', True)):
+            return False
+        if remaining < float(getattr(cfg, 'young_unknown_age_min_remaining_years', 0.0) or 0.0):
+            return False
+        return True
+
+    return age_f <= float(getattr(cfg, 'young_max_age', 25.0) or 25.0)
+
+
 def _choose_top_need_tags(tick_ctx: TradeGenerationTickContext, team_id: str, cfg: DealGeneratorConfig) -> List[str]:
     dc = tick_ctx.get_decision_context(team_id)
     need_map = getattr(dc, "need_map", None) or {}
@@ -628,10 +698,11 @@ def _pick_from_buckets(
     Uses TeamOutgoingCatalog ordering (already deterministic).
     """
     selected: List[PlayerTradeCandidate] = []
+    seen: Set[str] = set(exclude_players or set())
     for b in buckets:
         ids = outcat.player_ids_by_bucket.get(b, tuple()) or tuple()
         for pid in ids:
-            if pid in exclude_players:
+            if pid in seen:
                 continue
             cand = outcat.players.get(pid)
             if cand is None:
@@ -646,6 +717,7 @@ def _pick_from_buckets(
             if to_team and to_team in {str(t).upper() for t in (cand.return_ban_teams or tuple())}:
                 continue
             selected.append(cand)
+            seen.add(pid)
             if len(selected) >= int(max_n):
                 break
         if len(selected) >= int(max_n):
@@ -800,6 +872,16 @@ def _add_one_outgoing_filler_player(
         return False
     current_leg = list(deal.legs.get(from_team_u, []) or [])
     current_out_players = [a for a in current_leg if isinstance(a, PlayerAsset)]
+
+    # Always exclude players already present in the deal to avoid DUPLICATE_ASSET failures.
+    exclude = set(exclude_players or set())
+    try:
+        for assets in (deal.legs or {}).values():
+            for a in (assets or []):
+                if isinstance(a, PlayerAsset):
+                    exclude.add(str(a.player_id))
+    except Exception:
+        pass
     if len(current_out_players) >= int(max_outgoing_players):
         return False
 
@@ -807,10 +889,11 @@ def _add_one_outgoing_filler_player(
     candidates = _pick_from_buckets(
         outcat,
         buckets=("FILLER_CHEAP", "FILLER_BAD_CONTRACT", "EXPIRING", "SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT"),
-        exclude_players=exclude_players,
+        exclude_players=exclude,
         to_team=to_team_u,
         max_n=10,
         prefer_low_market=True,
+        current_outgoing_players_count=len(current_out_players),
     )
     if target_add_salary_m is not None:
         gap = max(0.0, float(target_add_salary_m))
@@ -1036,7 +1119,7 @@ class DealGenerator:
                 tags_set: Set[str] = set(skel_tags)
 
                 # Dedupe early (pre-repair)
-                h_skel = _hash_deal_for_dedupe(deal)
+                h_skel = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
                 if h_skel in seen_skeletons:
                     continue
                 seen_skeletons.add(h_skel)
@@ -1086,7 +1169,7 @@ class DealGenerator:
                     continue
 
                 # Final dedupe (post-repair / post-validation)
-                h_final = _hash_deal_for_dedupe(deal)
+                h_final = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
                 if h_final in seen_deals:
                     continue
                 seen_deals.add(h_final)
@@ -1623,19 +1706,38 @@ class DealGenerator:
                 buckets=("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP"),
                 exclude_players=set(),
                 to_team=seller_id,
-                max_n=4,
+                max_n=6,
                 prefer_low_market=False,
                 receiver_need_map=seller_need_map,
             )
-            for c in young[:2]:
-                d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
-                d.legs[buyer_id].append(_player_asset(c.player_id))
-                # add a small pick sweetener
-                self._add_pick_by_bucket(d, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket="SECOND")
-                tags = set(tags_base)
-                tags.add("archetype:young_plus_pick")
-                tags.add(f"give:{c.player_id}")
-                out.append((d, tags))
+            # Enforce 'youngness' so this archetype matches its label.
+            young = [c for c in young if _is_young_candidate(c, self.cfg)]
+            if young:
+                def _age(c: PlayerTradeCandidate) -> float:
+                    try:
+                        a = getattr(getattr(c, 'snap', None), 'age', None)
+                        return float(a) if a is not None else 99.0
+                    except Exception:
+                        return 99.0
+
+                def _fit(c: PlayerTradeCandidate) -> float:
+                    try:
+                        return _need_fit_score(getattr(c, 'supply', None) or {}, seller_need_map)
+                    except Exception:
+                        return 0.0
+
+                # Prefer younger assets, then seller fit, then higher market (realistic 'young core' value pieces).
+                young.sort(key=lambda c: (_age(c), -_fit(c), -float(c.market.total), c.player_id))
+
+                for c in young[:2]:
+                    d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
+                    d.legs[buyer_id].append(_player_asset(c.player_id))
+                    # add a small pick sweetener
+                    self._add_pick_by_bucket(d, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket="SECOND")
+                    tags = set(tags_base)
+                    tags.add("archetype:young_plus_pick")
+                    tags.add(f"give:{c.player_id}")
+                    out.append((d, tags))
 
         # Player-for-player around salary
         p2p = _closest_salary_players(
@@ -1933,7 +2035,7 @@ class DealGenerator:
                 continue
 
             # dedupe (local pre-check; global dedupe happens after repair/validation)
-            h_pre = _hash_deal_for_dedupe(deal)
+            h_pre = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
             if h_pre in local_seen:
                 continue
             local_seen.add(h_pre)
@@ -1971,7 +2073,7 @@ class DealGenerator:
                 continue
 
             # Global dedupe after repair/validation (prevents duplicates from repair paths)
-            h_final = _hash_deal_for_dedupe(deal)
+            h_final = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
             if h_final in seen_deals:
                 continue
 
