@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import random
+from datetime import date
 
 try:
     from schema import normalize_team_id  # type: ignore
@@ -389,10 +390,6 @@ def _generate_buy_mode(state: _GenState, *, buyer_id: str, budgets: _Budgets, ma
         if not seller_id or seller_id == buyer_id:
             continue
 
-        # partner spam limit (hard)
-        if stats.partner_counts[seller_id] >= cfg.max_partner_repeats:
-            continue
-
         # build deal skeletons for this target
         skeletons = _build_offer_skeletons(state, buyer_id=buyer_id, target_ref=ref)
         attempts = 0
@@ -436,10 +433,6 @@ def _generate_buy_mode(state: _GenState, *, buyer_id: str, budgets: _Budgets, ma
                 per_target_best[ref.player_id].sort(key=lambda x: x.score, reverse=True)
                 per_target_best[ref.player_id] = per_target_best[ref.player_id][: budgets.beam_width]
 
-        # partner count increments only if we produced at least one valid proposal for this opponent
-        if per_target_best.get(ref.player_id):
-            stats.partner_counts[seller_id] += 1
-
         # early stop if budgets tight
         if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
             break
@@ -448,7 +441,8 @@ def _generate_buy_mode(state: _GenState, *, buyer_id: str, budgets: _Budgets, ma
         results.extend(lst)
 
     results.sort(key=lambda x: x.score, reverse=True)
-    return results[: max(0, int(max_results))]
+    results = _apply_partner_cap(state, results, max_results=max_results, partner_side="seller")
+    return results
 
 
 def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, max_results: int) -> List[DealProposal]:
@@ -479,10 +473,6 @@ def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, 
             if not buyer_id or buyer_id == seller_id:
                 continue
 
-            # partner spam limit (hard) -> in SELL mode, partner is BUYER
-            if stats.partner_counts[buyer_id] >= cfg.max_partner_repeats:
-                continue
-
             # Create a synthetic incoming ref so we can reuse BUY-mode skeleton builder
             ref = IncomingPlayerRef(
                 player_id=sale.player_id,
@@ -497,7 +487,6 @@ def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, 
 
             skeletons = _build_offer_skeletons(state, buyer_id=buyer_id, target_ref=ref)
             attempts = 0
-            produced_for_buyer = False
 
             for sk in skeletons:
                 if attempts >= budgets.max_attempts_per_target:
@@ -529,15 +518,10 @@ def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, 
 
                 for p in proposals_to_add:
                     per_asset_best[sale.player_id].append(p)
-                produced_for_buyer = True
 
                 if per_asset_best[sale.player_id]:
                     per_asset_best[sale.player_id].sort(key=lambda x: x.score, reverse=True)
                     per_asset_best[sale.player_id] = per_asset_best[sale.player_id][: budgets.beam_width]
-
-            # If we generated at least one valid proposal for this buyer (this asset), count them as a partner used.
-            if produced_for_buyer:
-                stats.partner_counts[buyer_id] += 1
 
             if stats.validations >= budgets.max_validations or stats.evaluations >= budgets.max_evaluations:
                 break
@@ -546,7 +530,8 @@ def _generate_sell_mode(state: _GenState, *, seller_id: str, budgets: _Budgets, 
         results.extend(lst)
 
     results.sort(key=lambda x: x.score, reverse=True)
-    return results[: max(0, int(max_results))]
+    results = _apply_partner_cap(state, results, max_results=max_results, partner_side="buyer")
+    return results
 
 
 def _select_sale_assets(state: _GenState, *, seller_id: str, budgets: _Budgets) -> List[PlayerTradeCandidate]:
@@ -581,7 +566,7 @@ def _select_sale_assets(state: _GenState, *, seller_id: str, budgets: _Budgets) 
             continue
         if _is_locked(c.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
             continue
-        if c.recent_signing_banned_until or c.aggregation_banned_until:
+        if _is_ban_active(tick_ctx.current_date, c.recent_signing_banned_until):
             continue
 
         # Exclude CORE in SOFT_SELL; allow ultra-rare CORE in SELL
@@ -724,6 +709,25 @@ def _clamp01(x: float) -> float:
         return float(x)
     except Exception:
         return 0.5
+
+
+def _parse_iso_ymd(value: object) -> Optional[date]:
+    """Parse YYYY-MM-DD (or datetime ISO) into a date. Returns None on failure."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if len(s) < 10:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except Exception:
+        return None
+
+
+def _is_ban_active(current_date: date, until_iso: Optional[str]) -> bool:
+    """True if a banned-until ISO string is active at current_date."""
+    d = _parse_iso_ymd(until_iso)
+    return bool(d is not None and current_date < d)
 
 
 # =============================================================================
@@ -871,7 +875,7 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     if target_ref.from_team and buyer_id in set(target.return_ban_teams or ()):
         state.stats.pruned_ineligible += 1
         return []
-    if target.recent_signing_banned_until or target.aggregation_banned_until:
+    if _is_ban_active(tick_ctx.current_date, target.recent_signing_banned_until):
         state.stats.pruned_ineligible += 1
         return []
 
@@ -1024,7 +1028,7 @@ def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCa
             continue
         if _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
             continue
-        if cand.recent_signing_banned_until:
+        if _is_ban_active(tick_ctx.current_date, cand.recent_signing_banned_until):
             continue
         # keep return bans irrelevant here (outgoing)
         all_players.append(cand)
@@ -1369,10 +1373,11 @@ def _repair_roster_limit(state: _GenState, spec: _DealSpec, err: TradeError) -> 
 
         filler_cands = _collect_buyer_player_candidates(state, buyer_out)["filler"]
         used = set(spec.buyer_players_out)
+        allow_solo_only = len(spec.buyer_players_out) == 0
         for c in filler_cands:
             if c.player_id in used:
                 continue
-            if c.aggregation_solo_only:
+            if c.aggregation_solo_only and not allow_solo_only:
                 continue
             spec.buyer_players_out.append(c.player_id)
             spec.tags.append("repair:roster_send_filler_buyer")
@@ -1397,10 +1402,11 @@ def _repair_roster_limit(state: _GenState, spec: _DealSpec, err: TradeError) -> 
 
         filler_cands = _collect_buyer_player_candidates(state, seller_out)["filler"]
         used = set(spec.seller_players_out)
+        allow_solo_only = len(spec.seller_players_out) == 0
         for c in filler_cands:
             if c.player_id in used:
                 continue
-            if c.aggregation_solo_only:
+            if c.aggregation_solo_only and not allow_solo_only:
                 continue
             spec.seller_players_out.append(c.player_id)
             spec.tags.append("repair:roster_send_filler_seller")
@@ -1512,9 +1518,12 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
         # If we're at SECOND_APRON, we cannot add a 2nd outgoing player once we already have one.
         second_apron_one_for_one = (status == "SECOND_APRON") or (method == "outgoing_second_apron")
 
-        # If adding an extra outgoing would violate aggregation solo-only restriction, don't.
-        if any(buyer_out.players.get(pid) and buyer_out.players[pid].aggregation_solo_only for pid in spec.buyer_players_out):
-            return False
+        # aggregation_solo_only means the team cannot aggregate multiple outgoing players;
+        # it can still trade a single player (including another solo-only player).
+        has_solo_only_outgoing = any(
+            buyer_out.players.get(pid) and buyer_out.players[pid].aggregation_solo_only
+            for pid in spec.buyer_players_out
+        )
 
         deficit_dollars = max(0.0, incoming_salary - allowed_in) if allowed_in > 0 else max(0.0, incoming_salary)
         needed_extra_m = deficit_dollars / 1_000_000.0
@@ -1528,7 +1537,7 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
             for c in pool:
                 if c.player_id in used:
                     continue
-                if c.aggregation_solo_only:
+                if c.aggregation_solo_only and len(spec.buyer_players_out) >= 1:
                     continue
                 sal = _salary_m(c)
                 if sal <= 0:
@@ -1555,8 +1564,6 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
                     continue
                 if c.player_id in used:
                     continue
-                if c.aggregation_solo_only:
-                    continue
                 sal = _salary_m(c)
                 if sal + 1e-6 < min_sal:
                     continue
@@ -1569,7 +1576,11 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
             return best_c
 
         # Prefer add when allowed; otherwise swap to keep 1 outgoing player.
-        if not (second_apron_one_for_one and len(spec.buyer_players_out) >= 1):
+        can_add_outgoing = (
+            not (second_apron_one_for_one and len(spec.buyer_players_out) >= 1)
+            and not (has_solo_only_outgoing and len(spec.buyer_players_out) >= 1)
+        )
+        if can_add_outgoing:
             cand = pick_best_to_add()
             if cand is not None:
                 spec.buyer_players_out.append(cand.player_id)
@@ -1730,8 +1741,8 @@ def _spec_to_deal(state: _GenState, spec: _DealSpec) -> Optional[Deal]:
             return None
         if _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
             return None
-        # eligibility prefilter
-        if cand.recent_signing_banned_until or cand.aggregation_banned_until:
+        # eligibility prefilter (recent-signing ban is absolute; aggregation is handled by solo-only constraint)
+        if _is_ban_active(state.tick_ctx.current_date, cand.recent_signing_banned_until):
             return None
         legs[seller_id].append(cand.as_asset(to_team=None))
 
@@ -1793,12 +1804,6 @@ def _evaluate_and_score(state: _GenState, deal: Deal, *, buyer_id: str, seller_i
 
     score = _score_deal(cfg, buyer_decision, buyer_eval, seller_decision, seller_eval)
     tags = tuple(_extract_tags_from_deal(deal))
-
-    # partner spam penalty: discourage repetitive same opponent (mode-aware)
-    opp = _canon_team_id(partner_id) if partner_id else seller_id
-    repeats = max(0, int(state.stats.partner_counts.get(opp, 0)))
-    if repeats > 0:
-        score -= cfg.partner_repeat_penalty * float(repeats)
 
     return DealProposal(
         deal=deal,
@@ -2037,6 +2042,44 @@ def _deal_to_spec_guess(deal: Deal, *, buyer_id: str, seller_id: str) -> Optiona
         elif isinstance(a, SwapAsset):
             spec.seller_swaps_out.append(a.swap_id)
     return spec
+
+
+def _apply_partner_cap(
+    state: _GenState,
+    proposals: List[DealProposal],
+    *,
+    max_results: int,
+    partner_side: str,
+) -> List[DealProposal]:
+    """Diversify final output by capping number of proposals per partner team.
+
+    partner_side:
+      - 'seller': cap by proposal.seller_id (BUY mode)
+      - 'buyer':  cap by proposal.buyer_id  (SELL mode)
+    """
+    cap = int(state.cfg.max_partner_repeats or 0)
+    if cap <= 0:
+        return proposals[: max(0, int(max_results))]
+
+    counts = defaultdict(int)
+    out: List[DealProposal] = []
+    for p in proposals:
+        partner = p.seller_id if partner_side == 'seller' else p.buyer_id
+        if counts[partner] >= cap:
+            continue
+        out.append(p)
+        counts[partner] += 1
+        if len(out) >= max(0, int(max_results)):
+            break
+
+    # Record final partner exposure counts for telemetry.
+    try:
+        state.stats.partner_counts.clear()
+        state.stats.partner_counts.update(counts)
+    except Exception:
+        pass
+
+    return out
 
 
 # =============================================================================
