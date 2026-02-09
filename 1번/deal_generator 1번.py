@@ -2346,6 +2346,134 @@ def _apply_prune_side_effects(
         banned_players.add(failure.player_id)
 
 
+@dataclass(frozen=True, slots=True)
+class SalaryMatchSimResult:
+    """SalaryMatchingRule의 핵심 계산을 로컬에서 재현한 결과(달러 단위 정수).
+
+    SSOT(TradeGenerationTickContext.validate_deal)에서 나온 TradeError.details를 기반으로,
+    repair 단계에서 '이 filler를 추가하면 통과할 가능성이 있는가?'를 빠르게 판정하기 위해 사용한다.
+
+    주의:
+    - 실제 SSOT는 float + math.floor 기반이므로, floor 연산에는 eps를 더해 부동소수 오차를 상쇄한다.
+    - BELOW_FIRST_APRON의 large 구간(1.25배)은 정수 연산((out*5)//4)로 정확히 재현한다.
+    """
+
+    ok: bool
+    status: str
+    method: str
+    allowed_in_d: int
+    payroll_after_d: int
+    max_incoming_cap_room_d: Optional[int] = None
+    reason: Optional[str] = None
+
+
+def _to_int_dollars(x: Any) -> int:
+    """float/int/str 등을 달러 단위 정수로 안전하게 변환."""
+    try:
+        return int(round(float(x)))
+    except Exception:
+        return 0
+
+
+def _simulate_salary_matching(
+    *,
+    payroll_before_d: int,
+    outgoing_salary_d: int,
+    incoming_salary_d: int,
+    trade_rules: Mapping[str, Any],
+    eps: float = 1e-6,
+) -> SalaryMatchSimResult:
+    """SalaryMatchingRule.validate()의 계산을 달러 정수로 재현.
+
+    Returns:
+        SalaryMatchSimResult(ok, status, method, allowed_in_d, payroll_after_d, ...)
+    """
+
+    # defaults: trade/trades/rules/builtin/salary_matching_rule.py 와 동일
+    salary_cap_d = _to_int_dollars(trade_rules.get("salary_cap") or 0.0)
+    first_apron_d = _to_int_dollars(trade_rules.get("first_apron") or 0.0)
+    second_apron_d = _to_int_dollars(trade_rules.get("second_apron") or 0.0)
+
+    match_small_out_max_d = _to_int_dollars(trade_rules.get("match_small_out_max") or 7_500_000)
+    match_mid_out_max_d = _to_int_dollars(trade_rules.get("match_mid_out_max") or 29_000_000)
+    match_mid_add_d = _to_int_dollars(trade_rules.get("match_mid_add") or 7_500_000)
+    match_buffer_d = _to_int_dollars(trade_rules.get("match_buffer") or 250_000)
+
+    first_apron_mult = float(trade_rules.get("first_apron_mult") or 1.10)
+    second_apron_mult = float(trade_rules.get("second_apron_mult") or 1.00)
+
+    payroll_after_d = int(payroll_before_d - outgoing_salary_d + incoming_salary_d)
+
+    if payroll_after_d >= second_apron_d:
+        status = "SECOND_APRON"
+    elif payroll_after_d >= first_apron_d:
+        status = "FIRST_APRON"
+    else:
+        status = "BELOW_FIRST_APRON"
+
+    # cap-room exception (SSOT와 동일한 위치/순서)
+    if payroll_before_d < salary_cap_d:
+        cap_room_d = salary_cap_d - payroll_before_d
+        max_incoming_d = cap_room_d + outgoing_salary_d
+        if incoming_salary_d <= max_incoming_d:
+            return SalaryMatchSimResult(
+                ok=True,
+                status=status,
+                method="cap_room",
+                allowed_in_d=max_incoming_d,
+                payroll_after_d=payroll_after_d,
+                max_incoming_cap_room_d=max_incoming_d,
+                reason="cap_room_ok",
+            )
+
+    if outgoing_salary_d <= 0:
+        return SalaryMatchSimResult(
+            ok=False,
+            status=status,
+            method="outgoing_required",
+            allowed_in_d=0,
+            payroll_after_d=payroll_after_d,
+            reason="outgoing_required",
+        )
+
+    # NOTE: SECOND_APRON one-for-one 제약은 여기서는 다루지 않는다.
+    # (generator가 SECOND_APRON에 대해 별도 repair 루트를 가지며, 이 helper는 'allowed_in' 계산 목적)
+
+    if status == "SECOND_APRON":
+        allowed_in_d = int(math.floor(outgoing_salary_d * second_apron_mult + eps))
+        method = "outgoing_second_apron"
+    elif status == "FIRST_APRON":
+        allowed_in_d = int(math.floor(outgoing_salary_d * first_apron_mult + eps))
+        method = "outgoing_first_apron"
+    else:
+        if outgoing_salary_d <= match_small_out_max_d:
+            allowed_in_d = int(2 * outgoing_salary_d + match_buffer_d)
+        elif outgoing_salary_d <= match_mid_out_max_d:
+            allowed_in_d = int(outgoing_salary_d + match_mid_add_d)
+        else:
+            allowed_in_d = int((outgoing_salary_d * 5) // 4 + match_buffer_d)
+        method = "outgoing_below_first_apron"
+
+    if incoming_salary_d > allowed_in_d:
+        return SalaryMatchSimResult(
+            ok=False,
+            status=status,
+            method=method,
+            allowed_in_d=allowed_in_d,
+            payroll_after_d=payroll_after_d,
+            reason="incoming_gt_allowed_in",
+        )
+
+    return SalaryMatchSimResult(
+        ok=True,
+        status=status,
+        method=method,
+        allowed_in_d=allowed_in_d,
+        payroll_after_d=payroll_after_d,
+        reason="ok",
+    )
+
+
 def _repair_salary_matching(
     cand: DealCandidate,
     failing_team: str,
@@ -2388,34 +2516,65 @@ def _repair_salary_matching(
     # receiver team(상대팀) 계산: return-ban 프리필터에 사용
     other = [t for t in cand.deal.teams if str(t).upper() != str(failing_team).upper()]
     receiver_team = str(other[0]).upper() if other else None
-    outgoing_cnt = _count_players(cand.deal, failing_team)
 
-    filler = _pick_bucket_player(
-        out_catalog,
-        bucket="FILLER_CHEAP",
-        receiver_team_id=receiver_team,
-        must_be_aggregation_friendly=True,
-    )
-    if not filler:
-        filler = _pick_bucket_player(
-            out_catalog,
-            bucket="EXPIRING",
-            receiver_team_id=receiver_team,
-            must_be_aggregation_friendly=True,
-        )
-    if not filler:
-        filler = _pick_bucket_player(
-            out_catalog,
-            bucket="FILLER_BAD_CONTRACT",
-            receiver_team_id=receiver_team,
-            must_be_aggregation_friendly=True,
-        )
-    if not filler:
+    # SalaryMatchingRule failure.details는 달러(float) 기반이므로, 달러 정수로 변환해 사용한다.
+    # 이 숫자들은 SSOT(validate_deal)의 '현재 딜 상태' 기준이며, filler 추가 후 상태는 여기서 재시뮬레이션한다.
+    payroll_before_d = _to_int_dollars(failure.details.get("payroll_before"))
+    outgoing_salary_d0 = _to_int_dollars(failure.details.get("outgoing_salary"))
+    incoming_salary_d0 = _to_int_dollars(failure.details.get("incoming_salary"))
+
+    if incoming_salary_d0 <= 0:
         return False
 
+    # max_players_per_side guard는 이미 위에서 통과했으므로, 여기서는 후보 스캔/선정만 한다.
     already = {a.player_id for a in cand.deal.legs.get(failing_team, []) if isinstance(a, PlayerAsset)}
-    if filler in already:
+
+    # 후보 filler를 버킷에서 전수 스캔하고, "salary matching을 실제로 통과시키는" 후보만 남긴다.
+    buckets: Tuple[BucketId, ...] = ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT")
+    seen: Set[str] = set()
+    passing: List[Tuple[int, float, str]] = []  # (salary_d, market_total, player_id)
+
+    trade_rules = catalog.trade_rules or {}
+
+    for b in buckets:
+        for pid in out_catalog.player_ids_by_bucket.get(b, tuple()):
+            pid = str(pid)
+            if pid in seen or pid in already:
+                continue
+            seen.add(pid)
+
+            c = out_catalog.players.get(pid)
+            if c is None:
+                continue
+
+            # return-ban / aggregation-solo-only 필터 (기존 _pick_bucket_player와 동일한 의도)
+            if receiver_team and receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
+                continue
+            if bool(getattr(c, "aggregation_solo_only", False)):
+                continue
+
+            filler_salary_d = int(round(float(c.salary_m) * 1_000_000.0))
+            if filler_salary_d <= 0:
+                continue
+
+            sim = _simulate_salary_matching(
+                payroll_before_d=payroll_before_d,
+                outgoing_salary_d=outgoing_salary_d0 + filler_salary_d,
+                incoming_salary_d=incoming_salary_d0,
+                trade_rules=trade_rules,
+            )
+            if not sim.ok:
+                continue
+
+            mkt = float(getattr(c.market, "total", 0.0))
+            passing.append((filler_salary_d, mkt, pid))
+
+    if not passing:
         return False
+
+    # "필요 샐러리를 충족하는 최소 salary" 우선, 그 안에서 market.total 최소
+    passing.sort(key=lambda t: (t[0], t[1], t[2]))
+    filler = passing[0][2]
 
     cand.deal.legs[failing_team].append(PlayerAsset(kind="player", player_id=filler))
     cand.tags.append("repair:add_filler_salary")
@@ -2819,6 +2978,8 @@ def maybe_apply_sweeteners(
     if out_cat is None:
         return base, 0, 0
 
+    local_sweetener_bans: Set[str] = set()
+
     best = base
     extra_v = 0
     extra_e = 0
@@ -2847,7 +3008,7 @@ def maybe_apply_sweeteners(
             config=config,
             target_value=float(deficit),
             bucket=str(bucket),
-            banned_asset_keys=banned_asset_keys,
+            banned_asset_keys=(set(banned_asset_keys) | set(local_sweetener_bans)),
             rng=rng,
         )
         if not added:
@@ -2858,12 +3019,34 @@ def maybe_apply_sweeteners(
         stats.sweetener_attempts += 1
 
         # validate
+        attempted_key: Optional[str] = None
+        if deal.legs.get(str(giver).upper()):
+            attempted_key = asset_key(deal.legs[str(giver).upper()][-1])
+
         try:
             tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
             extra_v += 1
-        except Exception:
+        except TradeError as err:
             # rollback this sweetener (remove last asset from giver leg)
             extra_v += 1
+            if attempted_key:
+                failure = parse_trade_error(err)
+                # 자산 자체가 근본적으로 금지/미소유/잠김/중복인 케이스는 global ban이 효과적
+                if failure.kind in (RuleFailureKind.ASSET_LOCK, RuleFailureKind.OWNERSHIP, RuleFailureKind.DUPLICATE_ASSET):
+                    banned_asset_keys.add(attempted_key)
+                    if failure.asset_key:
+                        banned_asset_keys.add(failure.asset_key)
+                else:
+                    local_sweetener_bans.add(attempted_key)
+                    if failure.asset_key:
+                        local_sweetener_bans.add(failure.asset_key)
+            _rollback_last_asset_from_leg(deal, str(giver).upper())
+            continue
+        except Exception:
+            # 예상치 못한 예외는 local ban(동일 sweetener 재시도 방지)만 적용
+            extra_v += 1
+            if attempted_key:
+                local_sweetener_bans.add(attempted_key)
             _rollback_last_asset_from_leg(deal, str(giver).upper())
             continue
 
