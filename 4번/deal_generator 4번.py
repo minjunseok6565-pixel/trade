@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Bilateral deal generator.
+"""Deal generator (bilateral by default; optional 3-team salary-bridge).
 
 This generator produces *validatable* and *evaluable* deals using:
 
@@ -19,7 +19,9 @@ Core ideas
 
 Scope
 -----
-- Two-team trades only (multi-team can be layered later).
+- Two-team trades by default.
+- Optional 3-team "salary-bridge" mode can be enabled to solve some salary-matching dead-ends
+  without forcing unwanted filler onto the counterparty.
 - Fixed assets ignored for now (can be added as another sweetener tier).
 - Outputs are deals + bilateral evaluations; orchestrator can decide how/when to submit.
 """
@@ -30,6 +32,7 @@ import hashlib
 import logging
 import math
 import random
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -63,6 +66,10 @@ class DealGeneratorConfig:
     # Output control
     max_results: int = 12
     include_near_misses: bool = False
+    # Multi-team (3-team) support
+    enable_three_team: bool = True
+    max_three_team_attempts: int = 12
+    max_three_team_candidate_teams: int = 10
 
     # Search budgets
     max_targets: int = 12
@@ -92,6 +99,39 @@ class DealGeneratorConfig:
 
     # Determinism
     rng_seed: Optional[int] = None
+
+
+@dataclass(slots=True)
+class DealGenerationStats:
+    """Per-call generation telemetry (lightweight; orchestrator can persist to trade_market.events)."""
+    team_id: str = ""
+    mode: str = ""
+    started_at_perf: float = 0.0
+    runtime_ms: float = 0.0
+
+    attempts: int = 0
+    deals_built: int = 0
+    duplicate_prunes: int = 0
+
+    validations: int = 0
+    invalid_by_rule: Dict[str, int] = field(default_factory=dict)
+    invalid_by_method: Dict[str, int] = field(default_factory=dict)
+
+    repairs_attempted: int = 0
+    repairs_succeeded: int = 0
+    sweetener_attempts: int = 0
+    sweetener_success: int = 0
+
+    three_team_attempts: int = 0
+    three_team_success: int = 0
+
+    evaluations: int = 0
+    accepts: int = 0
+    near_misses: int = 0
+
+    def _bump(self, d: Dict[str, int], key: str) -> None:
+        k = str(key or "")
+        d[k] = int(d.get(k, 0)) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,24 +201,17 @@ def _resolve_asset_catalog(
 
 
 def _deal_fingerprint(deal: Deal) -> str:
-    """Stable fingerprint for de-duplication (independent of ordering noise).
-
-    NOTE: `deal` is expected to be canonicalized already (e.g. via canonicalize_deal).
-    This avoids double-canonicalization in tight generation loops.
-    """
-    d = deal
-    parts: List[str] = []
-    parts.append("|".join(d.teams))
-    for team in d.teams:
-        assets = d.legs.get(team, [])
-        a_parts = []
-        for a in assets:
-            to_team = getattr(a, "to_team", None) or ""
-            a_parts.append(f"{asset_key(a)}->{to_team}")
-        a_parts.sort()
-        parts.append(f"{team}:" + ",".join(a_parts))
-    raw = "||".join(parts)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    """Stable fingerprint for deduping within a generation tick."""
+    h = hashlib.sha1()
+    h.update(("|".join(deal.teams)).encode("utf-8"))
+    for team_id in deal.teams:
+        h.update(team_id.encode("utf-8"))
+        for asset in deal.legs.get(team_id, []):
+            h.update(asset_key(asset).encode("utf-8"))
+            # receiver matters for multi-team deals
+            to_team = getattr(asset, "to_team", None) or ""
+            h.update(str(to_team).encode("utf-8"))
+    return h.hexdigest()
 
 
 def _is_accept(decision: DealDecision) -> bool:
@@ -297,6 +330,116 @@ class _BilateralDealBuilder:
         return b
 
 
+class _MultiTeamDealBuilder:
+    """Utility to build 3+ team deals safely (no duplicate assets).
+
+    Note: For >=3 teams, TeamLegsRule requires every asset to have to_team set.
+    This builder always sets explicit to_team and keeps legs keys == teams.
+    """
+
+    def __init__(self, teams: Sequence[str]) -> None:
+        ts = [_canon_team_id(t) for t in teams]
+        # preserve deterministic ordering
+        uniq = []
+        seen = set()
+        for t in ts:
+            if t and t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        self._legs: Dict[str, List[Any]] = {t: [] for t in uniq}
+        self._seen: Set[str] = set()
+
+    @property
+    def teams(self) -> Tuple[str, ...]:
+        return tuple(sorted(self._legs.keys()))
+
+    def ensure_team(self, team_id: str) -> None:
+        t = _canon_team_id(team_id)
+        if t not in self._legs:
+            self._legs[t] = []
+
+    def add_player(self, from_team: str, player_id: str, *, to_team: str) -> None:
+        ft = _canon_team_id(from_team)
+        tt = _canon_team_id(to_team)
+        self.ensure_team(ft)
+        self.ensure_team(tt)
+        pid = _canon_player_id(player_id)
+        a = PlayerAsset(kind="player", player_id=pid, to_team=tt)
+        k = asset_key(a)
+        if k in self._seen:
+            return
+        self._seen.add(k)
+        self._legs[ft].append(a)
+
+    def add_pick(self, from_team: str, pick_id: str, *, to_team: str, protection: Optional[Dict[str, Any]] = None) -> None:
+        ft = _canon_team_id(from_team)
+        tt = _canon_team_id(to_team)
+        self.ensure_team(ft)
+        self.ensure_team(tt)
+        a = PickAsset(kind="pick", pick_id=str(pick_id), to_team=tt, protection=protection)
+        k = asset_key(a)
+        if k in self._seen:
+            return
+        self._seen.add(k)
+        self._legs[ft].append(a)
+
+    def add_swap(self, from_team: str, swap: SwapTradeCandidate, *, to_team: str) -> None:
+        ft = _canon_team_id(from_team)
+        tt = _canon_team_id(to_team)
+        self.ensure_team(ft)
+        self.ensure_team(tt)
+        pick_id_a = getattr(swap, "pick_id_a", None)
+        pick_id_b = getattr(swap, "pick_id_b", None)
+        snap = getattr(swap, "snap", None)
+        if pick_id_a is None and snap is not None:
+            pick_id_a = getattr(snap, "pick_id_a", None)
+        if pick_id_b is None and snap is not None:
+            pick_id_b = getattr(snap, "pick_id_b", None)
+        a = SwapAsset(kind="swap", swap_id=swap.swap_id, pick_id_a=str(pick_id_a or ""), pick_id_b=str(pick_id_b or ""), to_team=tt)
+        k = asset_key(a)
+        if k in self._seen:
+            return
+        self._seen.add(k)
+        self._legs[ft].append(a)
+
+    def count_players_out(self, team: str) -> int:
+        t = _canon_team_id(team)
+        return sum(1 for a in self._legs.get(t, []) if isinstance(a, PlayerAsset))
+
+    def count_players_in(self, team: str) -> int:
+        t = _canon_team_id(team)
+        c = 0
+        for assets in self._legs.values():
+            for a in assets:
+                if isinstance(a, PlayerAsset) and _canon_team_id(getattr(a, "to_team", "") or "") == t:
+                    c += 1
+        return c
+
+    def total_players_moved(self) -> int:
+        return sum(self.count_players_out(t) for t in self._legs.keys())
+
+    def pick_ids_out(self, team: str) -> List[str]:
+        t = _canon_team_id(team)
+        return [str(a.pick_id) for a in self._legs.get(t, []) if isinstance(a, PickAsset)]
+
+    def pick_ids_in(self, team: str) -> List[str]:
+        t = _canon_team_id(team)
+        return [
+            str(a.pick_id)
+            for sender, assets in self._legs.items()
+            if sender != t
+            for a in assets
+            if isinstance(a, PickAsset) and _canon_team_id(getattr(a, "to_team", "") or "") == t
+        ]
+
+    def build(self, meta: Optional[Dict[str, Any]] = None) -> Deal:
+        # Ensure legs keys == teams (TeamLegsRule)
+        for t in list(self._legs.keys()):
+            self._legs.setdefault(t, [])
+        deal = Deal(teams=list(self.teams), legs=self._legs, meta=(meta or {}))
+        return canonicalize_deal(deal)
+
+
 # -----------------------------------------------------------------------------
 # Deal generator
 # -----------------------------------------------------------------------------
@@ -337,6 +480,8 @@ class DealGenerator:
         self._seen_deals: Set[str] = set()
         # Fingerprints that validated successfully (useful for debugging/telemetry).
         self._seen_valid_deals: Set[str] = set()
+        self.last_stats: Optional[DealGenerationStats] = None
+        self._stats: Optional[DealGenerationStats] = None
         self._validation_count = 0
         self._evaluation_count = 0
 
@@ -351,6 +496,20 @@ class DealGenerator:
     # Public entrypoint
     # ------------------------
 
+    def generate_deals_for_team_with_stats(self, team_id: str) -> Tuple[List[GeneratedDeal], DealGenerationStats]:
+        deals = self.generate_deals_for_team(team_id)
+        return deals, (self.last_stats or DealGenerationStats(team_id=_canon_team_id(team_id)))
+
+    def _stats_bump(self, d: Dict[str, int], key: str) -> None:
+        if self._stats is None:
+            return
+        self._stats._bump(d, key)
+
+    def _stats_inc(self, attr: str, n: int = 1) -> None:
+        if self._stats is None:
+            return
+        setattr(self._stats, attr, int(getattr(self._stats, attr, 0)) + int(n))
+
     def generate_deals_for_team(self, team_id: str) -> List[GeneratedDeal]:
         """Generate a ranked list of bilateral deals initiated by team_id."""
         initiator = _canon_team_id(team_id)
@@ -358,7 +517,13 @@ class DealGenerator:
         posture = str(getattr(ts, "trade_posture", "STAND_PAT")).upper()
         mode = "BUY" if posture in {"AGGRESSIVE_BUY", "SOFT_BUY"} else "SELL" if posture in {"SELL", "SOFT_SELL"} else "BUY"
 
+        st = DealGenerationStats(team_id=initiator, mode=mode, started_at_perf=time.perf_counter())
+        self._stats = st
+        self.last_stats = st
+
         if getattr(getattr(ts, "constraints", None), "cooldown_active", False):
+            st.runtime_ms = (time.perf_counter() - st.started_at_perf) * 1000.0
+            self._stats = None
             return []
 
         # Use a deterministic *team-scoped* RNG stream by default.
@@ -371,6 +536,8 @@ class DealGenerator:
             results = self._generate_deals_for_team_mode(initiator, mode)
 
         results.sort(key=lambda x: (-x.score, x.counterparty_team_id, x.target_player_id or ""))
+        st.runtime_ms = (time.perf_counter() - st.started_at_perf) * 1000.0
+        self._stats = None
         return results[: self.cfg.max_results]
 
     def _generate_deals_for_team_mode(self, initiator: str, mode: str) -> List[GeneratedDeal]:
@@ -385,6 +552,10 @@ class DealGenerator:
                 deals = self._search_for_target(initiator, ref)
                 for gd in deals:
                     results.append(gd)
+                    if gd.meta.get("near_miss"):
+                        self._stats_inc("near_misses", 1)
+                    else:
+                        self._stats_inc("accepts", 1)
                     if self._should_stop(results):
                         break
         else:
@@ -395,6 +566,10 @@ class DealGenerator:
                 deals = self._search_for_sell_candidate(initiator, cand)
                 for gd in deals:
                     results.append(gd)
+                    if gd.meta.get("near_miss"):
+                        self._stats_inc("near_misses", 1)
+                    else:
+                        self._stats_inc("accepts", 1)
                     if self._should_stop(results):
                         break
 
@@ -964,6 +1139,7 @@ class DealGenerator:
         # Try validate/repair loop
         cur = builder
         last_err: Optional[TradeError] = None
+        sweetened = False
         for _ in range(max(1, self.cfg.max_repairs_per_offer)):
             if self._validation_count >= self.cfg.max_validations:
                 return None
@@ -972,9 +1148,12 @@ class DealGenerator:
             fp: Optional[str] = None
             stage = "build/fingerprint"
             try:
+                self._stats_inc("attempts", 1)
                 deal = cur.build(meta={"gen_mode": mode, "target": target_pid})
+                self._stats_inc("deals_built", 1)
                 fp = _deal_fingerprint(deal)
                 if fp in self._seen_deals:
+                    self._stats_inc("duplicate_prunes", 1)
                     return None
                 # Record attempted fingerprints even if validation fails, to avoid repeated invalid spam.
                 self._seen_deals.add(fp)
@@ -982,6 +1161,7 @@ class DealGenerator:
                 stage = "validate/evaluate"
                 self.tick_ctx.validate_deal(deal, integrity_check=False)
                 self._validation_count += 1
+                self._stats_inc("validations", 1)
                 self._seen_valid_deals.add(fp)
                 # Evaluate (initiator-first to save work on obvious rejects)
                 if self._evaluation_count >= self.cfg.max_evaluations:
@@ -1014,6 +1194,7 @@ class DealGenerator:
                         validate=False,
                     )
                 self._evaluation_count += 1
+                self._stats_inc("evaluations", 1)
 
                 # If initiator rejects, skip counterparty evaluation entirely.
                 if not _is_accept(a_dec):
@@ -1047,6 +1228,7 @@ class DealGenerator:
                         validate=False,
                     )
                 self._evaluation_count += 1
+                self._stats_inc("evaluations", 1)
 
                 # Local sweetener loop when counterparty is close but rejecting.
                 if (not _is_accept(b_dec)) and _is_accept(a_dec):
@@ -1059,10 +1241,13 @@ class DealGenerator:
                     )
                     if repaired is not None:
                         cur = repaired
+                        sweetened = True
                         continue  # validate/evaluate again
 
                 # Accept criteria
                 if _is_accept(a_dec) and _is_accept(b_dec):
+                    if sweetened:
+                        self._stats_inc("sweetener_success", 1)
                     score = self._score_deal(initiator, a_dec, a_eval, b_dec, b_eval, cur)
                     return GeneratedDeal(
                         deal=deal,
@@ -1101,10 +1286,30 @@ class DealGenerator:
 
             except TradeError as e:
                 self._validation_count += 1
+                self._stats_inc("validations", 1)
                 last_err = e
+                # Track invalid reasons for tuning.
+                details = getattr(e, "details", None)
+                if isinstance(details, Mapping):
+                    self._stats_bump(self.last_stats.invalid_by_rule if self.last_stats else {}, str(details.get("rule") or details.get("reason") or ""))
+                    self._stats_bump(self.last_stats.invalid_by_method if self.last_stats else {}, str(details.get("method") or ""))
+
+                self._stats_inc("repairs_attempted", 1)
                 fixed = self._repair_after_validation_error(cur, initiator=initiator, counterparty=counterparty, err=e)
                 if fixed is None:
+                    # Optional 3-team salary-bridge when bilateral salary matching cannot be repaired.
+                    tri = self._try_three_team_on_salary_matching_deadend(
+                        base_builder=cur,
+                        initiator=initiator,
+                        counterparty=counterparty,
+                        mode=mode,
+                        target_pid=target_pid,
+                        err=e,
+                    )
+                    if tri is not None:
+                        return tri
                     break
+                self._stats_inc("repairs_succeeded", 1)
                 cur = fixed
                 continue
             except Exception as e:
@@ -1117,6 +1322,307 @@ class DealGenerator:
         # Failed to produce a valid/evaluable deal.
         _ = last_err
         return None
+
+    def _try_three_team_on_salary_matching_deadend(
+        self,
+        *,
+        base_builder: _BilateralDealBuilder,
+        initiator: str,
+        counterparty: str,
+        mode: str,
+        target_pid: Optional[str],
+        err: TradeError,
+    ) -> Optional[GeneratedDeal]:
+        """Attempt a minimal 3-team 'salary bridge' when a bilateral offer hits a salary-matching dead-end.
+
+        Pattern:
+          - failing_team sends a dump/filler player to third_team (improves outgoing_salary without burdening counterparty)
+          - third_team sends a filler player to counterparty (avoids outgoing_required for third)
+          - failing_team compensates third_team with small picks (2nds first)
+
+        This is intentionally small-search and budgeted.
+        """
+        if not self.cfg.enable_three_team:
+            return None
+
+        details = getattr(err, "details", None)
+        code = str(getattr(err, "code", ""))
+        rule = ""
+        method = ""
+        failing_team = None
+        if isinstance(details, Mapping):
+            rule = str(details.get("rule") or details.get("reason") or "")
+            method = str(details.get("method") or "")
+            failing_team = details.get("team_id")
+        failing_team = _canon_team_id(failing_team) if failing_team else None
+
+        if code != DEAL_INVALIDATED or rule != "salary_matching":
+            return None
+        # If rule says SECOND_APRON one-for-one failed, we keep it simple and skip here.
+        if method == "second_apron_one_for_one":
+            return None
+
+        if failing_team not in {_canon_team_id(initiator), _canon_team_id(counterparty)}:
+            return None
+
+        # Budget guard
+        if self._validation_count >= self.cfg.max_validations or self._evaluation_count >= self.cfg.max_evaluations:
+            return None
+
+        self._stats_inc("three_team_attempts", 1)
+
+        # Candidate third teams: deterministic sorting by cap_space desc then team_id.
+        candidate_teams: List[str] = []
+        try:
+            all_ids = list(getattr(self.tick_ctx, "team_situations", {}).keys())  # type: ignore[attr-defined]
+        except Exception:
+            all_ids = []
+        if not all_ids:
+            # fallback: catalog teams
+            all_ids = list(getattr(self.catalog, "outgoing_by_team", {}).keys())
+
+        for t in all_ids:
+            tt = _canon_team_id(t)
+            if tt in {_canon_team_id(initiator), _canon_team_id(counterparty)}:
+                continue
+            ts = self.tick_ctx.get_team_situation(tt)
+            if getattr(getattr(ts, "constraints", None), "cooldown_active", False):
+                continue
+            candidate_teams.append(tt)
+
+        def _cap_space_key(tid: str) -> Tuple[float, str]:
+            ts = self.tick_ctx.get_team_situation(tid)
+            cs = float(getattr(getattr(ts, "constraints", None), "cap_space", 0.0) or 0.0)
+            return (-cs, tid)
+
+        candidate_teams.sort(key=_cap_space_key)
+        candidate_teams = candidate_teams[: max(1, int(self.cfg.max_three_team_candidate_teams))]
+
+        # Outgoing catalogs
+        fail_out = self.catalog.outgoing_by_team.get(_canon_team_id(failing_team or ""))
+        if fail_out is None:
+            return None
+
+        # Players already used in base offer (avoid duplicates)
+        used_players: Set[str] = set()
+        for assets in base_builder._legs.values():
+            for a in assets:
+                if isinstance(a, PlayerAsset):
+                    used_players.add(_canon_player_id(a.player_id))
+
+        # Dump candidates from failing team (prefer filler/expiring/surplus-low-fit)
+        dump_buckets = ("FILLER_CHEAP", "EXPIRING", "SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT")
+        dump_ids: List[str] = []
+        for b in dump_buckets:
+            dump_ids.extend(list(fail_out.player_ids_by_bucket.get(b, ())))
+        dump_ids = [_canon_player_id(pid) for pid in dump_ids if _canon_player_id(pid) not in used_players]
+
+        # deterministically prefer higher salary dumps (more likely to fix matching)
+        def _salary_key(pid: str) -> Tuple[float, str]:
+            cand = fail_out.players.get(pid)
+            sal = float(getattr(cand, "salary_m", 0.0) or 0.0)
+            return (-sal, pid)
+
+        dump_ids.sort(key=_salary_key)
+        dump_ids = dump_ids[: max(1, int(self.cfg.max_three_team_attempts))]
+
+        # Small pick pool for compensating third team
+        second_pick_ids = list(fail_out.pick_ids_by_bucket.get("SECOND", ()))
+        first_safe_ids = list(fail_out.pick_ids_by_bucket.get("FIRST_SAFE", ()))
+
+        for third in candidate_teams:
+            third_out = self.catalog.outgoing_by_team.get(third)
+            if third_out is None:
+                continue
+
+            # third sends out a filler to counterparty to avoid outgoing_required
+            third_send_ids: List[str] = []
+            for b in ("FILLER_CHEAP", "EXPIRING", "SURPLUS_LOW_FIT"):
+                third_send_ids.extend(list(third_out.player_ids_by_bucket.get(b, ())))
+            third_send_ids = [_canon_player_id(pid) for pid in third_send_ids if _canon_player_id(pid) not in used_players]
+            # prefer low-ish salary (realism) but not necessarily minimum (needs to satisfy third's own matching)
+            def _third_salary_key(pid: str) -> Tuple[float, str]:
+                cand = third_out.players.get(pid)
+                sal = float(getattr(cand, "salary_m", 0.0) or 0.0)
+                return (-sal, pid)
+            third_send_ids.sort(key=_third_salary_key)
+            third_send_ids = third_send_ids[:8]
+
+            for dump_pid in dump_ids:
+                for third_pid in third_send_ids:
+                    # Build 3-team deal candidate
+                    mb = _MultiTeamDealBuilder([initiator, counterparty, third])
+                    # copy base offer legs (preserving explicit to_team)
+                    for sender, assets in base_builder._legs.items():
+                        for a in assets:
+                            if isinstance(a, PlayerAsset):
+                                mb.add_player(sender, a.player_id, to_team=str(a.to_team))
+                            elif isinstance(a, PickAsset):
+                                mb.add_pick(sender, str(a.pick_id), to_team=str(a.to_team), protection=getattr(a, "protection", None))
+                            elif isinstance(a, SwapAsset):
+                                mb.add_swap(sender, self._resolve_swap_candidate(a.swap_id), to_team=str(a.to_team))
+
+                    # failing team dumps a player to third (increases outgoing_salary for failing team)
+                    mb.add_player(failing_team, dump_pid, to_team=third)
+                    # third sends a filler to counterparty
+                    mb.add_player(third, third_pid, to_team=counterparty)
+
+                    # compensate third with smallest available pick(s) from failing team
+                    if second_pick_ids:
+                        mb.add_pick(failing_team, second_pick_ids[0], to_team=third)
+                    elif first_safe_ids:
+                        mb.add_pick(failing_team, first_safe_ids[0], to_team=third)
+
+                    # Cheap shape constraints (reuse existing prunes)
+                    if mb.total_players_moved() > self.cfg.max_total_players_moved:
+                        continue
+                    if mb.count_players_out(initiator) > self.cfg.max_players_moved_per_team:
+                        continue
+                    if mb.count_players_out(counterparty) > self.cfg.max_players_moved_per_team:
+                        continue
+                    if mb.count_players_out(third) > self.cfg.max_players_moved_per_team:
+                        continue
+                    if not self._second_apron_shape_ok(mb, initiator) or not self._second_apron_shape_ok(mb, counterparty) or not self._second_apron_shape_ok(mb, third):
+                        continue
+                    if not self._aggregation_shape_ok(mb, initiator) or not self._aggregation_shape_ok(mb, counterparty) or not self._aggregation_shape_ok(mb, third):
+                        continue
+                    if not self._stepien_ok(mb, initiator) or not self._stepien_ok(mb, counterparty) or not self._stepien_ok(mb, third):
+                        continue
+
+                    # Validate + evaluate all 3 teams
+                    try:
+                        deal = mb.build(meta={"gen_mode": mode, "target": target_pid, "three_team": True, "third_team": third})
+                        fp = _deal_fingerprint(deal)
+                        if fp in self._seen_deals:
+                            self._stats_inc("duplicate_prunes", 1)
+                            continue
+                        self._seen_deals.add(fp)
+                        self._stats_inc("deals_built", 1)
+
+                        self.tick_ctx.validate_deal(deal, integrity_check=False)
+                        self._validation_count += 1
+                        self._stats_inc("validations", 1)
+
+                        eval_one = getattr(self.tick_ctx, "evaluate_deal_for_team", None)
+
+                        def _eval(team_id: str) -> Tuple[DealDecision, TeamDealEvaluation]:
+                            if callable(eval_one):
+                                return eval_one(
+                                    deal,
+                                    team_id,
+                                    include_breakdown=False,
+                                    include_package_effects=True,
+                                    allow_counter=False,
+                                    rng=self.rng,
+                                    rng_seed=None,
+                                    validate=False,
+                                )
+                            from ..valuation.service import evaluate_deal_for_team as _eval_deal_for_team
+                            return _eval_deal_for_team(
+                                deal,
+                                team_id,
+                                tick_ctx=self.tick_ctx,
+                                include_breakdown=False,
+                                include_package_effects=True,
+                                allow_counter=False,
+                                rng=self.rng,
+                                rng_seed=None,
+                                validate=False,
+                            )
+
+                        if self._evaluation_count + 3 > self.cfg.max_evaluations:
+                            return None
+
+                        a_dec, a_eval = _eval(initiator)
+                        self._evaluation_count += 1
+                        self._stats_inc("evaluations", 1)
+                        if not _is_accept(a_dec):
+                            continue
+
+                        b_dec, b_eval = _eval(counterparty)
+                        self._evaluation_count += 1
+                        self._stats_inc("evaluations", 1)
+                        if not _is_accept(b_dec):
+                            continue
+
+                        c_dec, c_eval = _eval(third)
+                        self._evaluation_count += 1
+                        self._stats_inc("evaluations", 1)
+                        if not _is_accept(c_dec):
+                            continue
+
+                        # Success
+                        self._stats_inc("three_team_success", 1)
+                        score = self._score_deal_three_team(
+                            initiator=initiator,
+                            initiator_eval=a_eval,
+                            counterparty_eval=b_eval,
+                            third_eval=c_eval,
+                            builder=mb,
+                        )
+                        return GeneratedDeal(
+                            deal=deal,
+                            initiator_team_id=initiator,
+                            counterparty_team_id=counterparty,
+                            mode=mode,
+                            target_player_id=target_pid,
+                            score=score,
+                            initiator_decision=a_dec,
+                            initiator_eval=a_eval,
+                            counterparty_decision=b_dec,
+                            counterparty_eval=b_eval,
+                            meta={
+                                "fingerprint": fp,
+                                "three_team": True,
+                                "third_team_id": third,
+                                "third_decision": str(getattr(c_dec, "kind", c_dec)),
+                                "third_net_surplus": float(getattr(c_eval, "net_surplus", 0.0) or 0.0),
+                            },
+                        )
+                    except TradeError:
+                        self._validation_count += 1
+                        self._stats_inc("validations", 1)
+                        continue
+                    except Exception:
+                        continue
+        return None
+
+    def _resolve_swap_candidate(self, swap_id: str) -> SwapTradeCandidate:
+        """Resolve a SwapTradeCandidate from catalog by swap_id (best-effort)."""
+        sid = str(swap_id)
+        # Search through teams' swap maps deterministically; this is rare (only for copy).
+        for tid in sorted(self.catalog.outgoing_by_team.keys()):
+            cat = self.catalog.outgoing_by_team.get(tid)
+            if not cat:
+                continue
+            sw = cat.swaps.get(sid)
+            if sw is not None:
+                return sw
+        # Fallback: fabricate minimal (should fail validation if truly unknown)
+        return SwapTradeCandidate(swap_id=sid, pick_id_a="", pick_id_b="", market_total=0.0)
+
+    def _score_deal_three_team(
+        self,
+        *,
+        initiator: str,
+        initiator_eval: TeamDealEvaluation,
+        counterparty_eval: TeamDealEvaluation,
+        third_eval: TeamDealEvaluation,
+        builder: _MultiTeamDealBuilder,
+    ) -> float:
+        """Rank 3-team deals: prioritize initiator surplus but penalize complexity more."""
+        s0 = float(getattr(initiator_eval, "net_surplus", 0.0) or 0.0)
+        s1 = float(getattr(counterparty_eval, "net_surplus", 0.0) or 0.0)
+        s2 = float(getattr(third_eval, "net_surplus", 0.0) or 0.0)
+
+        # lopsidedness penalty relative to worst other side
+        lopsided = abs(s0 - min(s1, s2))
+        lopsided_pen = 0.12 * max(0.0, lopsided - 6.0)
+
+        player_pen = 1.1 * float(builder.total_players_moved())
+        pick_pen = 0.35 * float(sum(len(builder.pick_ids_out(t)) for t in builder.teams))
+        complexity_pen = 1.5  # extra fixed penalty for 3-team coordination
+        return s0 + 0.05 * (s1 + s2) - lopsided_pen - player_pen - pick_pen - complexity_pen
 
     # ------------------------
     # Repairs / sweeteners
@@ -1453,6 +1959,7 @@ class DealGenerator:
         counterparty_eval: TeamDealEvaluation,
     ) -> Optional[_BilateralDealBuilder]:
         """If receiver is close, add picks from giver in small steps."""
+        self._stats_inc("sweetener_attempts", 1)
         shortfall = self._shortfall_amount(counterparty_dec, counterparty_eval)
         if shortfall <= 0:
             return None
