@@ -333,8 +333,10 @@ class DealGenerator:
         # Swap pricing cache (for sweeteners)
         self._swap_value_cache: Dict[str, float] = {}
         self._market_pricer = None  # lazy MarketPricer
-
+        # Fingerprints attempted this tick (includes invalid attempts to avoid repeated invalid spam).
         self._seen_deals: Set[str] = set()
+        # Fingerprints that validated successfully (useful for debugging/telemetry).
+        self._seen_valid_deals: Set[str] = set()
         self._validation_count = 0
         self._evaluation_count = 0
 
@@ -778,14 +780,11 @@ class DealGenerator:
         ts_s = self.tick_ctx.get_team_situation(seller)
         dc_b = self.tick_ctx.get_decision_context(buyer)
         dc_s = self.tick_ctx.get_decision_context(seller)
-
-        # Second apron (hard): enforce 1 outgoing player for that team.
-        b_second = str(getattr(getattr(ts_b, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
-        s_second = str(getattr(getattr(ts_s, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
+        # NOTE: Second-apron 1-for-1 is enforced using payroll_after semantics in _second_apron_shape_ok().
 
         target_salary_m = float(target.salary_m or 0.0)
         cap_space = float(getattr(getattr(ts_b, "constraints", None), "cap_space", 0.0) or 0.0) / 1_000_000.0
-        can_picks_only = (cap_space >= target_salary_m - 0.25) and not b_second
+        can_picks_only = (cap_space >= target_salary_m - 0.25)
 
         # Desired return market value heuristic (seller perspective).
         min_surplus = float(getattr(getattr(dc_s, "knobs", None), "min_surplus_required", 0.0) or 0.0)
@@ -836,7 +835,7 @@ class DealGenerator:
             to_team=seller,
             required_salary_m=target_salary_m,
             team_out=b_out,
-            single_player_only=b_second,
+            single_player_only=False,
         )
         if filler is not None:
             b.add_player(buyer, filler.player_id, to_team=seller)
@@ -844,7 +843,7 @@ class DealGenerator:
         seeds.append(b)
 
         # Seed C: consolidation piece + smaller picks (buyers often send a mid piece)
-        mid_piece = self._choose_consolidation_piece(buyer, seller, b_out, single_player_only=b_second)
+        mid_piece = self._choose_consolidation_piece(buyer, seller, b_out, single_player_only=False)
         if mid_piece is not None:
             b2 = _BilateralDealBuilder(buyer, seller)
             b2.add_player(seller, target.player_id, to_team=buyer)
@@ -868,8 +867,6 @@ class DealGenerator:
         dc_b = self.tick_ctx.get_decision_context(buyer)
         ts_s = self.tick_ctx.get_team_situation(seller)
         dc_s = self.tick_ctx.get_decision_context(seller)
-
-        b_second = str(getattr(getattr(ts_b, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
 
         desired = float(sell_cand.market.total)  # baseline
         min_surplus_buyer = float(getattr(getattr(dc_b, "knobs", None), "min_surplus_required", 0.0) or 0.0)
@@ -905,7 +902,7 @@ class DealGenerator:
 
         # Seed A: buyer sends picks only if cap room.
         cap_space_m = float(getattr(getattr(ts_b, "constraints", None), "cap_space", 0.0) or 0.0) / 1_000_000.0
-        if cap_space_m >= float(sell_cand.salary_m or 0.0) - 0.25 and not b_second:
+        if cap_space_m >= float(sell_cand.salary_m or 0.0) - 0.25:
             b = _BilateralDealBuilder(seller, buyer)
             b.add_player(seller, sell_cand.player_id, to_team=buyer)
             self._add_picks_for_value(b, from_team=buyer, to_team=seller, desired_value=desired, b_out=b_out)
@@ -919,7 +916,7 @@ class DealGenerator:
             to_team=seller,
             required_salary_m=float(sell_cand.salary_m or 0.0),
             team_out=b_out,
-            single_player_only=b_second,
+            single_player_only=False,
         )
         if filler is not None:
             b.add_player(buyer, filler.player_id, to_team=seller)
@@ -979,11 +976,13 @@ class DealGenerator:
                 fp = _deal_fingerprint(deal)
                 if fp in self._seen_deals:
                     return None
+                # Record attempted fingerprints even if validation fails, to avoid repeated invalid spam.
+                self._seen_deals.add(fp)
 
                 stage = "validate/evaluate"
                 self.tick_ctx.validate_deal(deal, integrity_check=False)
                 self._validation_count += 1
-                self._seen_deals.add(fp)
+                self._seen_valid_deals.add(fp)
                 # Evaluate (initiator-first to save work on obvious rejects)
                 if self._evaluation_count >= self.cfg.max_evaluations:
                     return None
@@ -1194,12 +1193,6 @@ class DealGenerator:
         if out is None:
             return None
 
-        # If team is 2nd apron, cannot add players beyond 1.
-        ts = self.tick_ctx.get_team_situation(team)
-        second = str(getattr(getattr(ts, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
-        if second and builder.count_players_out(team) >= 1:
-            return None
-
         # If an aggregation-solo-only player is already outgoing, cannot add another.
         if not self._aggregation_shape_ok(builder, team):
             return None
@@ -1317,6 +1310,9 @@ class DealGenerator:
             return None
         if not self._aggregation_shape_ok(nb, team):
             return None
+        # Enforce second-apron 1-for-1 using payroll_after semantics.
+        if (not self._second_apron_shape_ok(nb, team)) or (not self._second_apron_shape_ok(nb, other)):
+            return None
         return nb
 
     def _salary_allowed_in(
@@ -1390,11 +1386,6 @@ class DealGenerator:
             return None
         other = builder._other(t)
 
-        ts = self.tick_ctx.get_team_situation(t)
-        second = str(getattr(getattr(ts, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
-        if second and builder.count_players_out(t) >= 1:
-            return None
-
         existing = {a.player_id for a in builder._legs.get(t, []) if isinstance(a, PlayerAsset)}
         for b in ["FILLER_CHEAP", "EXPIRING", "SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT"]:
             for pid in out.player_ids_by_bucket.get(b, ()):
@@ -1412,6 +1403,8 @@ class DealGenerator:
                 if nb.total_players_moved() > self.cfg.max_total_players_moved:
                     continue
                 if not self._aggregation_shape_ok(nb, t):
+                    continue
+                if (not self._second_apron_shape_ok(nb, t)) or (not self._second_apron_shape_ok(nb, other)):
                     continue
                 return nb
         return None
@@ -1520,13 +1513,70 @@ class DealGenerator:
     # Cheap feasibility checks
     # ------------------------
 
-    def _second_apron_shape_ok(self, builder: _BilateralDealBuilder, team: str) -> bool:
+    def _team_salary_totals(self, builder: _BilateralDealBuilder, team: str) -> Tuple[float, float, float, float]:
+        """Return (payroll_before, outgoing_salary, incoming_salary, payroll_after) in dollars.
+
+        Uses TradeRuleTickContext.ensure_active_roster_index() (SSOT for salaries/payroll).
+        """
         t = _canon_team_id(team)
-        ts = self.tick_ctx.get_team_situation(t)
-        second = str(getattr(getattr(ts, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
-        if not second:
+        rtc = getattr(self.tick_ctx, "rule_tick_ctx", None)
+        if rtc is None:
+            return 0.0, 0.0, 0.0, 0.0
+        try:
+            rtc.ensure_active_roster_index()
+        except Exception:
+            pass
+
+        payroll_before = float(getattr(rtc, "team_payroll_before_map", {}).get(t, 0.0) or 0.0)
+        sal_map = getattr(rtc, "player_salary_map", {}) or {}
+
+        outgoing_ids = [
+            _canon_player_id(a.player_id)
+            for a in builder._legs.get(t, [])
+            if isinstance(a, PlayerAsset)
+        ]
+        incoming_ids = [
+            _canon_player_id(a.player_id)
+            for sender, assets in builder._legs.items()
+            if sender != t
+            for a in assets
+            if isinstance(a, PlayerAsset) and _canon_team_id(getattr(a, "to_team", None) or "") == t
+        ]
+
+        outgoing_salary = float(sum(float(sal_map.get(pid) or 0.0) for pid in outgoing_ids))
+        incoming_salary = float(sum(float(sal_map.get(pid) or 0.0) for pid in incoming_ids))
+        payroll_after = payroll_before - outgoing_salary + incoming_salary
+        return payroll_before, outgoing_salary, incoming_salary, payroll_after
+
+    def _resolve_apron_status_after(self, payroll_after: float) -> str:
+        """Resolve apron status using the same semantics as SalaryMatchingRule (_resolve_apron_status)."""
+        league = (getattr(getattr(self.tick_ctx, "rule_tick_ctx", None), "ctx_state_base", {}) or {}).get("league", {})
+        trade_rules = (league or {}).get("trade_rules", {}) or {}
+        first_apron = float(trade_rules.get("first_apron") or 0.0)
+        second_apron = float(trade_rules.get("second_apron") or 0.0)
+        if payroll_after >= second_apron:
+            return "SECOND_APRON"
+        if payroll_after >= first_apron:
+            return "FIRST_APRON"
+        return "BELOW_FIRST_APRON"
+
+    def _requires_second_apron_one_for_one(self, builder: _BilateralDealBuilder, team: str) -> bool:
+        """True iff the team is SECOND_APRON after the deal *and* is taking in salary."""
+        _, _, incoming_salary, payroll_after = self._team_salary_totals(builder, team)
+        if incoming_salary <= 0.0:
+            return False
+        return self._resolve_apron_status_after(float(payroll_after)) == "SECOND_APRON"
+
+    def _second_apron_shape_ok(self, builder: _BilateralDealBuilder, team: str) -> bool:
+        """Cheap prune matching SalaryMatchingRule semantics.
+
+        SalaryMatchingRule enforces 1-for-1 only when payroll_after is in SECOND_APRON
+        and the team is taking in salary (incoming_salary > 0).
+        """
+        t = _canon_team_id(team)
+        if not self._requires_second_apron_one_for_one(builder, t):
             return True
-        # Rule semantics: ABOVE_2ND_APRON teams must be 1-for-1 (<=1 outgoing player AND <=1 incoming player).
+        # 1-for-1: <=1 outgoing player AND <=1 incoming player.
         if builder.count_players_out(t) > 1:
             return False
         if builder.count_players_in(t) > 1:
