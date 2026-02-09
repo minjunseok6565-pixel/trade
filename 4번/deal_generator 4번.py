@@ -27,8 +27,10 @@ Scope
 from dataclasses import dataclass, field
 from datetime import date
 import hashlib
+import logging
 import math
 import random
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from schema import normalize_player_id, normalize_team_id
@@ -48,6 +50,8 @@ from .asset_catalog import (
     SwapTradeCandidate,
 )
 
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Public output
@@ -249,12 +253,38 @@ class _BilateralDealBuilder:
         t = _canon_team_id(team)
         return sum(1 for a in self._legs.get(t, []) if isinstance(a, PlayerAsset))
 
+    def count_players_in(self, team: str) -> int:
+        """Number of incoming PlayerAsset objects for `team` (bilateral).
+
+        We count player assets whose `to_team` resolves to `team` and that originate from
+        the other leg.
+        """
+        t = _canon_team_id(team)
+        return sum(
+            1
+            for sender, assets in self._legs.items()
+            if sender != t
+            for a in assets
+            if isinstance(a, PlayerAsset) and _canon_team_id(getattr(a, "to_team", None) or "") == t
+        )
+
     def total_players_moved(self) -> int:
         return self.count_players_out(self.team_a) + self.count_players_out(self.team_b)
 
     def pick_ids_out(self, team: str) -> Set[str]:
         t = _canon_team_id(team)
         return {a.pick_id for a in self._legs.get(t, []) if isinstance(a, PickAsset)}
+
+    def pick_ids_in(self, team: str) -> Set[str]:
+        """Pick ids incoming to `team` (i.e., sent by the other team to this team)."""
+        t = _canon_team_id(team)
+        return {
+            a.pick_id
+            for sender, assets in self._legs.items()
+            if sender != t
+            for a in assets
+            if isinstance(a, PickAsset) and _canon_team_id(getattr(a, "to_team", None) or "") == t
+        }
 
     def build(self, *, meta: Optional[Dict[str, Any]] = None) -> Deal:
         d = Deal(teams=[self.team_a, self.team_b], legs={self.team_a: list(self._legs[self.team_a]), self.team_b: list(self._legs[self.team_b])}, meta=dict(meta or {}))
@@ -285,6 +315,9 @@ class DealGenerator:
         self.catalog = _resolve_asset_catalog(tick_ctx, asset_catalog)
         self.cfg = config or DealGeneratorConfig()
 
+        self._external_rng = rng is not None
+        self._base_seed: Optional[int] = None
+
         if rng is not None:
             self.rng = rng
         else:
@@ -294,7 +327,12 @@ class DealGenerator:
                 # Deterministic per tick by default.
                 cd: date = getattr(tick_ctx, "current_date", date.today())
                 seed = int(cd.toordinal())
-            self.rng = random.Random(seed)
+            self._base_seed = int(seed)
+            self.rng = random.Random(int(seed))
+
+        # Swap pricing cache (for sweeteners)
+        self._swap_value_cache: Dict[str, float] = {}
+        self._market_pricer = None  # lazy MarketPricer
 
         self._seen_deals: Set[str] = set()
         self._validation_count = 0
@@ -321,6 +359,20 @@ class DealGenerator:
         if getattr(getattr(ts, "constraints", None), "cooldown_active", False):
             return []
 
+        # Use a deterministic *team-scoped* RNG stream by default.
+        # This avoids different teams producing overly synchronized random patterns when the
+        # orchestrator instantiates a generator per team.
+        if (not self._external_rng) and (self._base_seed is not None):
+            with self._scoped_rng(self._team_rng(initiator)):
+                results = self._generate_deals_for_team_mode(initiator, mode)
+        else:
+            results = self._generate_deals_for_team_mode(initiator, mode)
+
+        results.sort(key=lambda x: (-x.score, x.counterparty_team_id, x.target_player_id or ""))
+        return results[: self.cfg.max_results]
+
+    def _generate_deals_for_team_mode(self, initiator: str, mode: str) -> List[GeneratedDeal]:
+        """Internal helper to generate deals; assumes self.rng is already configured."""
         results: List[GeneratedDeal] = []
 
         if mode == "BUY":
@@ -344,8 +396,101 @@ class DealGenerator:
                     if self._should_stop(results):
                         break
 
-        results.sort(key=lambda x: (-x.score, x.counterparty_team_id, x.target_player_id or ""))
-        return results[: self.cfg.max_results]
+        return results
+
+    def _derive_team_seed(self, team_id: str, *, salt: str = "dealgen") -> int:
+        base = str(self._base_seed if self._base_seed is not None else 0)
+        tid = _canon_team_id(team_id)
+        raw = f"{base}|{tid}|{salt}"
+        h = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        # Use a stable 32-bit integer seed.
+        return int(h[:8], 16)
+
+    def _team_rng(self, team_id: str) -> random.Random:
+        return random.Random(self._derive_team_seed(team_id))
+
+    @contextmanager
+    def _scoped_rng(self, rng: random.Random):
+        old = self.rng
+        self.rng = rng
+        try:
+            yield
+        finally:
+            self.rng = old
+
+    def _log_internal_exception(
+        self,
+        exc: Exception,
+        *,
+        stage: str,
+        initiator: str,
+        counterparty: str,
+        fp: Optional[str] = None,
+    ) -> None:
+        try:
+            logger.exception(
+                "DealGenerator internal error at %s (initiator=%s counterparty=%s fp=%s)",
+                stage,
+                initiator,
+                counterparty,
+                fp,
+                exc_info=exc,
+            )
+        except Exception:
+            # Never let logging crash generation.
+            pass
+
+    def _estimate_swap_market_value(self, swap: SwapTradeCandidate) -> float:
+        """Estimate swap market value using MarketPricer + provider snapshots (cached per tick).
+
+        If pricing fails for any reason, fall back to a conservative constant.
+        """
+        sid = str(getattr(swap, "swap_id", "") or "")
+        if not sid:
+            return 2.0
+        cached = self._swap_value_cache.get(sid)
+        if cached is not None:
+            return float(cached)
+
+        # Lazy import/initialization to avoid import cycles at module load time.
+        try:
+            if self._market_pricer is None:
+                from ..valuation.market_pricing import MarketPricer
+
+                self._market_pricer = MarketPricer()
+
+            provider = getattr(self.tick_ctx, "provider", None)
+            if provider is None:
+                raise AttributeError("tick_ctx.provider missing")
+
+            snap = getattr(swap, "snap", None)
+            if snap is None:
+                raise AttributeError("swap.snap missing")
+
+            pick_a = provider.get_pick_snapshot(str(getattr(snap, "pick_id_a", "") or ""))
+            pick_b = provider.get_pick_snapshot(str(getattr(snap, "pick_id_b", "") or ""))
+            exp_a = provider.get_pick_expectation(pick_a.pick_id)
+            exp_b = provider.get_pick_expectation(pick_b.pick_id)
+
+            mv = self._market_pricer.price_snapshot(
+                snap,
+                asset_key=f"swap:{sid}",
+                resolved_pick_a=pick_a,
+                resolved_pick_b=pick_b,
+                resolved_pick_a_expectation=exp_a,
+                resolved_pick_b_expectation=exp_b,
+            )
+            now = float(getattr(getattr(mv, "value", None), "now", 0.0) or 0.0)
+            fut = float(getattr(getattr(mv, "value", None), "future", 0.0) or 0.0)
+            total = now + fut
+
+            # Conservative dampening/clamp: avoid over-using swaps as cheap fillers.
+            total = _clamp(total * 0.75, 0.5, 8.0)
+        except Exception:
+            total = 2.0
+
+        self._swap_value_cache[sid] = float(total)
+        return float(total)
 
     # ------------------------
     # Target selection
@@ -959,6 +1104,12 @@ class DealGenerator:
                     break
                 cur = fixed
                 continue
+            except Exception as e:
+                # Unknown error (bug, unexpected snapshot shape, etc.).
+                # Do not allow generation to crash the orchestration tick.
+                self._validation_count += 1
+                self._log_internal_exception(e, stage="validate/evaluate", initiator=initiator, counterparty=counterparty, fp=fp)
+                return None
 
         # Failed to produce a valid/evaluable deal.
         _ = last_err
@@ -1339,7 +1490,8 @@ class DealGenerator:
                 pick: PickTradeCandidate = obj
                 # Stepien precheck after adding this pick.
                 outgoing = set(nb.pick_ids_out(giver)) | {pick.pick_id}
-                if not self.catalog.stepien.is_compliant_after(team_id=giver, outgoing_pick_ids=outgoing, incoming_pick_ids=set()):
+                incoming = set(nb.pick_ids_in(giver))
+                if not self.catalog.stepien.is_compliant_after(team_id=giver, outgoing_pick_ids=outgoing, incoming_pick_ids=incoming):
                     continue
                 nb.add_pick(giver, pick.pick_id, to_team=receiver, protection=pick.snap.protection)
                 added += 1
@@ -1370,7 +1522,12 @@ class DealGenerator:
         second = str(getattr(getattr(ts, "constraints", None), "apron_status", "")) == "ABOVE_2ND_APRON"
         if not second:
             return True
-        return builder.count_players_out(t) <= 1  # outgoing player count only; incoming handled in salary rule
+        # Rule semantics: ABOVE_2ND_APRON teams must be 1-for-1 (<=1 outgoing player AND <=1 incoming player).
+        if builder.count_players_out(t) > 1:
+            return False
+        if builder.count_players_in(t) > 1:
+            return False
+        return True
 
     def _aggregation_shape_ok(self, builder: _BilateralDealBuilder, team: str) -> bool:
         """If any outgoing player is aggregation-solo-only, outgoing player count must be <= 1."""
@@ -1392,7 +1549,8 @@ class DealGenerator:
         outgoing = set(builder.pick_ids_out(t))
         if not outgoing:
             return True
-        return bool(self.catalog.stepien.is_compliant_after(team_id=t, outgoing_pick_ids=outgoing, incoming_pick_ids=set()))
+        incoming = set(builder.pick_ids_in(t))
+        return bool(self.catalog.stepien.is_compliant_after(team_id=t, outgoing_pick_ids=outgoing, incoming_pick_ids=incoming))
 
     # ------------------------
     # Candidate selection helpers
@@ -1719,7 +1877,8 @@ class DealGenerator:
                     continue
                 # Stepien precheck after adding.
                 outgoing = set(builder.pick_ids_out(ft)) | {pid}
-                if not self.catalog.stepien.is_compliant_after(team_id=ft, outgoing_pick_ids=outgoing, incoming_pick_ids=set()):
+                incoming = set(builder.pick_ids_in(ft))
+                if not self.catalog.stepien.is_compliant_after(team_id=ft, outgoing_pick_ids=outgoing, incoming_pick_ids=incoming):
                     continue
 
                 builder.add_pick(ft, pid, to_team=tt, protection=pick.snap.protection)
@@ -1771,9 +1930,9 @@ class DealGenerator:
                     continue
                 if s.lock.is_locked:
                     continue
-                # Swap market is not cached; treat as mid sweetener.
-                # Use a conservative constant so we don't over-use swaps.
-                items.append(("SWAP", 2.0, s))
+                # Estimate swap market value using the same MarketPricer SSOT used by valuation.
+                val = self._estimate_swap_market_value(s)
+                items.append(("SWAP", float(val), s))
 
         items.sort(key=lambda t: (t[1], t[0]))
         return items
