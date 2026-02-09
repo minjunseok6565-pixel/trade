@@ -571,7 +571,6 @@ def _generate_buy_mode(
     seen: Set[str] = set()
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
-    banned_return_pairs: Set[Tuple[str, str]] = set()  # (player_id, to_team)
 
     proposals: List[DealProposal] = []
 
@@ -613,7 +612,6 @@ def _generate_buy_mode(
             budget=budget,
             rng=rng,
             banned_players=banned_players,
-            banned_return_pairs=banned_return_pairs,
         )
 
         if not candidates:
@@ -642,8 +640,15 @@ def _generate_buy_mode(
             if not candidates:
                 continue
 
-        rng.shuffle(candidates)
-        candidates = candidates[: variant_cap]
+        candidates = _beam_select_candidates(
+            candidates,
+            buyer_id=buyer_id,
+            seller_id=seller_id,
+            tick_ctx=tick_ctx,
+            catalog=catalog,
+            rng=rng,
+            cap=variant_cap,
+        )
 
         attempts = 0
         for cand in candidates:
@@ -671,7 +676,6 @@ def _generate_buy_mode(
                 budget=budget,
                 banned_asset_keys=banned_asset_keys,
                 banned_players=banned_players,
-                banned_return_pairs=banned_return_pairs,
                 stats=stats,
             )
             stats.validations += v_used
@@ -687,6 +691,7 @@ def _generate_buy_mode(
                 config=config,
                 tags=tuple(cand2.tags),
                 opponent_repeat_count=int(partner_counts.get(seller_id, 0)),
+                stats=stats,
             )
             stats.evaluations += e_used
             if base_prop is None:
@@ -743,7 +748,6 @@ def _generate_sell_mode(
     seen: Set[str] = set()
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
-    banned_return_pairs: Set[Tuple[str, str]] = set()
 
     proposals: List[DealProposal] = []
     partner_counts: Dict[str, int] = {}
@@ -800,7 +804,6 @@ def _generate_sell_mode(
                 budget=budget,
                 rng=rng,
                 banned_players=banned_players,
-                banned_return_pairs=banned_return_pairs,
             )
 
             if not candidates:
@@ -814,8 +817,15 @@ def _generate_sell_mode(
                 if not candidates:
                     continue
 
-            rng.shuffle(candidates)
-            candidates = candidates[: max(1, int(budget.beam_width))]
+            candidates = _beam_select_candidates(
+                candidates,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                tick_ctx=tick_ctx,
+                catalog=catalog,
+                rng=rng,
+                cap=max(1, int(budget.beam_width)),
+            )
 
             attempts = 0
             for cand in candidates:
@@ -843,7 +853,6 @@ def _generate_sell_mode(
                     budget=budget,
                     banned_asset_keys=banned_asset_keys,
                     banned_players=banned_players,
-                    banned_return_pairs=banned_return_pairs,
                     stats=stats,
                 )
                 stats.validations += v_used
@@ -858,6 +867,7 @@ def _generate_sell_mode(
                     config=config,
                     tags=tuple(cand2.tags),
                     opponent_repeat_count=int(partner_counts.get(buyer_id, 0)),
+                    stats=stats,
                 )
                 stats.evaluations += e_used
                 if base_prop is None:
@@ -974,6 +984,168 @@ def _soft_guard_second_apron_candidates(
         if ok:
             out.append(c)
     return out
+
+
+# =============================================================================
+# Beam selection helpers (cheap heuristic pre-score)
+# =============================================================================
+
+
+def _cap_space_m(ts: Any) -> float:
+    """TeamConstraints.cap_space는 달러 단위로 들어오는 경우가 많아서(프로젝트 코드 기준) M 단위로 변환."""
+    try:
+        c = getattr(ts, "constraints", None)
+        v = float(getattr(c, "cap_space", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    return v / 1_000_000.0
+
+
+def _can_absorb_without_outgoing(ts: Any, incoming_salary_m: float, *, buffer_m: float = 0.25) -> bool:
+    """플레이어를 보내지 않고(incoming only) salary를 흡수 가능한지(=cap space로 커버)."""
+    cap_m = _cap_space_m(ts)
+    return cap_m >= float(incoming_salary_m) + float(buffer_m)
+
+
+def _sum_leg_player_salary_m(
+    deal: Deal, *, team_id: str, out_cat: Optional[TeamOutgoingCatalog]
+) -> float:
+    if out_cat is None:
+        return 0.0
+    s = 0.0
+    for a in deal.legs.get(str(team_id).upper(), []) or []:
+        if isinstance(a, PlayerAsset):
+            c = out_cat.players.get(a.player_id)
+            if c is not None:
+                s += float(c.salary_m)
+    return float(s)
+
+
+def _sum_leg_market_total(
+    deal: Deal, *, team_id: str, out_cat: Optional[TeamOutgoingCatalog]
+) -> float:
+    if out_cat is None:
+        return 0.0
+    s = 0.0
+    for a in deal.legs.get(str(team_id).upper(), []) or []:
+        if isinstance(a, PlayerAsset):
+            c = out_cat.players.get(a.player_id)
+            if c is not None:
+                s += float(c.market.total)
+        elif isinstance(a, PickAsset):
+            p = out_cat.picks.get(a.pick_id)
+            if p is not None:
+                s += float(p.market.total)
+        elif isinstance(a, SwapAsset):
+            # Swap은 catalog에 market이 없으므로(현재 프로젝트 구조) 0으로 둔다.
+            # (beam pre-score용이므로 과도한 추정값을 넣지 않는다)
+            s += 0.0
+    return float(s)
+
+
+def _prescore_candidate(
+    cand: DealCandidate,
+    *,
+    buyer_id: str,
+    seller_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+) -> float:
+    """validate/evaluate 없이 후보를 정렬하기 위한 아주 가벼운 pre-score.
+
+    목표:
+    - 예산이 타이트할 때도 '실현 가능성 높은' 후보가 evaluate까지 올라가게 한다.
+    - 완전 결정적이 되면 다양성이 죽으니, 실제 샘플링은 _beam_select_candidates가 담당.
+    """
+
+    buyer = str(buyer_id).upper()
+    seller = str(seller_id).upper()
+
+    buyer_out = catalog.outgoing_by_team.get(buyer)
+    seller_out = catalog.outgoing_by_team.get(seller)
+
+    d = cand.deal
+    n_assets = sum(len(v) for v in d.legs.values())
+    n_players = sum(1 for leg in d.legs.values() for a in leg if isinstance(a, PlayerAsset))
+
+    score = 0.0
+
+    # 1) 복잡도: 단순할수록 우선
+    score -= 0.10 * max(0, int(n_assets) - 2)
+    score -= 0.08 * max(0, int(n_players) - 2)
+
+    # 2) salary plausibility (양쪽 모두 대충 체크)
+    try:
+        ts_buyer = tick_ctx.get_team_situation(buyer)
+    except Exception:
+        ts_buyer = None
+    try:
+        ts_seller = tick_ctx.get_team_situation(seller)
+    except Exception:
+        ts_seller = None
+
+    buyer_in_m = _sum_leg_player_salary_m(d, team_id=seller, out_cat=seller_out)   # buyer가 받는 salary
+    buyer_out_m = _sum_leg_player_salary_m(d, team_id=buyer, out_cat=buyer_out)    # buyer가 보내는 salary
+    if buyer_in_m > 0.5:
+        gap = abs(float(buyer_out_m) - float(buyer_in_m))
+        score -= 0.55 * (gap / max(1.0, float(buyer_in_m)))
+        # picks-only 류(보내는 선수가 거의 없음)인데 cap space도 없으면 강한 패널티
+        if buyer_out_m < 0.10 and ts_buyer is not None:
+            if not _can_absorb_without_outgoing(ts_buyer, buyer_in_m, buffer_m=0.0):
+                score -= 5.0
+
+    seller_in_m = buyer_out_m
+    seller_out_m = buyer_in_m
+    if seller_out_m > 0.5:
+        gap = abs(float(seller_out_m) - float(seller_in_m))
+        score -= 0.35 * (gap / max(1.0, float(seller_out_m)))
+        if seller_in_m < 0.10 and ts_seller is not None:
+            if not _can_absorb_without_outgoing(ts_seller, seller_in_m, buffer_m=0.0):
+                score -= 2.0
+
+    # 3) 대략적 가치 밸런스(과도한 overpay 후보를 아래로)
+    gain_val = _sum_leg_market_total(d, team_id=seller, out_cat=seller_out)  # buyer가 얻는 가치(상대가 보내는 것)
+    cost_val = _sum_leg_market_total(d, team_id=buyer, out_cat=buyer_out)    # buyer가 지불하는 가치
+    if gain_val > 0.0:
+        rel = (float(gain_val) - float(cost_val)) / max(10.0, float(gain_val))
+        score += 0.80 * rel
+
+    return float(score)
+
+
+def _beam_select_candidates(
+    candidates: List[DealCandidate],
+    *,
+    buyer_id: str,
+    seller_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+    rng: random.Random,
+    cap: int,
+) -> List[DealCandidate]:
+    """랜덤 shuffle+slice 대신: pre-score 정렬 + 제한적 랜덤 샘플링(다양성 유지)."""
+    cap_n = max(1, int(cap))
+    if len(candidates) <= cap_n:
+        return candidates
+
+    scored: List[Tuple[float, float, DealCandidate]] = []
+    for c in candidates:
+        # tie-breaker용 deterministic random
+        scored.append((_prescore_candidate(c, buyer_id=buyer_id, seller_id=seller_id, tick_ctx=tick_ctx, catalog=catalog), rng.random(), c))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    # 상위 일부는 고정, 나머지는 상위 풀에서 랜덤 추출
+    n_fixed = max(2, cap_n // 2)
+    fixed = [c for _, __, c in scored[:n_fixed]]
+
+    pool = [c for _, __, c in scored[n_fixed : min(len(scored), n_fixed + cap_n * 3)]]
+    rng.shuffle(pool)
+
+    out = list(fixed)
+    need = cap_n - len(out)
+    if need > 0:
+        out.extend(pool[:need])
+    return out[:cap_n]
 
 
 # =============================================================================
@@ -1208,7 +1380,6 @@ def build_offer_skeletons_buy(
     budget: DealGeneratorBudget,
     rng: random.Random,
     banned_players: Set[str],
-    banned_return_pairs: Set[Tuple[str, str]],
 ) -> List[DealCandidate]:
     """BUY 모드: target 1명 기준 2~4개 archetype 스켈레톤."""
 
@@ -1225,7 +1396,6 @@ def build_offer_skeletons_buy(
     cand_target = seller_out.players.get(target.player_id)
     if cand_target is not None:
         if str(buyer_id).upper() in set(cand_target.return_ban_teams or ()):
-            banned_return_pairs.add((cand_target.player_id, str(buyer_id).upper()))
             return []
 
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
@@ -1251,30 +1421,32 @@ def build_offer_skeletons_buy(
 
     out: List[DealCandidate] = []
 
-    # archetype 1) picks-only (or picks+cheap)
-    deal1 = _clone_deal(base)
-    # seller rebuild이면 pick을 조금 더
-    max_picks = 2 if str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL") == "REBUILD" else 1
-    _add_pick_package(
-        deal1,
-        from_team=buyer_id,
-        out_cat=buyer_out,
-        catalog=catalog,
-        config=config,
-        rng=rng,
-        prefer=("SECOND", "FIRST_SAFE"),
-        max_picks=max_picks,
-    )
-    out.append(
-        DealCandidate(
-            deal=deal1,
-            buyer_id=buyer_id,
-            seller_id=seller_id,
-            focal_player_id=target.player_id,
-            archetype="picks_only",
-            tags=[f"need:{target.need_tag}", "pkg:picks"],
+    # archetype 1) picks-only
+    # cap space로 흡수 가능한 경우에만 생성(그 외는 salary_matching repair로 억지 변형되는 비율이 높아 현실감/비용에 악영향)
+    if _can_absorb_without_outgoing(ts_buyer, float(target.salary_m)):
+        deal1 = _clone_deal(base)
+        # seller rebuild이면 pick을 조금 더
+        max_picks = 2 if str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL") == "REBUILD" else 1
+        _add_pick_package(
+            deal1,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND", "FIRST_SAFE"),
+            max_picks=max_picks,
         )
-    )
+        out.append(
+            DealCandidate(
+                deal=deal1,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=target.player_id,
+                archetype="picks_only",
+                tags=[f"need:{target.need_tag}", "pkg:picks"],
+            )
+        )
 
     # archetype 2) young + pick (one outgoing player)
     young_id = _pick_youngish_player(
@@ -1400,7 +1572,6 @@ def build_offer_skeletons_sell(
     budget: DealGeneratorBudget,
     rng: random.Random,
     banned_players: Set[str],
-    banned_return_pairs: Set[Tuple[str, str]],
 ) -> List[DealCandidate]:
     """SELL 모드: (seller sends sale_asset.player_id) 기준 BUYER 패키지를 생성."""
 
@@ -1417,7 +1588,6 @@ def build_offer_skeletons_sell(
     c_sale = seller_out.players.get(pid)
     if c_sale is not None:
         if str(buyer_id).upper() in set(c_sale.return_ban_teams or ()):
-            banned_return_pairs.add((c_sale.player_id, str(buyer_id).upper()))
             return []
 
     # base deal: seller sends player to buyer
@@ -1431,42 +1601,45 @@ def build_offer_skeletons_sell(
     )
 
     ts_seller = tick_ctx.get_team_situation(seller_id)
+    ts_buyer = tick_ctx.get_team_situation(buyer_id)
     time_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL")
 
     # soft 2nd apron guard for buyer
     buyer_one_for_one_soft = False
     if config.soft_guard_second_apron_by_constraints:
         try:
-            buyer_one_for_one_soft = str(tick_ctx.get_team_situation(buyer_id).constraints.apron_status) == "ABOVE_2ND_APRON"
+            buyer_one_for_one_soft = str(ts_buyer.constraints.apron_status) == "ABOVE_2ND_APRON"
         except Exception:
             buyer_one_for_one_soft = False
 
     out: List[DealCandidate] = []
 
     # archetype 1) buyer picks package to seller
-    deal1 = _clone_deal(base)
-    # rebuild seller는 picks 선호
-    max_picks = 2 if time_horizon == "REBUILD" else 1
-    _add_pick_package(
-        deal1,
-        from_team=buyer_id,
-        out_cat=buyer_out,
-        catalog=catalog,
-        config=config,
-        rng=rng,
-        prefer=("SECOND", "FIRST_SAFE"),
-        max_picks=max_picks,
-    )
-    out.append(
-        DealCandidate(
-            deal=deal1,
-            buyer_id=buyer_id,
-            seller_id=seller_id,
-            focal_player_id=pid,
-            archetype="buyer_picks",
-            tags=[f"match:{match_tag}", "pkg:picks"],
+    # buyer가 선수 없이 salary를 흡수할 cap space가 있을 때만 생성
+    if _can_absorb_without_outgoing(ts_buyer, float(sale_asset.salary_m)):
+        deal1 = _clone_deal(base)
+        # rebuild seller는 picks 선호
+        max_picks = 2 if time_horizon == "REBUILD" else 1
+        _add_pick_package(
+            deal1,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND", "FIRST_SAFE"),
+            max_picks=max_picks,
         )
-    )
+        out.append(
+            DealCandidate(
+                deal=deal1,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=pid,
+                archetype="buyer_picks",
+                tags=[f"match:{match_tag}", "pkg:picks"],
+            )
+        )
 
     # archetype 2) buyer young + pick
     young_id = _pick_youngish_player(
@@ -1656,26 +1829,32 @@ def expand_variants(
         )
 
     # --- archetype: picks-only variants
-    # (SECOND) / (SECOND+SECOND) / (FIRST_SAFE) / (FIRST_SAFE+SECOND)
-    pick_plans: List[Tuple[Tuple[str, ...], int]] = [
-        (("SECOND",), 1),
-        (("SECOND", "SECOND"), 2),
-        (("FIRST_SAFE",), 1),
-        (("FIRST_SAFE", "SECOND"), 2),
-    ]
-    for prefer, max_picks in pick_plans:
-        d = _base_deal()
-        _add_pick_package(
-            d,
-            from_team=buyer,
-            out_cat=buyer_out,
-            catalog=catalog,
-            rng=rng,
-            prefer=prefer,
-            max_picks=max_picks,
-            config=config,
-        )
-        _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
+    # cap space 흡수 가능할 때만
+    try:
+        ts_buyer = tick_ctx.get_team_situation(buyer)
+    except Exception:
+        ts_buyer = None
+    if ts_buyer is not None and _can_absorb_without_outgoing(ts_buyer, float(target.salary_m)):
+        # (SECOND) / (SECOND+SECOND) / (FIRST_SAFE) / (FIRST_SAFE+SECOND)
+        pick_plans: List[Tuple[Tuple[str, ...], int]] = [
+            (("SECOND",), 1),
+            (("SECOND", "SECOND"), 2),
+            (("FIRST_SAFE",), 1),
+            (("FIRST_SAFE", "SECOND"), 2),
+        ]
+        for prefer, max_picks in pick_plans:
+            d = _base_deal()
+            _add_pick_package(
+                d,
+                from_team=buyer,
+                out_cat=buyer_out,
+                catalog=catalog,
+                rng=rng,
+                prefer=prefer,
+                max_picks=max_picks,
+                config=config,
+            )
+            _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
     # --- archetype: young + pick variants (top 2 youngish)
     young_ids = _top_k_youngish_players(buyer_out, k=2, banned_players=banned_players)
@@ -1831,7 +2010,6 @@ def repair_until_valid(
     budget: DealGeneratorBudget,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
-    banned_return_pairs: Set[Tuple[str, str]],
     stats: DealGeneratorStats,
 ) -> Tuple[bool, Optional[DealCandidate], int]:
     """validate -> 실패 유형에 따라 최대 budget.max_repairs회 repair.
@@ -1855,7 +2033,7 @@ def repair_until_valid(
             stats.bump_failure(str(failure.kind.value))
 
             if cand.repairs_used >= int(budget.max_repairs):
-                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_return_pairs)
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players)
                 return False, None, validations_used
 
             repaired = repair_once(
@@ -1866,10 +2044,9 @@ def repair_until_valid(
                 config=config,
                 banned_asset_keys=banned_asset_keys,
                 banned_players=banned_players,
-                banned_return_pairs=banned_return_pairs,
             )
             if not repaired:
-                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_return_pairs)
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players)
                 return False, None, validations_used
 
             cand.repairs_used += 1
@@ -1878,6 +2055,11 @@ def repair_until_valid(
             # repair 후 shape check
             if not _shape_ok(cand.deal, config=config, catalog=catalog):
                 return False, None, validations_used
+        except Exception:
+            # 상업용 루프: 예상 못한 예외로 tick이 죽지 않게 방어
+            validations_used += 1
+            stats.bump_failure("unexpected_exception_validate")
+            return False, None, validations_used
 
     return False, None, validations_used
 
@@ -1891,7 +2073,6 @@ def repair_once(
     config: DealGeneratorConfig,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
-    banned_return_pairs: Set[Tuple[str, str]],
 ) -> bool:
     """실패 유형에 따라 '최소 수정' 1회 적용.
 
@@ -1925,10 +2106,6 @@ def repair_once(
         return False
 
     if failure.kind == RuleFailureKind.RETURN_TO_TRADING_TEAM:
-        pid = failure.player_id
-        to_team = str(failure.details.get("to_team") or "").upper()
-        if pid and to_team:
-            banned_return_pairs.add((pid, to_team))
         return False
 
     if failure.kind == RuleFailureKind.ROSTER_LIMIT:
@@ -1956,16 +2133,11 @@ def _apply_prune_side_effects(
     failure: RuleFailure,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
-    banned_return_pairs: Set[Tuple[str, str]],
 ) -> None:
     if failure.kind == RuleFailureKind.ASSET_LOCK and failure.asset_key:
         banned_asset_keys.add(failure.asset_key)
     if failure.kind == RuleFailureKind.PLAYER_ELIGIBILITY and failure.player_id and failure.reason == "recent_contract_signing":
         banned_players.add(failure.player_id)
-    if failure.kind == RuleFailureKind.RETURN_TO_TRADING_TEAM and failure.player_id:
-        to_team = str(failure.details.get("to_team") or "").upper()
-        if to_team:
-            banned_return_pairs.add((failure.player_id, to_team))
 
 
 def _repair_salary_matching(
@@ -2286,7 +2458,7 @@ def maybe_apply_sweeteners(
         try:
             tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
             extra_v += 1
-        except TradeError:
+        except Exception:
             # rollback this sweetener (remove last asset from giver leg)
             extra_v += 1
             _rollback_last_asset_from_leg(deal, str(giver).upper())
@@ -2301,6 +2473,7 @@ def maybe_apply_sweeteners(
             config=config,
             tags=tuple(best.tags) + (f"sweetener:{bucket}",),
             opponent_repeat_count=0,
+            stats=stats,
         )
         extra_e += used
         if prop is None:
@@ -2445,6 +2618,7 @@ def evaluate_and_score(
     config: DealGeneratorConfig,
     tags: Tuple[str, ...],
     opponent_repeat_count: int,
+    stats: Optional[DealGeneratorStats] = None,
 ) -> Tuple[Optional[DealProposal], int]:
     """양팀 evaluate_deal_for_team 호출 + score 산정."""
 
@@ -2464,6 +2638,12 @@ def evaluate_and_score(
             validate=False,
         )
     except TradeError:
+        if stats is not None:
+            stats.bump_failure("eval_trade_error")
+        return None, 1
+    except Exception:
+        if stats is not None:
+            stats.bump_failure("unexpected_exception_eval")
         return None, 1
 
     score = score_deal(
