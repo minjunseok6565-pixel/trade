@@ -31,6 +31,7 @@ from __future__ import annotations
 """
 
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 import hashlib
 import json
@@ -46,6 +47,7 @@ from ..errors import (
     PLAYER_NOT_OWNED,
     PICK_NOT_OWNED,
     SWAP_NOT_OWNED,
+    TRADE_DEADLINE_PASSED,
     DUPLICATE_ASSET,
 )
 from ..models import (
@@ -161,7 +163,8 @@ class DealGeneratorConfig:
     rebuild_catalog_when_allow_locked: bool = True
 
     # --- soft guard (invalid 폭발 방지)
-    # 현재 팀이 ABOVE_2ND_APRON이면 multi-player outgoing 스켈레톤을 만들지 않는다(soft).
+    # 딜 적용 후 추정 payroll_after가 second_apron 이상이면 one-for-one 형태만 남긴다(soft).
+    # (SSOT: SalaryMatchingRule은 payroll_after 기반으로 apron status를 판정한다)
     soft_guard_second_apron_by_constraints: bool = True
 
 
@@ -266,6 +269,7 @@ class DealCandidate:
 
 
 class RuleFailureKind(str, Enum):
+    DEADLINE = "deadline"
     SALARY_MATCHING = "salary_matching"
     SECOND_APRON_ONE_FOR_ONE = "second_apron_one_for_one"
     ROSTER_LIMIT = "roster_limit"
@@ -306,6 +310,14 @@ def parse_trade_error(err: TradeError) -> RuleFailure:
         details = dict(err.details)  # shallow copy
 
     # --- code-first
+    if err.code == TRADE_DEADLINE_PASSED:
+        return RuleFailure(
+            kind=RuleFailureKind.DEADLINE,
+            code=err.code,
+            message=err.message,
+            rule_id="deadline",
+            details=details,
+        )
     if err.code == ROSTER_LIMIT:
         return RuleFailure(
             kind=RuleFailureKind.ROSTER_LIMIT,
@@ -452,6 +464,13 @@ class DealGenerator:
             return []
 
         tid = str(team_id).upper()
+
+        # trade deadline hard stop (SSOT: DeadlineRule)
+        deadline = _get_trade_deadline_date(tick_ctx)
+        if deadline is not None and tick_ctx.current_date > deadline:
+            self.last_stats = DealGeneratorStats(mode="SKIP_DEADLINE")
+            return []
+
         ts = tick_ctx.get_team_situation(tid)
 
         # 즉시 중단
@@ -548,6 +567,111 @@ def _compute_seed(cfg: DealGeneratorConfig, tick_ctx: TradeGenerationTickContext
 
 
 # =============================================================================
+# Rule SSOT helpers (trade_rules / apron thresholds)
+# =============================================================================
+
+
+def _trade_rules_map(tick_ctx: TradeGenerationTickContext) -> Mapping[str, Any]:
+    base = getattr(getattr(tick_ctx, "rule_tick_ctx", None), "ctx_state_base", None)
+    if isinstance(base, dict):
+        league = base.get("league") if isinstance(base.get("league"), dict) else {}
+        tr = league.get("trade_rules") if isinstance(league.get("trade_rules"), dict) else {}
+        if isinstance(tr, dict):
+            return tr
+    return {}
+
+
+def _get_trade_deadline_date(tick_ctx: TradeGenerationTickContext) -> Optional[date]:
+    tr = _trade_rules_map(tick_ctx)
+    raw = tr.get("trade_deadline")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except Exception:
+        return None
+
+
+def _get_second_apron_threshold(tick_ctx: TradeGenerationTickContext) -> float:
+    tr = _trade_rules_map(tick_ctx)
+    try:
+        return float(tr.get("second_apron") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _player_salary_dollars(tick_ctx: TradeGenerationTickContext, player_id: str) -> float:
+    # Prefer tick SSOT salary map (dollars). Fallback: asset_catalog salary_m.
+    pid = str(player_id)
+    rt = getattr(tick_ctx, "rule_tick_ctx", None)
+    try:
+        if rt is not None:
+            rt.ensure_active_roster_index()
+            sal = rt.player_salary_map.get(pid)
+            if sal is not None:
+                return float(sal)
+    except Exception:
+        pass
+
+    try:
+        rt.ensure_active_roster_index()  # type: ignore[name-defined]
+        owner = rt.player_team_map.get(pid)  # type: ignore[attr-defined]
+    except Exception:
+        owner = None
+
+    cat = getattr(tick_ctx, "asset_catalog", None)
+    if owner and cat is not None:
+        out = cat.outgoing_by_team.get(str(owner).upper())
+        if out is not None:
+            c = out.players.get(pid)
+            if c is not None:
+                try:
+                    return float(c.salary_m) * 1_000_000.0
+                except Exception:
+                    return 0.0
+    return 0.0
+
+
+def _estimate_team_payroll_after_dollars(
+    tick_ctx: TradeGenerationTickContext,
+    deal: Deal,
+    team_id: str,
+) -> float:
+    # Estimate payroll_after (dollars) for soft 2nd apron guarding.
+    tid = str(team_id).upper()
+    rt = getattr(tick_ctx, "rule_tick_ctx", None)
+    payroll_before = 0.0
+    if rt is not None:
+        try:
+            rt.ensure_active_roster_index()
+            payroll_before = float(rt.team_payroll_before_map.get(tid, 0.0))
+        except Exception:
+            payroll_before = 0.0
+
+    if payroll_before <= 0.0:
+        try:
+            ts = tick_ctx.get_team_situation(tid)
+            payroll_before = float(getattr(getattr(ts, "constraints", None), "payroll", 0.0) or 0.0)
+        except Exception:
+            payroll_before = 0.0
+
+    outgoing = 0.0
+    for a in deal.legs.get(tid, []) or []:
+        if isinstance(a, PlayerAsset):
+            outgoing += _player_salary_dollars(tick_ctx, a.player_id)
+
+    incoming = 0.0
+    for from_team, assets in deal.legs.items():
+        if str(from_team).upper() == tid:
+            continue
+        for a in assets or []:
+            if isinstance(a, PlayerAsset):
+                incoming += _player_salary_dollars(tick_ctx, a.player_id)
+
+    return float(payroll_before - outgoing + incoming)
+
+
+# =============================================================================
 # Mode orchestrators
 # =============================================================================
 
@@ -634,7 +758,7 @@ def _generate_buy_mode(
         )
         variant_cap = min(12, max(6, int(budget.beam_width)))
 
-        # soft guard: ABOVE_2ND_APRON 팀은 one-for-one 형태만 남김(탐색 낭비/invalid 감소)
+        # soft guard: payroll_after_est 기준 2nd apron one-for-one 위반 가능 후보 제거(탐색 낭비/invalid 감소)
         if getattr(config, "soft_guard_second_apron_by_constraints", False):
             candidates = _soft_guard_second_apron_candidates(candidates, tick_ctx)
             if not candidates:
@@ -811,7 +935,7 @@ def _generate_sell_mode(
 
             stats.skeletons_built += len(candidates)
 
-            # soft guard: ABOVE_2ND_APRON 팀은 one-for-one 형태만 남김(탐색 낭비/invalid 감소)
+            # soft guard: payroll_after_est 기준 2nd apron one-for-one 위반 가능 후보 제거(탐색 낭비/invalid 감소)
             if getattr(config, "soft_guard_second_apron_by_constraints", False):
                 candidates = _soft_guard_second_apron_candidates(candidates, tick_ctx)
                 if not candidates:
@@ -956,31 +1080,51 @@ def _soft_guard_second_apron_candidates(
     candidates: List[DealCandidate],
     tick_ctx: TradeGenerationTickContext,
 ) -> List[DealCandidate]:
-    """ABOVE_2ND_APRON 팀은 'one-for-one' 형태만 남긴다(soft guard).
+    """Soft guard: 2nd apron one-for-one 제약을 위반할 가능성이 큰 후보를 제거한다.
 
-    SSOT는 validate_deal이지만, 이 필터는 "탐색 낭비"를 줄이기 위한 휴리스틱이다.
-    - outgoing players > 1 이거나
-    - incoming players > 1 이면
-      해당 후보를 제거한다.
+    SSOT는 validate_deal(SalaryMatchingRule)이며, 이 함수는 탐색 낭비를 줄이기 위한 휴리스틱이다.
+
+    핵심 변경점(SSOT aligned)
+    - TeamConstraints.apron_status(현 상태)로만 판단하지 않고,
+      deal 적용 후 추정 payroll_after가 second_apron 이상일 때만 one-for-one을 강제한다.
+
+    구현
+    - payroll_after_est = payroll_before - outgoing_salary + incoming_salary (dollars)
+    - if payroll_after_est >= second_apron:
+        outgoing_players_count <= 1 AND incoming_players_count <= 1 이어야 통과
+
+    fallback
+    - second_apron 값을 SSOT에서 읽을 수 없으면 기존처럼 constraints.apron_status 기반으로만 soft guard.
     """
+    second_apron = _get_second_apron_threshold(tick_ctx)
     out: List[DealCandidate] = []
     for c in candidates:
         d = c.deal
         ok = True
         for tid in [str(t).upper() for t in (d.teams or [])]:
-            try:
-                ts = tick_ctx.get_team_situation(tid)
-                status = str(getattr(ts.constraints, "apron_status", "") or "")
-                if status == "ABOVE_2ND_APRON":
-                    if _count_players(d, tid) > 1:
-                        ok = False
-                        break
-                    if _incoming_player_count(d, tid) > 1:
-                        ok = False
-                        break
-            except Exception:
-                # soft guard이므로 실패 시 그냥 통과
-                continue
+            requires_guard = False
+
+            if second_apron > 0.0:
+                try:
+                    payroll_after = _estimate_team_payroll_after_dollars(tick_ctx, d, tid)
+                    if payroll_after >= float(second_apron):
+                        requires_guard = True
+                except Exception:
+                    requires_guard = False
+            else:
+                # fallback: 기존 휴리스틱
+                try:
+                    ts = tick_ctx.get_team_situation(tid)
+                    status = str(getattr(getattr(ts, "constraints", None), "apron_status", "") or "")
+                    if status == "ABOVE_2ND_APRON":
+                        requires_guard = True
+                except Exception:
+                    requires_guard = False
+
+            if requires_guard:
+                if _count_players(d, tid) > 1 or _incoming_player_count(d, tid) > 1:
+                    ok = False
+                    break
         if ok:
             out.append(c)
     return out
@@ -1401,13 +1545,7 @@ def build_offer_skeletons_buy(
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
     ts_seller = tick_ctx.get_team_situation(seller_id)
 
-    # soft 2nd apron guard
-    buyer_one_for_one_soft = False
-    if config.soft_guard_second_apron_by_constraints:
-        try:
-            buyer_one_for_one_soft = str(ts_buyer.constraints.apron_status) == "ABOVE_2ND_APRON"
-        except Exception:
-            buyer_one_for_one_soft = False
+    # soft 2nd apron guard는 _soft_guard_second_apron_candidates(=payroll_after_est 기반)에서 처리
 
     # base deal: seller sends target
     base = Deal(
@@ -1501,51 +1639,49 @@ def build_offer_skeletons_buy(
             )
         )
 
-    # archetype 4) consolidate 2-for-1 (soft)
-    # soft guard: 팀이 ABOVE_2ND_APRON이면 multi-outgoing은 만들지 않는다.
-    if not buyer_one_for_one_soft:
-        cons_id = _pick_bucket_player(
-            buyer_out,
-            bucket="CONSOLIDATE",
-            receiver_team_id=seller_id,
-            banned_players=banned_players,
-            must_be_aggregation_friendly=True,
+    # archetype 4) consolidate 2-for-1
+    cons_id = _pick_bucket_player(
+        buyer_out,
+        bucket="CONSOLIDATE",
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
+    cheap_id = _pick_bucket_player(
+        buyer_out,
+        bucket="FILLER_CHEAP",
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
+    if cons_id and cheap_id and cons_id != cheap_id:
+        deal4 = _clone_deal(base)
+        deal4.legs[str(buyer_id).upper()].extend(
+            [
+                PlayerAsset(kind="player", player_id=cons_id),
+                PlayerAsset(kind="player", player_id=cheap_id),
+            ]
         )
-        cheap_id = _pick_bucket_player(
-            buyer_out,
-            bucket="FILLER_CHEAP",
-            receiver_team_id=seller_id,
-            banned_players=banned_players,
-            must_be_aggregation_friendly=True,
+        _add_pick_package(
+            deal4,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND",),
+            max_picks=1,
         )
-        if cons_id and cheap_id and cons_id != cheap_id:
-            deal4 = _clone_deal(base)
-            deal4.legs[str(buyer_id).upper()].extend(
-                [
-                    PlayerAsset(kind="player", player_id=cons_id),
-                    PlayerAsset(kind="player", player_id=cheap_id),
-                ]
+        out.append(
+            DealCandidate(
+                deal=deal4,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=target.player_id,
+                archetype="consolidate_2_for_1",
+                tags=[f"need:{target.need_tag}", "pkg:consolidate"],
             )
-            _add_pick_package(
-                deal4,
-                from_team=buyer_id,
-                out_cat=buyer_out,
-                catalog=catalog,
-                config=config,
-                rng=rng,
-                prefer=("SECOND",),
-                max_picks=1,
-            )
-            out.append(
-                DealCandidate(
-                    deal=deal4,
-                    buyer_id=buyer_id,
-                    seller_id=seller_id,
-                    focal_player_id=target.player_id,
-                    archetype="consolidate_2_for_1",
-                    tags=[f"need:{target.need_tag}", "pkg:consolidate"],
-                )
-            )
+        )
 
     # shape cap
     trimmed: List[DealCandidate] = []
@@ -1601,13 +1737,7 @@ def build_offer_skeletons_sell(
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
     time_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL")
 
-    # soft 2nd apron guard for buyer
-    buyer_one_for_one_soft = False
-    if config.soft_guard_second_apron_by_constraints:
-        try:
-            buyer_one_for_one_soft = str(ts_buyer.constraints.apron_status) == "ABOVE_2ND_APRON"
-        except Exception:
-            buyer_one_for_one_soft = False
+    # soft 2nd apron guard는 _soft_guard_second_apron_candidates(=payroll_after_est 기반)에서 처리
 
     out: List[DealCandidate] = []
 
@@ -1692,47 +1822,46 @@ def build_offer_skeletons_sell(
                 )
             )
 
-    # archetype 4) consolidate (buyer 2-for-1) if not soft-guard
-    if not buyer_one_for_one_soft:
-        cons_id = _pick_bucket_player(
-            buyer_out,
-            bucket="CONSOLIDATE",
-            receiver_team_id=seller_id,
-            banned_players=banned_players,
-            must_be_aggregation_friendly=True,
+    # archetype 4) consolidate (buyer 2-for-1)
+    cons_id = _pick_bucket_player(
+        buyer_out,
+        bucket="CONSOLIDATE",
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
+    cheap_id = _pick_bucket_player(
+        buyer_out,
+        bucket="FILLER_CHEAP",
+        receiver_team_id=seller_id,
+        banned_players=banned_players,
+        must_be_aggregation_friendly=True,
+    )
+    if cons_id and cheap_id and cons_id != cheap_id:
+        deal4 = _clone_deal(base)
+        deal4.legs[str(buyer_id).upper()].extend(
+            [PlayerAsset(kind="player", player_id=cons_id), PlayerAsset(kind="player", player_id=cheap_id)]
         )
-        cheap_id = _pick_bucket_player(
-            buyer_out,
-            bucket="FILLER_CHEAP",
-            receiver_team_id=seller_id,
-            banned_players=banned_players,
-            must_be_aggregation_friendly=True,
+        _add_pick_package(
+            deal4,
+            from_team=buyer_id,
+            out_cat=buyer_out,
+            catalog=catalog,
+            config=config,
+            rng=rng,
+            prefer=("SECOND",),
+            max_picks=1,
         )
-        if cons_id and cheap_id and cons_id != cheap_id:
-            deal4 = _clone_deal(base)
-            deal4.legs[str(buyer_id).upper()].extend(
-                [PlayerAsset(kind="player", player_id=cons_id), PlayerAsset(kind="player", player_id=cheap_id)]
+        out.append(
+            DealCandidate(
+                deal=deal4,
+                buyer_id=buyer_id,
+                seller_id=seller_id,
+                focal_player_id=pid,
+                archetype="buyer_consolidate",
+                tags=[f"match:{match_tag}", "pkg:consolidate"],
             )
-            _add_pick_package(
-                deal4,
-                from_team=buyer_id,
-                out_cat=buyer_out,
-                catalog=catalog,
-                config=config,
-                rng=rng,
-                prefer=("SECOND",),
-                max_picks=1,
-            )
-            out.append(
-                DealCandidate(
-                    deal=deal4,
-                    buyer_id=buyer_id,
-                    seller_id=seller_id,
-                    focal_player_id=pid,
-                    archetype="buyer_consolidate",
-                    tags=[f"match:{match_tag}", "pkg:consolidate"],
-                )
-            )
+        )
 
     trimmed: List[DealCandidate] = []
     for c in out:
