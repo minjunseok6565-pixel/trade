@@ -30,6 +30,7 @@ import re
 
 from ..errors import (
     DEAL_INVALIDATED,
+    TRADE_DEADLINE_PASSED,
     ROSTER_LIMIT,
     ASSET_LOCKED,
     DUPLICATE_ASSET,
@@ -292,6 +293,180 @@ def _team_apron_status(ts: Any) -> str:
     return str(getattr(c, "apron_status", "") or "").upper()
 
 
+def _trade_rules(tick_ctx: TradeGenerationTickContext) -> Mapping[str, Any]:
+    """Best-effort read of league.trade_rules from the tick snapshot.
+
+    We intentionally read from rule_tick_ctx.ctx_state_base (SSOT for rules) instead of
+    TeamSituation.constraints which may reflect heuristics or stale snapshots.
+    """
+    try:
+        rtc = getattr(tick_ctx, "rule_tick_ctx", None)
+        base = getattr(rtc, "ctx_state_base", None) or {}
+        if isinstance(base, Mapping):
+            league = base.get("league")
+            if isinstance(league, Mapping):
+                tr = league.get("trade_rules")
+                if isinstance(tr, Mapping):
+                    return tr
+    except Exception:
+        pass
+    return {}
+
+
+def _trade_deadline_date(tick_ctx: TradeGenerationTickContext) -> Optional[date]:
+    tr = _trade_rules(tick_ctx)
+    raw = tr.get("trade_deadline") if isinstance(tr, Mapping) else None
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw))
+    except Exception:
+        return None
+
+
+def _resolve_receiver_team_id_2team(deal: Deal, sender_team: str, asset: Any) -> str:
+    to_team = getattr(asset, "to_team", None)
+    if to_team:
+        return _canon_team_id(to_team)
+    if len(deal.teams) == 2:
+        t0 = _canon_team_id(deal.teams[0])
+        t1 = _canon_team_id(deal.teams[1])
+        s = _canon_team_id(sender_team)
+        return t1 if s == t0 else t0
+    return ""
+
+
+def _player_salary_amount_dollars(
+    player_id: str,
+    *,
+    from_team: Optional[str],
+    tick_ctx: TradeGenerationTickContext,
+    catalog: Optional[TradeAssetCatalog] = None,
+) -> float:
+    """Return salary_amount in dollars (not millions).
+
+    Prefer tick_ctx.rule_tick_ctx active roster index. Fallback to catalog snapshots.
+    """
+    pid = str(player_id)
+    try:
+        rtc = getattr(tick_ctx, "rule_tick_ctx", None)
+        if rtc is not None:
+            try:
+                rtc.ensure_active_roster_index()
+            except Exception:
+                pass
+            sal = getattr(rtc, "player_salary_map", {}).get(pid)
+            if sal is not None:
+                return float(sal or 0.0)
+    except Exception:
+        pass
+
+    # Fallback: outgoing catalog snapshot (best-effort, may be missing)
+    try:
+        if catalog is not None and from_team:
+            outcat = catalog.outgoing_by_team.get(_canon_team_id(from_team))
+            if outcat is not None:
+                c = outcat.players.get(pid)
+                if c is not None:
+                    snap = getattr(c, "snap", None)
+                    if snap is not None and getattr(snap, "salary_amount", None) is not None:
+                        return float(getattr(snap, "salary_amount") or 0.0)
+                    return float(getattr(c, "salary_m", 0.0) or 0.0) * 1_000_000.0
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def _estimate_team_payroll_after_dollars(
+    deal: Deal,
+    *,
+    team_id: str,
+    tick_ctx: TradeGenerationTickContext,
+    catalog: TradeAssetCatalog,
+) -> Optional[float]:
+    """Estimate payroll_after in dollars for a team (2-team deals only).
+
+    This mirrors SalaryMatchingRule logic closely enough for *gating* decisions:
+    we only need to know whether payroll_after is at/above the 2nd apron.
+    """
+    if len(deal.teams) != 2:
+        return None
+    tid = _canon_team_id(team_id)
+
+    # payroll_before: prefer tick index (fast, accurate)
+    payroll_before = None
+    try:
+        rtc = getattr(tick_ctx, "rule_tick_ctx", None)
+        if rtc is not None:
+            try:
+                rtc.ensure_active_roster_index()
+            except Exception:
+                pass
+            pb = getattr(rtc, "team_payroll_before_map", {}).get(tid)
+            if pb is not None:
+                payroll_before = float(pb or 0.0)
+    except Exception:
+        payroll_before = None
+    if payroll_before is None:
+        try:
+            ts = tick_ctx.get_team_situation(tid)
+            c = getattr(ts, "constraints", None)
+            payroll_before = float(getattr(c, "payroll", 0.0) or 0.0)
+        except Exception:
+            payroll_before = 0.0
+
+    outgoing_salary = 0.0
+    incoming_salary = 0.0
+    for sender_team, assets in (deal.legs or {}).items():
+        sender_u = _canon_team_id(sender_team)
+        for a in (assets or []):
+            if not isinstance(a, PlayerAsset):
+                continue
+            sal = _player_salary_amount_dollars(str(a.player_id), from_team=sender_u, tick_ctx=tick_ctx, catalog=catalog)
+            if sender_u == tid:
+                outgoing_salary += float(sal)
+            receiver_u = _resolve_receiver_team_id_2team(deal, sender_u, a)
+            if receiver_u == tid:
+                incoming_salary += float(sal)
+
+    return float(payroll_before) - float(outgoing_salary) + float(incoming_salary)
+
+
+def _is_one_for_one_mode(*, deal: Deal, team_id: str, tick_ctx: TradeGenerationTickContext, catalog: TradeAssetCatalog) -> bool:
+    """Conservative 'one-for-one' detector.
+
+    Returns True when the team is already ABOVE_2ND_APRON, or when the deal would put payroll_after
+    at/above (second_apron - match_buffer). Used to steer generation/repair away from invalid 2+ player packages.
+    """
+    tid = _canon_team_id(team_id)
+    try:
+        ts = tick_ctx.get_team_situation(tid)
+        if _team_apron_status(ts) == "ABOVE_2ND_APRON":
+            return True
+    except Exception:
+        pass
+
+    tr = _trade_rules(tick_ctx)
+    try:
+        second_apron = float(tr.get("second_apron") or 0.0)
+    except Exception:
+        second_apron = 0.0
+    if second_apron <= 0:
+        return False
+
+    try:
+        buffer = float(tr.get("match_buffer") or 250_000)
+    except Exception:
+        buffer = 250_000.0
+
+    payroll_after = _estimate_team_payroll_after_dollars(deal, team_id=tid, tick_ctx=tick_ctx, catalog=catalog)
+    if payroll_after is None:
+        return False
+
+    return float(payroll_after) >= float(second_apron - buffer)
+
+
 def _is_rebuildish(ts: Any) -> bool:
     th = _team_time_horizon(ts)
     tier = str(getattr(ts, "competitive_tier", "") or "").upper()
@@ -408,6 +583,7 @@ def _pick_from_buckets(
     max_n: int,
     prefer_low_market: bool = True,
     receiver_need_map: Optional[Mapping[str, float]] = None,
+    current_outgoing_players_count: int = 0,
 ) -> List[PlayerTradeCandidate]:
     """Select player candidates from outgoing buckets.
 
@@ -422,6 +598,12 @@ def _pick_from_buckets(
             cand = outcat.players.get(pid)
             if cand is None:
                 continue
+            # aggregation_solo_only: cannot aggregate with other outgoing players in the same package
+            try:
+                if bool(getattr(cand, "aggregation_solo_only", False)) and int(current_outgoing_players_count) >= 1:
+                    continue
+            except Exception:
+                pass
             # return-to-team ban
             if to_team and to_team in {str(t).upper() for t in (cand.return_ban_teams or tuple())}:
                 continue
@@ -703,6 +885,10 @@ class DealGenerator:
         if not tid:
             return []
 
+        deadline = _trade_deadline_date(tick_ctx)
+        if deadline is not None and tick_ctx.current_date > deadline:
+            return []
+
         ts = tick_ctx.get_team_situation(tid)
         if _team_cooldown(ts):
             return []
@@ -730,6 +916,14 @@ class DealGenerator:
                 pass
         if catalog is None:
             return []
+
+        # Ensure active roster index exists for payroll/salary estimation helpers.
+        try:
+            rtc = getattr(tick_ctx, "rule_tick_ctx", None)
+            if rtc is not None:
+                rtc.ensure_active_roster_index()
+        except Exception:
+            pass
 
         # Deterministic RNG: date + team_id (+ optional seed override).
         seed = int(rng_seed) if rng_seed is not None else self._default_seed(tick_ctx.current_date, tid)
@@ -821,6 +1015,10 @@ class DealGenerator:
                         deal_valid = True
                         break
                     except TradeError as exc:
+                        if exc.code == TRADE_DEADLINE_PASSED:
+                            hard_stop = True
+                            deal_valid = False
+                            break
                         rule_id = _extract_rule_id(exc)
                         failures_by_rule[rule_id] = failures_by_rule.get(rule_id, 0) + 1
 
@@ -1399,9 +1597,10 @@ class DealGenerator:
             tags.add(f"give:{c.player_id}")
             out.append((d, tags))
 
-        # Consolidate (2-for-1) unless buyer is likely 2nd apron restricted.
+        # Consolidate (2-for-1) only when neither side is (or will become) 2nd-apron one-for-one.
         buyer_apron = _team_apron_status(buyer_ts)
-        if buyer_apron != "ABOVE_2ND_APRON" and rng.random() < 0.70:
+        seller_apron = _team_apron_status(seller_ts)
+        if buyer_apron != "ABOVE_2ND_APRON" and seller_apron != "ABOVE_2ND_APRON" and rng.random() < 0.70:
             cons = _pick_from_buckets(
                 buyer_out,
                 buckets=("CONSOLIDATE", "SURPLUS_REDUNDANT", "SURPLUS_LOW_FIT"),
@@ -1410,6 +1609,8 @@ class DealGenerator:
                 max_n=3,
                 prefer_low_market=False,
                 receiver_need_map=seller_need_map,
+                # We will add a 2nd outgoing player; exclude solo-only assets up front.
+                current_outgoing_players_count=1,
             )
             filler = _pick_from_buckets(
                 buyer_out,
@@ -1419,18 +1620,24 @@ class DealGenerator:
                 max_n=4,
                 prefer_low_market=True,
                 receiver_need_map=seller_need_map,
+                current_outgoing_players_count=1,
             )
             if cons and filler:
                 d = self._make_base_deal(buyer_id, seller_id, target_player_id=pid)
                 d.legs[buyer_id].append(_player_asset(cons[0].player_id))
                 d.legs[buyer_id].append(_player_asset(filler[0].player_id))
-                if rng.random() < 0.55:
-                    self._add_pick_by_bucket(d, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket="SECOND")
-                tags = set(tags_base)
-                tags.add("archetype:consolidate")
-                tags.add(f"give:{cons[0].player_id}")
-                tags.add(f"give:{filler[0].player_id}")
-                out.append((d, tags))
+                # If either side will be 2nd-apron one-for-one *after* this deal, skip 2-for-1 packages.
+                if not (
+                    _is_one_for_one_mode(deal=d, team_id=buyer_id, tick_ctx=tick_ctx, catalog=catalog)
+                    or _is_one_for_one_mode(deal=d, team_id=seller_id, tick_ctx=tick_ctx, catalog=catalog)
+                ):
+                    if rng.random() < 0.55:
+                        self._add_pick_by_bucket(d, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket="SECOND")
+                    tags = set(tags_base)
+                    tags.add("archetype:consolidate")
+                    tags.add(f"give:{cons[0].player_id}")
+                    tags.add(f"give:{filler[0].player_id}")
+                    out.append((d, tags))
 
         # Cap skeleton count
         out = out[: int(budgets.get("skeletons_per_target", 5))]
@@ -1662,6 +1869,8 @@ class DealGenerator:
             try:
                 tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
             except TradeError as exc:
+                if exc.code == TRADE_DEADLINE_PASSED:
+                    return None
                 # small repair attempt
                 rep = self._repair_until_valid(
                     deal,
@@ -1892,6 +2101,8 @@ class DealGenerator:
                 tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
                 return new_deal
             except TradeError as exc:
+                if exc.code == TRADE_DEADLINE_PASSED:
+                    return None
                 rep = self._repair_until_valid(
                     new_deal,
                     exc,
@@ -1920,6 +2131,108 @@ class DealGenerator:
     # ---------------------------------------------------------------------
     # Repair
     # ---------------------------------------------------------------------
+    def _try_swap_outgoing_player_for_salary(
+        self,
+        deal: Deal,
+        *,
+        from_team: str,
+        to_team: str,
+        tick_ctx: TradeGenerationTickContext,
+        catalog: TradeAssetCatalog,
+        protected_players: Set[str],
+        needed_add_salary_m: Optional[float],
+    ) -> bool:
+        """In one-for-one mode, prefer swapping the outgoing player to a higher-salary option.
+
+        This avoids invalid attempts where the counterparty (or the failing team itself) is
+        effectively restricted to 1-for-1 due to being at/over the 2nd apron.
+        """
+        from_team_u = _canon_team_id(from_team)
+        to_team_u = _canon_team_id(to_team)
+        outcat = catalog.outgoing_by_team.get(from_team_u)
+        if outcat is None:
+            return False
+
+        leg = list(deal.legs.get(from_team_u, []) or [])
+        outgoing_pids = [str(a.player_id) for a in leg if isinstance(a, PlayerAsset)]
+        if not outgoing_pids:
+            return False
+
+        # choose a replaceable outgoing player (lowest salary, non-protected)
+        replace_pid = None
+        replace_sal = None
+        for pid in outgoing_pids:
+            if pid in protected_players:
+                continue
+            sal = _player_salary_amount_dollars(pid, from_team=from_team_u, tick_ctx=tick_ctx, catalog=catalog)
+            if replace_sal is None or float(sal) < float(replace_sal):
+                replace_sal = float(sal)
+                replace_pid = str(pid)
+        if replace_pid is None or replace_sal is None:
+            return False
+
+        # desired salary: increase by estimated gap (if available)
+        gap_dollars = 0.0
+        try:
+            if needed_add_salary_m is not None:
+                gap_dollars = max(0.0, float(needed_add_salary_m)) * 1_000_000.0
+        except Exception:
+            gap_dollars = 0.0
+        desired = float(replace_sal) + float(gap_dollars)
+
+        # Build replacement pool from non-core buckets.
+        buckets = (
+            "FILLER_BAD_CONTRACT",
+            "EXPIRING",
+            "CONSOLIDATE",
+            "SURPLUS_REDUNDANT",
+            "SURPLUS_LOW_FIT",
+            "FILLER_CHEAP",
+        )
+
+        exclude = set(outgoing_pids) | set(protected_players)
+        candidates: List[Tuple[float, float, str]] = []  # (salary_dollars, market, pid)
+        seen: Set[str] = set()
+        for b in buckets:
+            for pid in (outcat.player_ids_by_bucket.get(b, tuple()) or tuple()):
+                pid_s = str(pid)
+                if pid_s in seen or pid_s in exclude:
+                    continue
+                seen.add(pid_s)
+                c = outcat.players.get(pid_s)
+                if c is None:
+                    continue
+                # return-to-team ban
+                if to_team_u and to_team_u in {str(t).upper() for t in (c.return_ban_teams or tuple())}:
+                    continue
+                sal = _player_salary_amount_dollars(pid_s, from_team=from_team_u, tick_ctx=tick_ctx, catalog=catalog)
+                if float(sal) <= float(replace_sal) + 1.0:
+                    continue
+                candidates.append((float(sal), float(c.market.total), pid_s))
+
+        if not candidates:
+            return False
+
+        def _key(item: Tuple[float, float, str]) -> Tuple[int, float, float, str]:
+            sal, market, pid_s = item
+            miss = 0 if float(sal) >= float(desired) else 1
+            return (miss, abs(float(sal) - float(desired)), float(market), str(pid_s))
+
+        candidates.sort(key=_key)
+        new_pid = candidates[0][2]
+
+        changed = False
+        for i, a in enumerate(leg):
+            if isinstance(a, PlayerAsset) and str(a.player_id) == str(replace_pid):
+                leg[i] = _player_asset(str(new_pid))
+                changed = True
+                break
+        if not changed:
+            return False
+
+        deal.legs[from_team_u] = leg
+        return True
+
     def _repair_until_valid(
         self,
         deal: Deal,
@@ -1990,17 +2303,70 @@ class DealGenerator:
         if rule == "salary_matching" or (exc.code == DEAL_INVALIDATED and str(details.get("rule")) == "salary_matching"):
             team_fail = _canon_team_id(details.get("team_id") or "")
             method = str(details.get("method") or "")
+            status = str(details.get("status") or "")
             # second apron one-for-one: enforce both legs <= 1 player
             if method == "second_apron_one_for_one":
                 return _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog)
 
-            # Otherwise: add outgoing filler on the failing team (most common)
+            # If either side is predicted to be 2nd-apron one-for-one after this deal, avoid multi-player legs.
+            try:
+                if (
+                    _is_one_for_one_mode(deal=deal, team_id=buyer_id, tick_ctx=tick_ctx, catalog=catalog)
+                    or _is_one_for_one_mode(deal=deal, team_id=seller_id, tick_ctx=tick_ctx, catalog=catalog)
+                ):
+                    # Any leg sending 2+ players will violate one-for-one (outgoing>1 and counterparty incoming>1).
+                    if any(
+                        sum(1 for a in (deal.legs.get(t, []) or []) if isinstance(a, PlayerAsset)) > 1
+                        for t in deal.teams
+                    ):
+                        if _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog):
+                            return True
+            except Exception:
+                pass
+
+            # Otherwise: repair around failing team.
             if team_fail:
                 other = seller_id if team_fail == buyer_id else buyer_id
-                # Respect "ABOVE_2ND_APRON" heuristic by limiting outgoing players.
-                max_out_players = 1 if _team_apron_status(tick_ctx.get_team_situation(team_fail)) == "ABOVE_2ND_APRON" else 4
                 gap_m = _estimate_needed_filler_salary_m(details)
-                return _add_one_outgoing_filler_player(
+
+                # Decide whether we should treat either side as 2nd-apron one-for-one for this deal.
+                one_for_one_fail = False
+                one_for_one_other = False
+                try:
+                    one_for_one_fail = _is_one_for_one_mode(deal=deal, team_id=team_fail, tick_ctx=tick_ctx, catalog=catalog)
+                    one_for_one_other = _is_one_for_one_mode(deal=deal, team_id=other, tick_ctx=tick_ctx, catalog=catalog)
+                except Exception:
+                    one_for_one_fail = False
+                    one_for_one_other = False
+
+                # Respect one-for-one restriction: never add a 2nd outgoing player when either side is restricted.
+                max_out_players = 1 if (one_for_one_fail or one_for_one_other or status == "SECOND_APRON") else 4
+
+                out_players = [a for a in (deal.legs.get(team_fail, []) or []) if isinstance(a, PlayerAsset)]
+                if max_out_players <= 1 and len(out_players) >= 1:
+                    # Can't add another outgoing player: try to swap up the outgoing salary instead.
+                    swapped = self._try_swap_outgoing_player_for_salary(
+                        deal,
+                        from_team=team_fail,
+                        to_team=other,
+                        tick_ctx=tick_ctx,
+                        catalog=catalog,
+                        protected_players=set(protected),
+                        needed_add_salary_m=gap_m,
+                    )
+                    if swapped:
+                        return True
+                    # fallback: remove one incoming player (non-target) to the failing team
+                    return _remove_one_incoming_player(
+                        deal,
+                        receiver_team=team_fail,
+                        protected_players=protected,
+                        prefer_remove_high_salary=True,
+                        catalog=catalog,
+                    )
+
+                # Default: add outgoing filler on the failing team
+                added = _add_one_outgoing_filler_player(
                     deal,
                     from_team=team_fail,
                     to_team=other,
@@ -2008,6 +2374,15 @@ class DealGenerator:
                     exclude_players=set(protected),
                     max_outgoing_players=max_out_players,
                     target_add_salary_m=gap_m,
+                )
+                if added:
+                    return True
+                return _remove_one_incoming_player(
+                    deal,
+                    receiver_team=team_fail,
+                    protected_players=protected,
+                    prefer_remove_high_salary=True,
+                    catalog=catalog,
                 )
 
             # fallback: try remove one incoming player (non-target)
