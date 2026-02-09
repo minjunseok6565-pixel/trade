@@ -139,6 +139,15 @@ class DealGeneratorConfig:
     # --- deterministic randomness ---
     deterministic_seed_salt: str = "dealgen_v1"
 
+    # --- young asset definition (rebuild realism) ---
+    young_max_age: float = 25.0
+    young_min_control_years: float = 2.0
+    young_throwin_max_market: float = 22.0
+    # Prospect pool is the top fraction (by market.total) among young, controllable players.
+    young_prospect_top_frac: float = 0.35
+    young_prospect_max_candidates: int = 6
+    young_throwin_max_candidates: int = 6
+
     # --- telemetry ---
     telemetry_enabled: bool = True
     on_stats: Optional[Callable[["DealGenerationStats"], None]] = None
@@ -398,6 +407,11 @@ class DealGenerator:
         posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
         if posture == "STAND_PAT" and float(getattr(ts, "urgency", 0.0) or 0.0) < self.config.stand_pat_min_urgency:
             return []
+
+        # Early exit: trade deadline passed (avoid burning validation budgets).
+        if _deadline_passed(tick_ctx):
+            return []
+
         # Resolve asset catalog for this call (allow_locked may require a different index snapshot)
         catalog = self._get_asset_catalog_for_call(tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)
         if catalog is None:
@@ -793,6 +807,28 @@ def _parse_iso_ymd(value: object) -> Optional[date]:
         return None
 
 
+def _deadline_passed(tick_ctx: TradeGenerationTickContext) -> bool:
+    """True if trade deadline has passed for this tick.
+
+    Mirrors DeadlineRule(validate) but short-circuits generation to avoid burning budgets.
+    """
+    try:
+        rtc = getattr(tick_ctx, "rule_tick_ctx", None)
+        base = getattr(rtc, "ctx_state_base", None)
+        if not isinstance(base, dict):
+            return False
+        trade_deadline = base.get("league", {}).get("trade_rules", {}).get("trade_deadline")
+        if not trade_deadline:
+            return False
+        # Allow YYYY-MM-DD or datetime-like strings by slicing safely.
+        d = _parse_iso_ymd(trade_deadline)
+        if d is None:
+            return False
+        return bool(tick_ctx.current_date > d)
+    except Exception:
+        return False
+
+
 def _is_ban_active(current_date: date, until_iso: Optional[str]) -> bool:
     """True if a banned-until ISO string is active at current_date."""
     d = _parse_iso_ymd(until_iso)
@@ -965,7 +1001,8 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     buyer_players = _collect_buyer_player_candidates(state, buyer_out, receiver_team_id=seller_id)
     filler = buyer_players["filler"]
     match = buyer_players["match"]
-    young = buyer_players["young"]
+    young_hi = buyer_players["young_prospect"]
+    young_lo = buyer_players["young_throwin"]
     cons = buyer_players["consolidate"]
 
     # Archetype shaping by seller horizon (still bounded by shuffle + final cap)
@@ -1010,10 +1047,37 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
             skeletons.append(sk)
 
     # --- archetype: young + pick (rebuildish / re-tool sellers lean this way)
-    if young:
+    # Rebuild sellers should be offered *real prospects*, not just cheap young bodies.
+    if young_hi or young_lo:
         max_young_players = young_k if rebuildish else 1
         max_young_pkgs = young_pkg_n if rebuildish else 1
-        for p in _sample_for_counterparty(young[: max(1, 2 * max_young_players)], target.salary_m, need_map=seller_need_map, rng=rng, k=max_young_players):
+
+        if rebuildish:
+            pool = young_hi if young_hi else young_lo
+            # Select from top market prospects for realism; shuffle top bucket for variety.
+            pool_sorted = sorted(
+                pool,
+                key=lambda c: float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0),
+                reverse=True,
+            )
+            top_n = max(2, min(int(cfg.young_prospect_max_candidates), len(pool_sorted)))
+            top_bucket = list(pool_sorted[:top_n])
+            rng.shuffle(top_bucket)
+            chosen = top_bucket[: max(0, max_young_players)]
+            source_tag = "young_source:prospect" if young_hi else "young_source:throwin"
+        else:
+            # Non-rebuild sellers: treat young as a cheap throw-in.
+            pool = young_lo
+            chosen = _sample_for_counterparty(
+                pool[: max(1, 2 * max(1, max_young_players))],
+                target.salary_m,
+                need_map=seller_need_map,
+                rng=rng,
+                k=max_young_players,
+            )
+            source_tag = "young_source:throwin"
+
+        for p in chosen:
             for picks, swaps, tag in _picks_packages(state, buyer_out, max_packages=max_young_pkgs, prefer_second=True):
                 sk = _DealSpec(buyer_id=buyer_id, seller_id=seller_id)
                 sk.seller_players_out = [target.player_id]
@@ -1021,6 +1085,7 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
                 sk.buyer_picks_out = list(picks)
                 sk.buyer_swaps_out = list(swaps)
                 sk.tags.append("archetype:young+pick")
+                sk.tags.append(source_tag)
                 sk.tags.append(tag)
                 sk.tags.append(f"need:{target_ref.tag}")
                 if seller_horizon:
@@ -1129,33 +1194,71 @@ def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCa
     # consolidate: higher quality non-core
     consolidate = [c for c in all_players if (not is_core(c)) and any(b in (c.buckets or ()) for b in consolidate_buckets)]
 
-    # young: derived (age-based)
-    young = []
+    # young: derived (age + controllable years). Split into prospect vs throw-in.
+    young_pool: List[PlayerTradeCandidate] = []
+    young_throwin: List[PlayerTradeCandidate] = []
     for c in all_players:
         if is_core(c):
             continue
-        age = getattr(c.snap, "age", None)
+        # Avoid aggregation-solo-only assets for young packages: they tend to create invalid combos.
+        if bool(getattr(c, "aggregation_solo_only", False)):
+            continue
+        age = getattr(getattr(c, "snap", None), "age", None)
         try:
             age_f = float(age) if age is not None else None
         except Exception:
             age_f = None
-        if age_f is None:
+        if age_f is None or age_f > float(cfg.young_max_age):
             continue
-        if age_f <= 25.0 and float(getattr(c.market, "total", 0.0) or 0.0) <= 22.0:
-            young.append(c)
+        try:
+            yrs = float(getattr(c, "remaining_years", 0.0) or 0.0)
+        except Exception:
+            yrs = 0.0
+        if yrs < float(cfg.young_min_control_years):
+            continue
+
+        young_pool.append(c)
+        mv = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        if mv <= float(cfg.young_throwin_max_market):
+            young_throwin.append(c)
+
+    young_prospect: List[PlayerTradeCandidate] = []
+    if young_pool:
+        young_sorted = sorted(
+            young_pool,
+            key=lambda c: float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0),
+            reverse=True,
+        )
+        frac = float(getattr(cfg, "young_prospect_top_frac", 0.35) or 0.35)
+        try:
+            n = int(math.ceil(len(young_sorted) * max(0.05, min(1.0, frac))))
+        except Exception:
+            n = max(1, int(round(len(young_sorted) * 0.35)))
+        n = max(1, min(int(cfg.young_prospect_max_candidates), n, len(young_sorted)))
+        young_prospect = young_sorted[:n]
+
+    prospect_ids = {c.player_id for c in young_prospect}
+    young_throwin = [c for c in young_throwin if c.player_id not in prospect_ids]
 
     # Sort
     filler.sort(key=lambda c: (float(getattr(c.market, "total", 0.0) or 0.0), float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
     # match: keep salary diversity; do NOT bias to an arbitrary salary anchor (e.g. $10M)
     match.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), -float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
     consolidate.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), -float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
-    young.sort(key=lambda c: (-float(getattr(c.market, "total", 0.0) or 0.0), float(getattr(c.salary_m, 0.0) or 0.0), c.player_id))
+    young_prospect.sort(key=lambda c: (-float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0), float(getattr(c, "salary_m", 0.0) or 0.0), c.player_id))
+    young_throwin.sort(key=lambda c: (-float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0), float(getattr(c, "salary_m", 0.0) or 0.0), c.player_id))
 
     # In BUY posture, be less willing to ship out high-value consolidate pieces
     if posture in ("AGGRESSIVE_BUY", "SOFT_BUY"):
         consolidate = consolidate[:4]
 
-    return {"filler": filler[:14], "match": match[:28], "young": young[:6], "consolidate": consolidate[:8]}
+    return {
+        "filler": filler[:14],
+        "match": match[:28],
+        "young_prospect": young_prospect[: max(0, int(cfg.young_prospect_max_candidates))],
+        "young_throwin": young_throwin[: max(0, int(cfg.young_throwin_max_candidates))],
+        "consolidate": consolidate[:8],
+    }
 
 
 def _sample_near_salary(cands: Sequence[PlayerTradeCandidate], target_salary_m: float, *, rng: random.Random, k: int) -> List[PlayerTradeCandidate]:
