@@ -294,6 +294,7 @@ class RuleFailure:
     status: Optional[str] = None
     player_id: Optional[str] = None
     pick_id: Optional[str] = None
+    swap_id: Optional[str] = None
     asset_key: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
 
@@ -337,14 +338,29 @@ def parse_trade_error(err: TradeError) -> RuleFailure:
             details=details,
         )
     if err.code in (PLAYER_NOT_OWNED, PICK_NOT_OWNED, SWAP_NOT_OWNED):
+        player_id = str(details.get("player_id") or "") or None
+        pick_id = str(details.get("pick_id") or "") or None
+        swap_id = str(details.get("swap_id") or "") or None
+
+        # (C) ownership 실패가 반복될 때 예산 낭비를 줄이기 위해 asset_key를 채운다.
+        ak: Optional[str] = None
+        if err.code == PLAYER_NOT_OWNED and player_id:
+            ak = f"player:{player_id}"
+        elif err.code == PICK_NOT_OWNED and pick_id:
+            ak = f"pick:{pick_id}"
+        elif err.code == SWAP_NOT_OWNED and swap_id:
+            ak = f"swap:{swap_id}"
+
         return RuleFailure(
             kind=RuleFailureKind.OWNERSHIP,
             code=err.code,
             message=err.message,
             rule_id="ownership",
             team_id=str(details.get("team_id") or "") or None,
-            player_id=str(details.get("player_id") or "") or None,
-            pick_id=str(details.get("pick_id") or "") or None,
+            player_id=player_id,
+            pick_id=pick_id,
+            swap_id=swap_id,
+            asset_key=ak,
             details=details,
         )
     if err.code == DUPLICATE_ASSET:
@@ -735,6 +751,7 @@ def _generate_buy_mode(
             config=config,
             budget=budget,
             rng=rng,
+            banned_asset_keys=banned_asset_keys,
             banned_players=banned_players,
         )
 
@@ -754,6 +771,7 @@ def _generate_buy_mode(
             config=config,
             budget=budget,
             rng=rng,
+            banned_asset_keys=banned_asset_keys,
             banned_players=banned_players,
         )
         variant_cap = min(12, max(6, int(budget.beam_width)))
@@ -927,6 +945,7 @@ def _generate_sell_mode(
                 config=config,
                 budget=budget,
                 rng=rng,
+                banned_asset_keys=banned_asset_keys,
                 banned_players=banned_players,
             )
 
@@ -1513,6 +1532,16 @@ def select_buyers_for_sale_asset(
 # =============================================================================
 
 
+def _with_core_tags(tags: List[str], *, mode: str, focal_player_id: str, archetype: str) -> List[str]:
+    """(D) 후속 디버깅/분석을 위해 일관된 핵심 태그를 보장한다."""
+
+    out = list(tags)
+    for t in (f"mode:{str(mode).upper()}", f"focal:{focal_player_id}", f"arch:{archetype}"):
+        if t not in out:
+            out.append(t)
+    return out
+
+
 def build_offer_skeletons_buy(
     buyer_id: str,
     seller_id: str,
@@ -1523,6 +1552,7 @@ def build_offer_skeletons_buy(
     config: DealGeneratorConfig,
     budget: DealGeneratorBudget,
     rng: random.Random,
+    banned_asset_keys: Set[str],
     banned_players: Set[str],
 ) -> List[DealCandidate]:
     """BUY 모드: target 1명 기준 2~4개 archetype 스켈레톤."""
@@ -1574,6 +1604,7 @@ def build_offer_skeletons_buy(
             rng=rng,
             prefer=("SECOND", "FIRST_SAFE"),
             max_picks=max_picks,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1582,7 +1613,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="picks_only",
-                tags=[f"need:{target.need_tag}", "pkg:picks"],
+                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:picks"], mode="BUY", focal_player_id=target.player_id, archetype="picks_only"),
             )
         )
 
@@ -1605,6 +1636,7 @@ def build_offer_skeletons_buy(
             rng=rng,
             prefer=("SECOND",),
             max_picks=1,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1613,7 +1645,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="young_plus_pick",
-                tags=[f"need:{target.need_tag}", "pkg:young+pick"],
+                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:young+pick"], mode="BUY", focal_player_id=target.player_id, archetype="young_plus_pick"),
             )
         )
 
@@ -1635,7 +1667,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="p4p_salary",
-                tags=[f"need:{target.need_tag}", "pkg:player_for_player"],
+                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:player_for_player"], mode="BUY", focal_player_id=target.player_id, archetype="p4p_salary"),
             )
         )
 
@@ -1671,6 +1703,7 @@ def build_offer_skeletons_buy(
             rng=rng,
             prefer=("SECOND",),
             max_picks=1,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1679,7 +1712,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="consolidate_2_for_1",
-                tags=[f"need:{target.need_tag}", "pkg:consolidate"],
+                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:consolidate"], mode="BUY", focal_player_id=target.player_id, archetype="consolidate_2_for_1"),
             )
         )
 
@@ -1704,6 +1737,7 @@ def build_offer_skeletons_sell(
     config: DealGeneratorConfig,
     budget: DealGeneratorBudget,
     rng: random.Random,
+    banned_asset_keys: Set[str],
     banned_players: Set[str],
 ) -> List[DealCandidate]:
     """SELL 모드: (seller sends sale_asset.player_id) 기준 BUYER 패키지를 생성."""
@@ -1756,6 +1790,7 @@ def build_offer_skeletons_sell(
             rng=rng,
             prefer=("SECOND", "FIRST_SAFE"),
             max_picks=max_picks,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1764,7 +1799,7 @@ def build_offer_skeletons_sell(
                 seller_id=seller_id,
                 focal_player_id=pid,
                 archetype="buyer_picks",
-                tags=[f"match:{match_tag}", "pkg:picks"],
+                tags=_with_core_tags([f"match:{match_tag}", "pkg:picks"], mode="SELL", focal_player_id=pid, archetype="buyer_picks"),
             )
         )
 
@@ -1787,6 +1822,7 @@ def build_offer_skeletons_sell(
             rng=rng,
             prefer=("SECOND",),
             max_picks=1,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1795,7 +1831,7 @@ def build_offer_skeletons_sell(
                 seller_id=seller_id,
                 focal_player_id=pid,
                 archetype="buyer_young_plus_pick",
-                tags=[f"match:{match_tag}", "pkg:young+pick"],
+                tags=_with_core_tags([f"match:{match_tag}", "pkg:young+pick"], mode="SELL", focal_player_id=pid, archetype="buyer_young_plus_pick"),
             )
         )
 
@@ -1818,7 +1854,7 @@ def build_offer_skeletons_sell(
                     seller_id=seller_id,
                     focal_player_id=pid,
                     archetype="buyer_p4p",
-                    tags=[f"match:{match_tag}", "pkg:player_for_player"],
+                    tags=_with_core_tags([f"match:{match_tag}", "pkg:player_for_player"], mode="SELL", focal_player_id=pid, archetype="buyer_p4p"),
                 )
             )
 
@@ -1851,6 +1887,7 @@ def build_offer_skeletons_sell(
             rng=rng,
             prefer=("SECOND",),
             max_picks=1,
+            banned_asset_keys=banned_asset_keys,
         )
         out.append(
             DealCandidate(
@@ -1859,7 +1896,7 @@ def build_offer_skeletons_sell(
                 seller_id=seller_id,
                 focal_player_id=pid,
                 archetype="buyer_consolidate",
-                tags=[f"match:{match_tag}", "pkg:consolidate"],
+                tags=_with_core_tags([f"match:{match_tag}", "pkg:consolidate"], mode="SELL", focal_player_id=pid, archetype="buyer_consolidate"),
             )
         )
 
@@ -1899,6 +1936,7 @@ def expand_variants(
     config: DealGeneratorConfig,
     budget: DealGeneratorBudget,
     rng: random.Random,
+    banned_asset_keys: Set[str],
     banned_players: Set[str],
 ) -> List[DealCandidate]:
     """스켈레톤을 '얕게' 확장한다.
@@ -1940,7 +1978,7 @@ def expand_variants(
                 seller_id=seller,
                 focal_player_id=target.player_id,
                 archetype=archetype,
-                tags=tags,
+                tags=_with_core_tags(tags, mode="BUY", focal_player_id=target.player_id, archetype=archetype),
             )
         )
 
@@ -1951,7 +1989,7 @@ def expand_variants(
                 buyer: [],
                 seller: [PlayerAsset(kind="player", player_id=target.player_id)],
             },
-            meta={"generated": True, "target": target.player_id},
+            meta={"generated": True, "mode": "BUY", "focal": target.player_id},
         )
 
     # --- archetype: picks-only variants
@@ -1979,6 +2017,7 @@ def expand_variants(
                 prefer=prefer,
                 max_picks=max_picks,
                 config=config,
+                banned_asset_keys=banned_asset_keys,
             )
             _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
@@ -1997,6 +2036,7 @@ def expand_variants(
                 prefer=prefer,
                 max_picks=max_picks,
                 config=config,
+                banned_asset_keys=banned_asset_keys,
             )
             _push(d, "young_plus_pick", [f"need:{target.need_tag}", "pkg:young+pick", "var:young"])
 
@@ -2047,6 +2087,7 @@ def expand_variants(
                 prefer=("SECOND",),
                 max_picks=1,
                 config=config,
+                banned_asset_keys=banned_asset_keys,
             )
             _push(
                 d,
@@ -2260,8 +2301,15 @@ def _apply_prune_side_effects(
     banned_asset_keys: Set[str],
     banned_players: Set[str],
 ) -> None:
-    if failure.kind == RuleFailureKind.ASSET_LOCK and failure.asset_key:
-        banned_asset_keys.add(failure.asset_key)
+    # (C) 같은 invalid를 반복 생성하지 않도록 금지 목록에 반영
+    if failure.kind in (RuleFailureKind.ASSET_LOCK, RuleFailureKind.OWNERSHIP, RuleFailureKind.DUPLICATE_ASSET):
+        if failure.asset_key:
+            banned_asset_keys.add(failure.asset_key)
+
+    # ownership에서 플레이어 미소유는 플레이어 후보 자체를 금지하면 효과가 좋다.
+    if failure.kind == RuleFailureKind.OWNERSHIP and failure.player_id:
+        banned_players.add(failure.player_id)
+
     if failure.kind == RuleFailureKind.PLAYER_ELIGIBILITY and failure.player_id and failure.reason == "recent_contract_signing":
         banned_players.add(failure.player_id)
 
@@ -2591,13 +2639,22 @@ def maybe_apply_sweeteners(
             continue
 
         # evaluate
+        # (D) sweetener는 "누가 누구에게" 추가했는지와 round를 남겨두면
+        # 후속 counter/협상 로직 구현 시 매우 유용하다.
+        round_no = int(added_count)
         prop, used = evaluate_and_score(
             deal,
             buyer_id=base.buyer_id,
             seller_id=base.seller_id,
             tick_ctx=tick_ctx,
             config=config,
-            tags=tuple(best.tags) + (f"sweetener:{bucket}",),
+            tags=tuple(best.tags)
+            + (
+                f"sweetener:{bucket}",
+                f"sweetener_from:{str(giver).upper()}",
+                f"sweetener_to:{str(receiver).upper()}",
+                f"sweetener_round:{round_no}",
+            ),
             opponent_repeat_count=0,
             stats=stats,
         )
@@ -2782,6 +2839,24 @@ def evaluate_and_score(
         opponent_repeat_count=opponent_repeat_count,
     )
 
+    # (D) deal 형태를 태그로 남겨두면 후속 분석/디버깅(특히 spam/중복/비현실 필터)에 유용하다.
+    n_assets = sum(len(v) for v in deal.legs.values())
+    n_players = sum(1 for leg in deal.legs.values() for a in leg if isinstance(a, PlayerAsset))
+    n_picks = sum(1 for leg in deal.legs.values() for a in leg if isinstance(a, PickAsset))
+    n_swaps = sum(1 for leg in deal.legs.values() for a in leg if isinstance(a, SwapAsset))
+    shape_tags = (
+        f"shape:assets:{n_assets}",
+        f"shape:players:{n_players}",
+        f"shape:picks:{n_picks}",
+        f"shape:swaps:{n_swaps}",
+    )
+
+    # 중복 태그 방지(순서 유지)
+    tags_out: List[str] = list(tags)
+    for t in shape_tags:
+        if t not in tags_out:
+            tags_out.append(t)
+
     prop = DealProposal(
         deal=deal,
         buyer_id=str(buyer_id).upper(),
@@ -2791,7 +2866,7 @@ def evaluate_and_score(
         buyer_eval=buyer_eval,
         seller_eval=seller_eval,
         score=float(score),
-        tags=tuple(tags),
+        tags=tuple(tags_out),
     )
     return prop, 2
 
@@ -3118,6 +3193,7 @@ def _add_pick_package(
     rng: random.Random,
     prefer: Tuple[str, ...],
     max_picks: int,
+    banned_asset_keys: Optional[Set[str]] = None,
 ) -> None:
     """pick bucket 우선순위 기반으로 pick을 추가.
 
@@ -3154,20 +3230,26 @@ def _add_pick_package(
                 break
             if bucket == "SECOND" and _count_seconds(deal, tid, catalog=catalog) >= int(config.max_seconds_per_side):
                 break
-            if pid in outgoing_pick_ids:
+            pid_s = str(pid)
+
+            # (C) ownership/lock 등으로 금지된 pick은 스켈레톤 단계부터 제외
+            if banned_asset_keys is not None and f"pick:{pid_s}" in banned_asset_keys:
+                continue
+
+            if pid_s in outgoing_pick_ids:
                 continue
 
             # stepien check for 1st(s)
             if bucket.startswith("FIRST"):
                 out_ids, in_ids = _team_pick_flow(deal, tid)
-                if not catalog.stepien.is_compliant_after(team_id=tid, outgoing_pick_ids=set(out_ids | {pid}), incoming_pick_ids=set(in_ids)):
+                if not catalog.stepien.is_compliant_after(team_id=tid, outgoing_pick_ids=set(out_ids | {pid_s}), incoming_pick_ids=set(in_ids)):
                     continue
 
             try:
-                deal.legs[tid].append(out_cat.picks[str(pid)].as_asset())
+                deal.legs[tid].append(out_cat.picks[pid_s].as_asset())
             except Exception:
-                deal.legs[tid].append(PickAsset(kind="pick", pick_id=str(pid)))
-            outgoing_pick_ids.add(str(pid))
+                deal.legs[tid].append(PickAsset(kind="pick", pick_id=pid_s))
+            outgoing_pick_ids.add(pid_s)
             picks_added += 1
             break
 
