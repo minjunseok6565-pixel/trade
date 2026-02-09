@@ -43,6 +43,7 @@ import json
 import math
 import random
 from datetime import date
+from weakref import WeakKeyDictionary
 
 try:
     from schema import normalize_team_id  # type: ignore
@@ -285,6 +286,10 @@ class _GenState:
     banned_picks: DefaultDict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
     banned_swaps: DefaultDict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
 
+    # per-player receiver bans learned from validation (e.g., return-to-trading-team same season)
+    # keyed by player_id -> set(receiver_team_id)
+    banned_receivers_by_player: DefaultDict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+
     # dedupe across generated deals
     seen_fingerprints: Set[str] = field(default_factory=set)
 
@@ -296,6 +301,47 @@ class DealGenerator:
     def __init__(self, config: Optional[DealGeneratorConfig] = None) -> None:
         self.config = config or DealGeneratorConfig()
         self.last_stats: Optional[DealGenerationStats] = None
+        self._asset_catalog_cache: WeakKeyDictionary[TradeGenerationTickContext, Dict[str, TradeAssetCatalog]] = WeakKeyDictionary()
+
+    def _get_asset_catalog_for_call(
+        self,
+        tick_ctx: TradeGenerationTickContext,
+        *,
+        allow_locked_by_deal_id: Optional[str],
+    ) -> Optional[TradeAssetCatalog]:
+        # Returns an asset catalog appropriate for this call.
+        # - When allow_locked_by_deal_id is None, reuse tick_ctx.asset_catalog (build if missing).
+        # - When provided, build (and cache) a catalog that treats assets locked by that deal_id as eligible
+        #   for outgoing/incoming indexing.
+        if allow_locked_by_deal_id is None:
+            if tick_ctx.asset_catalog is None:
+                try:
+                    tick_ctx.asset_catalog = build_trade_asset_catalog(tick_ctx=tick_ctx)  # type: ignore[arg-type]
+                except Exception:
+                    return None
+            return tick_ctx.asset_catalog
+
+        key = str(allow_locked_by_deal_id)
+        per_tick = self._asset_catalog_cache.get(tick_ctx)
+        if per_tick is None:
+            per_tick = {}
+            try:
+                self._asset_catalog_cache[tick_ctx] = per_tick
+            except Exception:
+                # Fallback: if tick_ctx cannot be weak-referenced, do not cache.
+                pass
+
+        if per_tick is not None and key in per_tick:
+            return per_tick[key]
+
+        try:
+            cat = build_trade_asset_catalog(tick_ctx=tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)  # type: ignore[arg-type]
+        except Exception:
+            return None
+        if per_tick is not None:
+            per_tick[key] = cat
+        return cat
+
 
     def generate_for_team(
         self,
@@ -326,11 +372,8 @@ class DealGenerator:
         posture = str(getattr(ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
         if posture == "STAND_PAT" and float(getattr(ts, "urgency", 0.0) or 0.0) < self.config.stand_pat_min_urgency:
             return []
-
-        # Ensure asset catalog exists on tick context
-        if tick_ctx.asset_catalog is None:
-            tick_ctx.asset_catalog = build_trade_asset_catalog(tick_ctx=tick_ctx)  # type: ignore[arg-type]
-        catalog = tick_ctx.asset_catalog
+        # Resolve asset catalog for this call (allow_locked may require a different index snapshot)
+        catalog = self._get_asset_catalog_for_call(tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)
         if catalog is None:
             return []
 
@@ -875,6 +918,10 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     if target_ref.from_team and buyer_id in set(target.return_ban_teams or ()):
         state.stats.pruned_ineligible += 1
         return []
+
+    if buyer_id in state.banned_receivers_by_player.get(target.player_id, set()):
+        state.stats.pruned_ineligible += 1
+        return []
     if _is_ban_active(tick_ctx.current_date, target.recent_signing_banned_until):
         state.stats.pruned_ineligible += 1
         return []
@@ -889,7 +936,7 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     seller_need_map = _get_need_map(tick_ctx, seller_id)
 
     # Build candidate sets for buyer outgoing
-    buyer_players = _collect_buyer_player_candidates(state, buyer_out)
+    buyer_players = _collect_buyer_player_candidates(state, buyer_out, receiver_team_id=seller_id)
     filler = buyer_players["filler"]
     match = buyer_players["match"]
     young = buyer_players["young"]
@@ -1013,13 +1060,16 @@ def _buyer_can_absorb_target(tick_ctx: TradeGenerationTickContext, buyer_id: str
     return cap_space >= float(target_salary_m) * 1_000_000.0 * 1.02
 
 
-def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCatalog) -> Dict[str, List[PlayerTradeCandidate]]:
+def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCatalog, *, receiver_team_id: Optional[str] = None) -> Dict[str, List[PlayerTradeCandidate]]:
     """Bucket buyer outgoing players into candidate sets for archetypes."""
     cfg = state.cfg
     tick_ctx = state.tick_ctx
     buyer_id = buyer_out.team_id
     buyer_ts = tick_ctx.get_team_situation(buyer_id)
     posture = str(getattr(buyer_ts, "trade_posture", "STAND_PAT") or "STAND_PAT").upper()
+
+
+    receiver_id = _canon_team_id(receiver_team_id or '') if receiver_team_id else ''
 
     # gather players excluding banned/locked
     all_players: List[PlayerTradeCandidate] = []
@@ -1030,7 +1080,12 @@ def _collect_buyer_player_candidates(state: _GenState, buyer_out: TeamOutgoingCa
             continue
         if _is_ban_active(tick_ctx.current_date, cand.recent_signing_banned_until):
             continue
-        # keep return bans irrelevant here (outgoing)
+        if receiver_id:
+            # Block sending this player to receiver_id if SSOT return-bans or learned bans apply.
+            if receiver_id in set(cand.return_ban_teams or ()):  # type: ignore[arg-type]
+                continue
+            if receiver_id in state.banned_receivers_by_player.get(pid, set()):
+                continue
         all_players.append(cand)
 
     # classify by buckets
@@ -1174,33 +1229,48 @@ def _sample_for_counterparty(
 
 
 def _picks_packages(state: _GenState, buyer_out: TeamOutgoingCatalog, *, max_packages: int, prefer_second: bool = False) -> List[Tuple[Tuple[str, ...], Tuple[str, ...], str]]:
-    """Build a few pick/swap packages for the buyer (ordered cheap->expensive)."""
+    """Build a few pick/swap packages for the buyer.
+
+    prefer_second=True biases toward SECOND-based packages and uses FIRST picks only as fallback.
+    """
     picks_second = [pid for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()) if pid not in state.banned_picks[buyer_out.team_id]]
     picks_first_safe = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()) if pid not in state.banned_picks[buyer_out.team_id]]
     picks_first_sens = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()) if pid not in state.banned_picks[buyer_out.team_id]]
     swaps = [sid for sid in buyer_out.swap_ids if sid not in state.banned_swaps[buyer_out.team_id]]
 
-    out: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
-    # simplest: 2RP
-    if picks_second:
-        out.append(((picks_second[0],), tuple(), "sweetener:2RP"))
-    if len(picks_second) >= 2:
-        out.append(((picks_second[0], picks_second[1]), tuple(), "sweetener:2RPx2"))
-    # add swap
-    if swaps:
-        out.append((tuple(), (swaps[0],), "sweetener:swap"))
-    # 1RP safe
-    if picks_first_safe:
-        out.append(((picks_first_safe[0],), tuple(), "sweetener:1RP_SAFE"))
-    # sensitive last
-    if picks_first_sens:
-        out.append(((picks_first_sens[0],), tuple(), "sweetener:1RP_SENSITIVE"))
+    seconds_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
+    swap_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
+    first_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
 
+    # seconds-first packages
+    if picks_second:
+        seconds_pkgs.append(((picks_second[0],), tuple(), "sweetener:2RP"))
+    if len(picks_second) >= 2:
+        seconds_pkgs.append(((picks_second[0], picks_second[1]), tuple(), "sweetener:2RPx2"))
+    if picks_second and swaps:
+        seconds_pkgs.append(((picks_second[0],), (swaps[0],), "sweetener:2RP+swap"))
+
+    # swaps (cheap but valuable)
+    if swaps:
+        swap_pkgs.append((tuple(), (swaps[0],), "sweetener:swap"))
+
+    # first-round picks as fallback
+    if picks_first_safe:
+        first_pkgs.append(((picks_first_safe[0],), tuple(), "sweetener:1RP_SAFE"))
+    if picks_first_sens:
+        first_pkgs.append(((picks_first_sens[0],), tuple(), "sweetener:1RP_SENSITIVE"))
+
+    ordered: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]]
     if prefer_second:
-        # stable order emphasizing seconds first
-        pass
-    # keep bounded
-    return out[: max_packages]
+        ordered = seconds_pkgs + swap_pkgs + first_pkgs
+    else:
+        # stable cheap->expensive order (legacy)
+        ordered = []
+        ordered.extend(seconds_pkgs[:2])
+        ordered.extend(swap_pkgs[:1])
+        ordered.extend(first_pkgs)
+
+    return ordered[: max(0, int(max_packages))]
 
 
 # =============================================================================
@@ -1308,6 +1378,12 @@ def _is_locked(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
 
 def _ban_from_error(state: _GenState, err: TradeError) -> None:
     details = err.details if isinstance(err.details, dict) else {}
+    rule = str(details.get("rule") or "")
+    if rule == "return_to_trading_team_same_season":
+        pid = details.get("player_id")
+        to_team = _canon_team_id(details.get("to_team") or "")
+        if pid and to_team:
+            state.banned_receivers_by_player[str(pid)].add(to_team)
     # best-effort: ban offending asset id
     pid = details.get("player_id")
     if pid:
@@ -1371,7 +1447,7 @@ def _repair_roster_limit(state: _GenState, spec: _DealSpec, err: TradeError) -> 
             need_send = 1
         need_send = min(need_send, 1)
 
-        filler_cands = _collect_buyer_player_candidates(state, buyer_out)["filler"]
+        filler_cands = _collect_buyer_player_candidates(state, buyer_out, receiver_team_id=seller_id)["filler"]
         used = set(spec.buyer_players_out)
         allow_solo_only = len(spec.buyer_players_out) == 0
         for c in filler_cands:
@@ -1400,7 +1476,7 @@ def _repair_roster_limit(state: _GenState, spec: _DealSpec, err: TradeError) -> 
             need_send = 1
         need_send = min(need_send, 1)
 
-        filler_cands = _collect_buyer_player_candidates(state, seller_out)["filler"]
+        filler_cands = _collect_buyer_player_candidates(state, seller_out, receiver_team_id=buyer_id)["filler"]
         used = set(spec.seller_players_out)
         allow_solo_only = len(spec.seller_players_out) == 0
         for c in filler_cands:
@@ -1496,8 +1572,8 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
         except Exception:
             return 0.0
 
-    def _pool_for(out_cat: TeamOutgoingCatalog) -> List[PlayerTradeCandidate]:
-        packs = _collect_buyer_player_candidates(state, out_cat)
+    def _pool_for(out_cat: TeamOutgoingCatalog, receiver_team_id: str) -> List[PlayerTradeCandidate]:
+        packs = _collect_buyer_player_candidates(state, out_cat, receiver_team_id=receiver_team_id)
         filler = list(packs.get("filler") or [])
         match = list(packs.get("match") or [])
         seen: Set[str] = set()
@@ -1528,7 +1604,7 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
         deficit_dollars = max(0.0, incoming_salary - allowed_in) if allowed_in > 0 else max(0.0, incoming_salary)
         needed_extra_m = deficit_dollars / 1_000_000.0
 
-        pool = _pool_for(buyer_out)
+        pool = _pool_for(buyer_out, receiver_team_id=seller_id)
         used = set(spec.buyer_players_out)
 
         def pick_best_to_add() -> Optional[PlayerTradeCandidate]:
@@ -1625,7 +1701,7 @@ def _repair_salary_matching(state: _GenState, spec: _DealSpec, details: Dict[str
             return False
 
         cur_pid = spec.buyer_players_out[0]
-        pool = _pool_for(buyer_out)
+        pool = _pool_for(buyer_out, receiver_team_id=seller_id)
 
         candidates = []
         for c in pool:
@@ -1923,13 +1999,26 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
     used_picks = set(current_spec.buyer_picks_out)
     used_swaps = set(current_spec.buyer_swaps_out)
 
-    for token in cfg.sweetener_order[: max(0, cfg.max_sweeteners)]:
+    max_add = max(0, int(cfg.max_sweeteners))
+    if max_add <= 0:
+        return [proposal]
+
+    second_ids = set(buyer_out.pick_ids_by_bucket.get("SECOND", ()))
+    seconds_added = sum(1 for pid in used_picks if pid in second_ids)
+    added_count = 0
+
+    for token in cfg.sweetener_order:
+        if added_count >= max_add:
+            break
+
         if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
             break
 
         # choose next asset
         added = False
         if token == "SECOND":
+            if seconds_added >= 2:
+                continue
             for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()):
                 if pid in used_picks or pid in state.banned_picks[buyer_id]:
                     continue
@@ -1977,6 +2066,10 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
 
         if not added:
             continue
+
+        added_count += 1
+        if token == "SECOND":
+            seconds_added += 1
 
         # validate + evaluate new deal
         deal2 = _repair_until_valid(state, current_spec, budgets=budgets)
@@ -2056,23 +2149,62 @@ def _apply_partner_cap(
     partner_side:
       - 'seller': cap by proposal.seller_id (BUY mode)
       - 'buyer':  cap by proposal.buyer_id  (SELL mode)
+
+    Also applies a soft penalty (partner_repeat_penalty) during selection so repeated
+    partners are less likely to crowd out variety *before* hitting the hard cap.
     """
+    max_results_i = max(0, int(max_results))
+    if max_results_i <= 0:
+        return []
+
     cap = int(state.cfg.max_partner_repeats or 0)
     if cap <= 0:
-        return proposals[: max(0, int(max_results))]
+        return proposals[:max_results_i]
 
+    penalty = float(state.cfg.partner_repeat_penalty or 0.0)
     counts = defaultdict(int)
-    out: List[DealProposal] = []
-    for p in proposals:
-        partner = p.seller_id if partner_side == 'seller' else p.buyer_id
-        if counts[partner] >= cap:
-            continue
-        out.append(p)
-        counts[partner] += 1
-        if len(out) >= max(0, int(max_results)):
-            break
 
-    # Record final partner exposure counts for telemetry.
+    # If no penalty is configured, keep the old deterministic behavior.
+    if penalty <= 0.0:
+        out: List[DealProposal] = []
+        for p in proposals:
+            partner = p.seller_id if partner_side == 'seller' else p.buyer_id
+            if counts[partner] >= cap:
+                continue
+            out.append(p)
+            counts[partner] += 1
+            if len(out) >= max_results_i:
+                break
+        try:
+            state.stats.partner_counts.clear()
+            state.stats.partner_counts.update(counts)
+        except Exception:
+            pass
+        return out
+
+    # Greedy selection with diversity penalty (bounded by max_results).
+    remaining = list(proposals)
+    out: List[DealProposal] = []
+    while remaining and len(out) < max_results_i:
+        best_i = -1
+        best_adj = None
+        best_raw = None
+        for i, p in enumerate(remaining):
+            partner = p.seller_id if partner_side == 'seller' else p.buyer_id
+            if counts[partner] >= cap:
+                continue
+            adj = float(p.score) - penalty * float(max(0, counts[partner]))
+            if best_adj is None or adj > best_adj or (adj == best_adj and (best_raw is None or p.score > best_raw)):
+                best_adj = adj
+                best_raw = float(p.score)
+                best_i = i
+        if best_i < 0:
+            break
+        chosen = remaining.pop(best_i)
+        partner = chosen.seller_id if partner_side == 'seller' else chosen.buyer_id
+        out.append(chosen)
+        counts[partner] += 1
+
     try:
         state.stats.partner_counts.clear()
         state.stats.partner_counts.update(counts)
