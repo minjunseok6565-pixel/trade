@@ -211,6 +211,44 @@ def _deal_outgoing_pick_ids(deal: Deal, team_id: str) -> Set[str]:
     return out
 
 
+def _deal_incoming_pick_ids(deal: Deal, team_id: str) -> Set[str]:
+    """Return pick_ids that team_id would receive in this deal.
+
+    For 2-team deals, incoming picks to team_id are PickAssets located in the *other*
+    team's leg where (to_team is None) or (to_team == team_id).
+
+    This helper exists mainly to improve Stepien quick-checks during generation.
+    """
+    t = _canon_team_id(team_id)
+    out: Set[str] = set()
+    try:
+        teams = list(deal.teams or [])
+        if len(teams) != 2:
+            # Best-effort: scan all legs, treat None/explicit to_team as incoming.
+            for sender, assets in (deal.legs or {}).items():
+                sender_u = _canon_team_id(sender)
+                if not sender_u or sender_u == t:
+                    continue
+                for a in assets or []:
+                    if isinstance(a, PickAsset):
+                        rt = getattr(a, "to_team", None)
+                        if rt is None or _canon_team_id(rt) == t:
+                            out.add(str(a.pick_id))
+            return out
+
+        t0 = _canon_team_id(teams[0])
+        t1 = _canon_team_id(teams[1])
+        other = t1 if t == t0 else t0
+        for a in (deal.legs.get(other, []) or []):
+            if isinstance(a, PickAsset):
+                rt = getattr(a, "to_team", None)
+                if rt is None or _canon_team_id(rt) == t:
+                    out.add(str(a.pick_id))
+    except Exception:
+        return out
+    return out
+
+
 def _deal_assets_by_team(deal: Deal, team_id: str) -> Tuple[List[PlayerAsset], List[PickAsset], List[SwapAsset]]:
     ps: List[PlayerAsset] = []
     picks: List[PickAsset] = []
@@ -995,6 +1033,7 @@ class DealGenerator:
 
                 attempts += 1
                 deal = skel_deal
+                tags_set: Set[str] = set(skel_tags)
 
                 # Dedupe early (pre-repair)
                 h_skel = _hash_deal_for_dedupe(deal)
@@ -1037,6 +1076,7 @@ class DealGenerator:
                             catalog=catalog,
                             budgets=budgets,
                             rng=rng,
+                            tags_set=tags_set,
                         )
                         if not repaired:
                             deal_valid = False
@@ -1111,6 +1151,7 @@ class DealGenerator:
                                 rng=rng,
                                 allow_locked_by_deal_id=allow_locked_by_deal_id,
                                 budget=budget,
+                                tags_set=tags_set,
                             )
 
                         # If no fit swap (or not applicable), fall back to sweeteners (surplus short)
@@ -1133,6 +1174,7 @@ class DealGenerator:
                                 allow_locked_by_deal_id=allow_locked_by_deal_id,
                                 seen_deals=seen_deals,
                                 budget=budget,
+                                tags_set=tags_set,
                             )
                         # Re-evaluate only if we can afford it.
                         if deal2 is not None:
@@ -1171,7 +1213,7 @@ class DealGenerator:
                     opponent_seen=opponent_seen,
                     target_seen=target_seen,
                 )
-                tags = tuple(sorted(set(skel_tags)))
+                tags = tuple(sorted(tags_set))
 
                 # Add slight penalties for repetition to avoid market spam.
                 score -= float(opponent_seen.get(seller_id, 0)) * float(self.cfg.opponent_repeat_penalty)
@@ -1337,6 +1379,9 @@ class DealGenerator:
         buyer_ts = tick_ctx.get_team_situation(buyer_id)
         buyer_apron = _team_apron_status(buyer_ts)
 
+        # Seller bucket membership cache to avoid repeated set(...) allocations.
+        seller_bucket_cache: Dict[str, Tuple[Set[str], Set[str]]] = {}
+
         # Collect refs from incoming indices.
         refs: List[IncomingPlayerRef] = []
         for tag in need_tags:
@@ -1361,16 +1406,31 @@ class DealGenerator:
                 continue
             if r.player_id not in seller_out.players:
                 continue
-            # Exclude seller CORE (kept by catalog)
-            if r.player_id in set(seller_out.player_ids_by_bucket.get("CORE", tuple()) or tuple()):
+
+            cached = seller_bucket_cache.get(seller_id)
+            if cached is None:
+                core_set = set(seller_out.player_ids_by_bucket.get("CORE", tuple()) or tuple())
+                offer_set: Set[str] = set()
+                for b in (
+                    "VETERAN_SALE",
+                    "EXPIRING",
+                    "SURPLUS_LOW_FIT",
+                    "SURPLUS_REDUNDANT",
+                    "FILLER_BAD_CONTRACT",
+                    "FILLER_CHEAP",
+                    "CONSOLIDATE",
+                ):
+                    offer_set.update(seller_out.player_ids_by_bucket.get(b, tuple()) or tuple())
+                seller_bucket_cache[seller_id] = (core_set, offer_set)
+            else:
+                core_set, offer_set = cached
+
+            # Exclude seller CORE.
+            if r.player_id in core_set:
                 continue
-            # Prefer listed outgoing buckets
-            offered = False
-            for b in ("VETERAN_SALE", "EXPIRING", "SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_BAD_CONTRACT", "FILLER_CHEAP", "CONSOLIDATE"):
-                if r.player_id in set(seller_out.player_ids_by_bucket.get(b, tuple()) or tuple()):
-                    offered = True
-                    break
-            if not offered:
+
+            # Prefer listed outgoing buckets.
+            if r.player_id not in offer_set:
                 # still allow a small chance for mid-tier movement
                 if rng.random() > 0.15:
                     continue
@@ -1379,7 +1439,7 @@ class DealGenerator:
             if target_cand is None:
                 continue
             # return-to-trading-team ban: buyer can't be in banned teams
-            if buyer_id in {str(t).upper() for t in (target_cand.return_ban_teams or tuple())}:
+            if any(_canon_team_id(t) == buyer_id for t in (target_cand.return_ban_teams or tuple())):
                 continue
 
             # If buyer is above 2nd apron, prefer smaller salary targets to avoid hard-to-match.
@@ -1671,6 +1731,7 @@ class DealGenerator:
         to_team: str,
         catalog: TradeAssetCatalog,
         bucket: str,
+        exclude_pick_ids: Optional[Set[str]] = None,
     ) -> bool:
         from_team_u = _canon_team_id(from_team)
         to_team_u = _canon_team_id(to_team)
@@ -1681,11 +1742,13 @@ class DealGenerator:
         if not ids:
             return False
         existing = _deal_outgoing_pick_ids(deal, from_team_u)
+        excluded = set(exclude_pick_ids or set())
+        incoming = _deal_incoming_pick_ids(deal, from_team_u)
         for pid in ids:
-            if pid in existing:
+            if pid in existing or pid in excluded:
                 continue
             # Stepien check (quick)
-            if not catalog.stepien.is_compliant_after(team_id=from_team_u, outgoing_pick_ids=existing | {pid}, incoming_pick_ids=set()):
+            if not catalog.stepien.is_compliant_after(team_id=from_team_u, outgoing_pick_ids=existing | {pid}, incoming_pick_ids=incoming):
                 continue
             a = _pick_asset(pid, outcat)
             if a is None:
@@ -1731,6 +1794,7 @@ class DealGenerator:
         if outcat is None:
             return False
         existing = _deal_outgoing_pick_ids(deal, from_team_u)
+        incoming = _deal_incoming_pick_ids(deal, from_team_u)
         rejected: Set[str] = set()  # picks tried and rejected (e.g., Stepien)
 
         # Candidate picks ordered by bucket preference.
@@ -1769,7 +1833,7 @@ class DealGenerator:
                 break
 
             pid = str(best.pick_id)
-            if not catalog.stepien.is_compliant_after(team_id=from_team_u, outgoing_pick_ids=existing | {pid}, incoming_pick_ids=set()):
+            if not catalog.stepien.is_compliant_after(team_id=from_team_u, outgoing_pick_ids=existing | {pid}, incoming_pick_ids=incoming):
                 # if this pick makes Stepien illegal, skip it.
                 # IMPORTANT: do NOT add it to `existing` because it is not actually in the deal.
                 rejected.add(pid)
@@ -1806,6 +1870,7 @@ class DealGenerator:
         allow_locked_by_deal_id: Optional[str],
         seen_deals: Set[str],
         budget: _BudgetTracker,
+        tags_set: Optional[Set[str]] = None,
     ) -> Optional[Deal]:
         """If seller is slightly short, add 1-2 sweeteners and re-validate.
 
@@ -1836,6 +1901,7 @@ class DealGenerator:
             actions.append(("pick", "FIRST_SENSITIVE"))
 
         seconds_added = 0
+        scratch_tags: Set[str] = set()
         deal = Deal(teams=list(base_deal.teams), legs={k: list(v) for k, v in base_deal.legs.items()}, meta=dict(base_deal.meta or {}))
         protected = _protected_player_ids_from_meta(deal)
         local_seen: Set[str] = set()  # local pre-validate dedupe for sweetener exploration
@@ -1847,12 +1913,21 @@ class DealGenerator:
             if kind == "pick" and bucket == "SECOND" and seconds_added >= max_seconds:
                 continue
             changed = False
+            attempt_tags: Set[str] = set()
+            tag_added: Optional[str] = None
             if kind == "pick":
                 changed = self._add_pick_by_bucket(deal, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket=bucket)
                 if changed and bucket == "SECOND":
                     seconds_added += 1
+                if changed:
+                    tag_added = f"sweetener:{bucket}"
             elif kind == "swap":
                 changed = self._add_swap_sweetener(deal, from_team=buyer_id, to_team=seller_id, catalog=catalog)
+                if changed:
+                    tag_added = "sweetener:SWAP"
+
+            if tag_added:
+                attempt_tags.add(tag_added)
 
             if not changed:
                 continue
@@ -1882,6 +1957,7 @@ class DealGenerator:
                     catalog=catalog,
                     budgets=budgets,
                     rng=rng,
+                    tags_set=attempt_tags,
                 )
                 if not rep:
                     continue
@@ -1899,6 +1975,8 @@ class DealGenerator:
             if h_final in seen_deals:
                 continue
 
+            # Only now commit the attempt's tags; failed attempts should not pollute tags_set.
+            scratch_tags.update(attempt_tags)
             added += 1
             # early exit if we've added something meaningful
             if added >= 1 and rng.random() < 0.60:
@@ -1909,6 +1987,8 @@ class DealGenerator:
         # keep protected meta
         if deal.meta is not None and isinstance(deal.meta, dict):
             deal.meta["protected_player_ids"] = list(sorted(protected))
+        if tags_set is not None:
+            tags_set.update(scratch_tags)
         return deal
 
     def _try_swap_outgoing_player_for_fit(
@@ -1925,6 +2005,7 @@ class DealGenerator:
         rng: random.Random,
         allow_locked_by_deal_id: Optional[str],
         budget: _BudgetTracker,
+        tags_set: Optional[Set[str]] = None,
     ) -> Optional[Deal]:
         """If seller rejects due to FIT_FAILS, try swapping a buyer outgoing player to better fit seller needs.
 
@@ -2094,11 +2175,16 @@ class DealGenerator:
                 continue
             new_deal.legs[buyer_id] = leg
 
+            attempt_tags: Set[str] = set()
+
             # validate + optional minimal repair (counts attempted validations regardless of outcome)
             if not budget.try_consume_validations(1):
                 return None
             try:
                 tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+                if tags_set is not None:
+                    tags_set.update(attempt_tags)
+                    tags_set.add("repair:fit_swap")
                 return new_deal
             except TradeError as exc:
                 if exc.code == TRADE_DEADLINE_PASSED:
@@ -2113,6 +2199,7 @@ class DealGenerator:
                     catalog=catalog,
                     budgets=budgets,
                     rng=rng,
+                    tags_set=attempt_tags,
                 )
                 if not rep:
                     continue
@@ -2120,6 +2207,9 @@ class DealGenerator:
                     return None
                 try:
                     tick_ctx.validate_deal(new_deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
+                    if tags_set is not None:
+                        tags_set.update(attempt_tags)
+                        tags_set.add("repair:fit_swap")
                     return new_deal
                 except Exception:
                     continue
@@ -2185,6 +2275,7 @@ class DealGenerator:
             "FILLER_BAD_CONTRACT",
             "EXPIRING",
             "CONSOLIDATE",
+            "VETERAN_SALE",
             "SURPLUS_REDUNDANT",
             "SURPLUS_LOW_FIT",
             "FILLER_CHEAP",
@@ -2233,6 +2324,86 @@ class DealGenerator:
         deal.legs[from_team_u] = leg
         return True
 
+    def _try_add_one_for_one_salary_match_player(
+        self,
+        deal: Deal,
+        *,
+        from_team: str,
+        to_team: str,
+        tick_ctx: TradeGenerationTickContext,
+        catalog: TradeAssetCatalog,
+        protected_players: Set[str],
+        needed_out_salary_m: Optional[float],
+    ) -> bool:
+        """In one-for-one mode, add a single outgoing player that best closes salary-matching.
+
+        This is used when a team has *zero* outgoing players but is restricted to 1-for-1
+        due to being at/over the 2nd apron (or will become restricted after the deal).
+        """
+        from_team_u = _canon_team_id(from_team)
+        to_team_u = _canon_team_id(to_team)
+        outcat = catalog.outgoing_by_team.get(from_team_u)
+        if outcat is None:
+            return False
+
+        leg = list(deal.legs.get(from_team_u, []) or [])
+        if any(isinstance(a, PlayerAsset) for a in leg):
+            # must remain one outgoing player max
+            return False
+
+        # Desired salary in dollars.
+        desired_dollars = 0.0
+        try:
+            if needed_out_salary_m is not None:
+                desired_dollars = max(0.0, float(needed_out_salary_m)) * 1_000_000.0
+        except Exception:
+            desired_dollars = 0.0
+
+        buckets = (
+            "CONSOLIDATE",
+            "VETERAN_SALE",
+            "FILLER_BAD_CONTRACT",
+            "EXPIRING",
+            "SURPLUS_REDUNDANT",
+            "SURPLUS_LOW_FIT",
+            "FILLER_CHEAP",
+        )
+
+        exclude = set(protected_players)
+        candidates: List[Tuple[float, float, str]] = []  # (salary_dollars, market, pid)
+        seen: Set[str] = set()
+        for b in buckets:
+            for pid in (outcat.player_ids_by_bucket.get(b, tuple()) or tuple()):
+                pid_s = str(pid)
+                if pid_s in seen or pid_s in exclude:
+                    continue
+                seen.add(pid_s)
+                c = outcat.players.get(pid_s)
+                if c is None:
+                    continue
+                # return-to-team ban
+                if to_team_u and any(_canon_team_id(t) == to_team_u for t in (c.return_ban_teams or tuple())):
+                    continue
+                sal = _player_salary_amount_dollars(pid_s, from_team=from_team_u, tick_ctx=tick_ctx, catalog=catalog)
+                if float(sal) <= 0.0:
+                    continue
+                candidates.append((float(sal), float(c.market.total), pid_s))
+
+        if not candidates:
+            return False
+
+        def _key(item: Tuple[float, float, str]) -> Tuple[int, float, float, str]:
+            sal, market, pid_s = item
+            # prefer meeting/exceeding the desired salary to satisfy matching;
+            # then closest salary; then lowest market to keep realism.
+            miss = 0 if float(sal) >= float(desired_dollars) else 1
+            return (miss, abs(float(sal) - float(desired_dollars)), float(market), str(pid_s))
+
+        candidates.sort(key=_key)
+        pick_pid = candidates[0][2]
+        deal.legs[from_team_u] = leg + [_player_asset(str(pick_pid))]
+        return True
+
     def _repair_until_valid(
         self,
         deal: Deal,
@@ -2245,6 +2416,7 @@ class DealGenerator:
         catalog: TradeAssetCatalog,
         budgets: Mapping[str, int],
         rng: random.Random,
+        tags_set: Optional[Set[str]] = None,
     ) -> bool:
         """Try minimal repair based on TradeError details.
 
@@ -2306,7 +2478,10 @@ class DealGenerator:
             status = str(details.get("status") or "")
             # second apron one-for-one: enforce both legs <= 1 player
             if method == "second_apron_one_for_one":
-                return _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog)
+                modified = _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog)
+                if modified and tags_set is not None:
+                    tags_set.add("repair:one_for_one")
+                return modified
 
             # If either side is predicted to be 2nd-apron one-for-one after this deal, avoid multi-player legs.
             try:
@@ -2319,7 +2494,10 @@ class DealGenerator:
                         sum(1 for a in (deal.legs.get(t, []) or []) if isinstance(a, PlayerAsset)) > 1
                         for t in deal.teams
                     ):
-                        if _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog):
+                        modified = _enforce_one_for_one_players(deal, protected_players=protected, catalog=catalog)
+                        if modified:
+                            if tags_set is not None:
+                                tags_set.add("repair:one_for_one")
                             return True
             except Exception:
                 pass
@@ -2343,8 +2521,37 @@ class DealGenerator:
                 max_out_players = 1 if (one_for_one_fail or one_for_one_other or status == "SECOND_APRON") else 4
 
                 out_players = [a for a in (deal.legs.get(team_fail, []) or []) if isinstance(a, PlayerAsset)]
-                if max_out_players <= 1 and len(out_players) >= 1:
-                    # Can't add another outgoing player: try to swap up the outgoing salary instead.
+
+                # One-for-one restriction: can't add extra outgoing players.
+                if max_out_players <= 1:
+                    if len(out_players) == 0:
+                        # In one-for-one mode with no outgoing player yet, add a single higher-salary outgoing.
+                        added_one = self._try_add_one_for_one_salary_match_player(
+                            deal,
+                            from_team=team_fail,
+                            to_team=other,
+                            tick_ctx=tick_ctx,
+                            catalog=catalog,
+                            protected_players=set(protected),
+                            needed_out_salary_m=gap_m,
+                        )
+                        if added_one:
+                            if tags_set is not None:
+                                tags_set.add("repair:one_for_one")
+                                tags_set.add("repair:salary_filler")
+                            return True
+                        trimmed = _remove_one_incoming_player(
+                            deal,
+                            receiver_team=team_fail,
+                            protected_players=protected,
+                            prefer_remove_high_salary=True,
+                            catalog=catalog,
+                        )
+                        if trimmed and tags_set is not None:
+                            tags_set.add("repair:salary_trim_incoming")
+                        return bool(trimmed)
+
+                    # Already has 1 outgoing player: try to swap up salary.
                     swapped = self._try_swap_outgoing_player_for_salary(
                         deal,
                         from_team=team_fail,
@@ -2355,15 +2562,39 @@ class DealGenerator:
                         needed_add_salary_m=gap_m,
                     )
                     if swapped:
+                        if tags_set is not None:
+                            tags_set.add("repair:salary_swap")
                         return True
-                    # fallback: remove one incoming player (non-target) to the failing team
-                    return _remove_one_incoming_player(
+
+                    trimmed = _remove_one_incoming_player(
                         deal,
                         receiver_team=team_fail,
                         protected_players=protected,
                         prefer_remove_high_salary=True,
                         catalog=catalog,
                     )
+                    if trimmed and tags_set is not None:
+                        tags_set.add("repair:salary_trim_incoming")
+                    return bool(trimmed)
+
+                # If the gap is big, swapping outgoing salary can be higher-impact than adding tiny cheap fillers.
+                try:
+                    if len(out_players) >= 1 and gap_m is not None and float(gap_m) >= 7.5:
+                        swapped = self._try_swap_outgoing_player_for_salary(
+                            deal,
+                            from_team=team_fail,
+                            to_team=other,
+                            tick_ctx=tick_ctx,
+                            catalog=catalog,
+                            protected_players=set(protected),
+                            needed_add_salary_m=gap_m,
+                        )
+                        if swapped:
+                            if tags_set is not None:
+                                tags_set.add("repair:salary_swap")
+                            return True
+                except Exception:
+                    pass
 
                 # Default: add outgoing filler on the failing team
                 added = _add_one_outgoing_filler_player(
@@ -2376,23 +2607,32 @@ class DealGenerator:
                     target_add_salary_m=gap_m,
                 )
                 if added:
+                    if tags_set is not None:
+                        tags_set.add("repair:salary_filler")
                     return True
-                return _remove_one_incoming_player(
+
+                trimmed = _remove_one_incoming_player(
                     deal,
                     receiver_team=team_fail,
                     protected_players=protected,
                     prefer_remove_high_salary=True,
                     catalog=catalog,
                 )
+                if trimmed and tags_set is not None:
+                    tags_set.add("repair:salary_trim_incoming")
+                return bool(trimmed)
 
             # fallback: try remove one incoming player (non-target)
-            return _remove_one_incoming_player(
+            trimmed = _remove_one_incoming_player(
                 deal,
                 receiver_team=buyer_id,
                 protected_players=protected,
                 prefer_remove_high_salary=True,
                 catalog=catalog,
             )
+            if trimmed and tags_set is not None:
+                tags_set.add("repair:salary_trim_incoming")
+            return bool(trimmed)
 
         # 2) roster limit: reduce incoming players or increase outgoing
         if exc.code == ROSTER_LIMIT or rule == "roster_limit":
@@ -2408,10 +2648,12 @@ class DealGenerator:
                 catalog=catalog,
             )
             if removed:
+                if tags_set is not None:
+                    tags_set.add("repair:roster_trim_incoming")
                 return True
             # else add outgoing filler from team_fail
             other = seller_id if team_fail == buyer_id else buyer_id
-            return _add_one_outgoing_filler_player(
+            added = _add_one_outgoing_filler_player(
                 deal,
                 from_team=team_fail,
                 to_team=other,
@@ -2419,6 +2661,9 @@ class DealGenerator:
                 exclude_players=set(protected),
                 max_outgoing_players=4,
             )
+            if added and tags_set is not None:
+                tags_set.add("repair:roster_add_outgoing")
+            return bool(added)
 
         # 3) locks/eligibility/return bans/duplicate assets -> prune (no repair)
         if exc.code in {ASSET_LOCKED, DUPLICATE_ASSET}:
@@ -2428,16 +2673,91 @@ class DealGenerator:
             return False
 
         if rule in {"pick_rules", "ownership", "pick_protection_schema"}:
-            # Try to remove the last-added pick/swap (common failure mode for sweeteners)
+            # Prefer repairing by replacing/downgrading the last-added pick/swap, rather than just deleting.
+            reason = str(details.get("reason") or details.get("subrule") or details.get("code") or "").lower()
+            is_stepien = "stepien" in reason or "stepian" in reason or bool(details.get("stepien_violation"))
+
+            found: Optional[Tuple[str, int, List[Any], Any]] = None
             for team in (buyer_id, seller_id):
                 leg = list(deal.legs.get(team, []) or [])
-                # remove last pick first
                 for i in range(len(leg) - 1, -1, -1):
                     if isinstance(leg[i], (PickAsset, SwapAsset)):
-                        leg.pop(i)
-                        deal.legs[team] = leg
-                        return True
-            return False
+                        found = (team, i, leg, leg[i])
+                        break
+                if found:
+                    break
+            if not found:
+                return False
+
+            team, idx, leg, asset = found
+            team_u = _canon_team_id(team)
+            other = seller_id if team_u == buyer_id else buyer_id
+            outcat = catalog.outgoing_by_team.get(team_u)
+
+            # Remove the problematic asset first, then try to replace.
+            leg.pop(idx)
+            deal.legs[team_u] = leg
+
+            # If it was a swap, prefer replacing with a SECOND pick.
+            if isinstance(asset, SwapAsset):
+                ok = self._add_pick_by_bucket(deal, from_team=team_u, to_team=other, catalog=catalog, bucket="SECOND")
+                if tags_set is not None:
+                    tags_set.add("repair:pick_downgrade" if ok else "repair:pick_remove")
+                return True
+
+            # Pick replacement/downgrade logic.
+            old_pid = str(getattr(asset, "pick_id", "") or "")
+            bucket_map: Dict[str, str] = {}
+            if outcat is not None:
+                for b, ids in (outcat.pick_ids_by_bucket or {}).items():
+                    for pid in (ids or tuple()):
+                        bucket_map[str(pid)] = str(b)
+            old_bucket = bucket_map.get(old_pid, "")
+
+            # 1) If not Stepien, try swapping to a different pick in the *same* bucket.
+            if outcat is not None and old_bucket and (not is_stepien):
+                ok = self._add_pick_by_bucket(
+                    deal,
+                    from_team=team_u,
+                    to_team=other,
+                    catalog=catalog,
+                    bucket=old_bucket,
+                    exclude_pick_ids={old_pid},
+                )
+                if ok:
+                    if tags_set is not None:
+                        tags_set.add("repair:pick_downgrade")
+                    return True
+
+            # 2) Downgrade chain: FIRST_SENSITIVE -> FIRST_SAFE -> SECOND, FIRST_SAFE -> SECOND.
+            chain: List[str] = []
+            if old_bucket == "FIRST_SENSITIVE":
+                chain = ["FIRST_SAFE", "SECOND"]
+            elif old_bucket == "FIRST_SAFE":
+                chain = ["SECOND"]
+            elif old_bucket and old_bucket != "SECOND":
+                chain = ["SECOND"]
+
+            for b in chain:
+                if outcat is None:
+                    break
+                ok = self._add_pick_by_bucket(
+                    deal,
+                    from_team=team_u,
+                    to_team=other,
+                    catalog=catalog,
+                    bucket=b,
+                    exclude_pick_ids={old_pid},
+                )
+                if ok:
+                    if tags_set is not None:
+                        tags_set.add("repair:pick_downgrade")
+                    return True
+
+            # 3) If no replacement was possible, keep the removal.
+            if tags_set is not None:
+                tags_set.add("repair:pick_remove")
+            return True
 
         return False
 
