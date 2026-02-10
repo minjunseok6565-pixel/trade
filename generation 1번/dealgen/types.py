@@ -146,9 +146,6 @@ class DealGeneratorConfig:
     # (SSOT: SalaryMatchingRule은 payroll_after 기반으로 apron status를 판정한다)
     soft_guard_second_apron_by_constraints: bool = True
 
-    # --- sweetener candidate search (best-of-N trials per token)
-    sweetener_candidate_width: int = 3
-
 
 @dataclass(frozen=True, slots=True)
 class DealGeneratorBudget:
@@ -198,11 +195,6 @@ class DealGeneratorStats:
 
     # failure kind -> count
     failures_by_kind: Dict[str, int] = field(default_factory=dict)
-
-    # sweetener telemetry (v2-style)
-    sweetener_trials: int = 0
-    sweetener_commits: int = 0
-    sweetener_rollbacks: int = 0
 
     def bump_failure(self, kind: str) -> None:
         self.failures_by_kind[kind] = int(self.failures_by_kind.get(kind, 0)) + 1
