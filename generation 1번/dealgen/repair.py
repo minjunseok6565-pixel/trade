@@ -73,6 +73,7 @@ def repair_until_valid(
     banned_asset_keys: Set[str],
     banned_players: Set[str],
     stats: DealGeneratorStats,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
 ) -> Tuple[bool, Optional[DealCandidate], int]:
     """validate -> 실패 유형에 따라 최대 budget.max_repairs회 repair.
 
@@ -80,6 +81,8 @@ def repair_until_valid(
     """
 
     validations_used = 0
+    if banned_receivers_by_player is None:
+        banned_receivers_by_player = {}
 
     if not _shape_ok(cand.deal, config=config, catalog=catalog):
         return False, None, validations_used
@@ -95,7 +98,7 @@ def repair_until_valid(
             stats.bump_failure(str(failure.kind.value))
 
             if cand.repairs_used >= int(budget.max_repairs):
-                _apply_prune_side_effects(failure, banned_asset_keys, banned_players)
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_receivers_by_player)
                 return False, None, validations_used
 
             repaired = repair_once(
@@ -108,7 +111,7 @@ def repair_until_valid(
                 banned_players=banned_players,
             )
             if not repaired:
-                _apply_prune_side_effects(failure, banned_asset_keys, banned_players)
+                _apply_prune_side_effects(failure, banned_asset_keys, banned_players, banned_receivers_by_player)
                 return False, None, validations_used
 
             cand.repairs_used += 1
@@ -209,6 +212,7 @@ def _apply_prune_side_effects(
     failure: RuleFailure,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
 ) -> None:
     # (C) 같은 invalid를 반복 생성하지 않도록 금지 목록에 반영
     if failure.kind in (RuleFailureKind.ASSET_LOCK, RuleFailureKind.OWNERSHIP, RuleFailureKind.DUPLICATE_ASSET):
@@ -221,6 +225,16 @@ def _apply_prune_side_effects(
 
     if failure.kind == RuleFailureKind.PLAYER_ELIGIBILITY and failure.player_id and failure.reason == "recent_contract_signing":
         banned_players.add(failure.player_id)
+
+    # Return-to-trading-team: 특정 player가 특정 receiver로 못 가는 조합을 학습해서 재발 방지
+    # (types.py가 아직 to_team을 보존하지 않는 상태에서도 안전하게 동작하도록 getattr 사용)
+    if banned_receivers_by_player is not None and failure.kind == RuleFailureKind.RETURN_TO_TRADING_TEAM:
+        pid = getattr(failure, "player_id", None)
+        to_team = getattr(failure, "to_team", None)
+        if pid and to_team:
+            pid_s = str(pid)
+            to_u = str(to_team).upper()
+            banned_receivers_by_player.setdefault(pid_s, set()).add(to_u)
 
 
 @dataclass(frozen=True, slots=True)
