@@ -44,7 +44,7 @@ from .asset_catalog import (
 )
 
 from .dealgen_types import DealGeneratorConfig, DealProposal, DealGenerationStats, _Budgets, _DealSpec, _GenState
-from .dealgen_utils import _canon_team_id, _is_ban_active, _is_locked
+from .dealgen_utils import _canon_team_id, _is_ban_active, _is_locked, _clamp01
 
 def _select_sale_assets(state: _GenState, *, seller_id: str, budgets: _Budgets) -> List[PlayerTradeCandidate]:
     """Pick outgoing assets to shop in SELL mode (surplus/expiring/vet-sale first)."""
