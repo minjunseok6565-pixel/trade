@@ -38,6 +38,7 @@ from ..asset_catalog import (
     build_trade_asset_catalog,
 )
 from .utils import _canon_team_id
+from .need_fit import _need_fit_score
 
 def _pick_from_buckets(
     outcat: TeamOutgoingCatalog,
