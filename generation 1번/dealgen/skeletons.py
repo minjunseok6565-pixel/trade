@@ -664,7 +664,7 @@ def _top_k_youngish_players(
     k: int,
     banned_players: Set[str],
     receiver_team_id: Optional[str] = None,
-    banned_receivers_by_player=banned_receivers_by_player,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
     """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young-ish' top-k.
