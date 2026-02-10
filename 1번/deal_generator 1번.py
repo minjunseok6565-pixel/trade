@@ -708,7 +708,10 @@ def _generate_buy_mode(
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
 
     # 탐색 상태
-    seen: Set[str] = set()
+    # - seen_skeleton: repair 이전(스켈레톤/변형 단계) 중복 제거
+    # - seen_final: repair/sweetener 이후(최종 딜 형태) 중복 제거
+    seen_skeleton: Set[str] = set()
+    seen_final: Set[str] = set()
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
 
@@ -805,9 +808,9 @@ def _generate_buy_mode(
             stats.candidates_attempted += 1
 
             h = dedupe_hash(cand.deal)
-            if h in seen:
+            if h in seen_skeleton:
                 continue
-            seen.add(h)
+            seen_skeleton.add(h)
 
             ok, cand2, v_used = repair_until_valid(
                 cand,
@@ -823,6 +826,12 @@ def _generate_buy_mode(
             stats.validations += v_used
             if not ok or cand2 is None:
                 continue
+
+            # (A) repair 이후 형태 기준 중복 제거(수리 과정에서 서로 다른 스켈레톤이 같은 딜로 수렴 가능)
+            h_valid = dedupe_hash(cand2.deal)
+            if h_valid in seen_final:
+                continue
+            seen_final.add(h_valid)
 
             # evaluate
             base_prop, e_used = evaluate_and_score(
@@ -860,6 +869,12 @@ def _generate_buy_mode(
                 stats.validations += extra_v
                 stats.evaluations += extra_e
 
+            # (B) sweetener 이후 최종 형태 기준 중복 제거
+            h_best = dedupe_hash(best_prop.deal)
+            if h_best in seen_final and h_best != h_valid:
+                continue
+            seen_final.add(h_best)
+
             proposals = _push_best(
                 proposals,
                 best_prop,
@@ -887,7 +902,10 @@ def _generate_sell_mode(
     ts_seller = tick_ctx.get_team_situation(seller_id)
 
     # 탐색 상태
-    seen: Set[str] = set()
+    # - seen_skeleton: repair 이전(스켈레톤/변형 단계) 중복 제거
+    # - seen_final: repair/sweetener 이후(최종 딜 형태) 중복 제거
+    seen_skeleton: Set[str] = set()
+    seen_final: Set[str] = set()
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
 
@@ -983,9 +1001,9 @@ def _generate_sell_mode(
                 stats.candidates_attempted += 1
 
                 h = dedupe_hash(cand.deal)
-                if h in seen:
+                if h in seen_skeleton:
                     continue
-                seen.add(h)
+                seen_skeleton.add(h)
 
                 ok, cand2, v_used = repair_until_valid(
                     cand,
@@ -1001,6 +1019,12 @@ def _generate_sell_mode(
                 stats.validations += v_used
                 if not ok or cand2 is None:
                     continue
+
+                # (A) repair 이후 형태 기준 중복 제거(수리 과정에서 서로 다른 스켈레톤이 같은 딜로 수렴 가능)
+                h_valid = dedupe_hash(cand2.deal)
+                if h_valid in seen_final:
+                    continue
+                seen_final.add(h_valid)
 
                 base_prop, e_used = evaluate_and_score(
                     cand2.deal,
@@ -1034,6 +1058,12 @@ def _generate_sell_mode(
                     )
                     stats.validations += extra_v
                     stats.evaluations += extra_e
+
+                # (B) sweetener 이후 최종 형태 기준 중복 제거
+                h_best = dedupe_hash(best_prop.deal)
+                if h_best in seen_final and h_best != h_valid:
+                    continue
+                seen_final.add(h_best)
 
                 proposals = _push_best(proposals, best_prop, max_results=max_results)
                 partner_counts[best_prop.buyer_id] = int(partner_counts.get(best_prop.buyer_id, 0)) + 1
@@ -2054,7 +2084,7 @@ def expand_variants(
             _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
     # --- archetype: young + pick variants (top 2 youngish)
-    young_ids = _top_k_youngish_players(buyer_out, k=2, banned_players=banned_players)
+    young_ids = _top_k_youngish_players(buyer_out, k=2, banned_players=banned_players, receiver_team_id=seller)
     for pid in young_ids:
         for prefer, max_picks in [(("SECOND",), 1), (("SECOND", "SECOND"), 2)]:
             d = _base_deal()
@@ -2078,6 +2108,7 @@ def expand_variants(
         target_salary_m=float(target.salary_m),
         k=3,
         banned_players=banned_players,
+        receiver_team_id=seller,
     )
     for pid in filler_ids:
         d = _base_deal()
@@ -2091,6 +2122,7 @@ def expand_variants(
         k=2,
         banned_players=banned_players,
         descending=True,
+        receiver_team_id=seller,
     )
     cheap_ids = _top_k_bucket_players_by_market(
         buyer_out,
@@ -2098,6 +2130,7 @@ def expand_variants(
         k=2,
         banned_players=banned_players,
         descending=False,
+        receiver_team_id=seller,
     )
     for cid in cons_ids:
         for fid in cheap_ids:
@@ -2134,8 +2167,22 @@ def expand_variants(
     return out
 
 
-def _top_k_youngish_players(out: TeamOutgoingCatalog, *, k: int, banned_players: Set[str]) -> List[str]:
-    """버킷에 YOUNG가 없으므로 age 기반으로 'young-ish' top-k."""
+def _top_k_youngish_players(
+    out: TeamOutgoingCatalog,
+    *,
+    k: int,
+    banned_players: Set[str],
+    receiver_team_id: Optional[str] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> List[str]:
+    """버킷에 YOUNG가 없으므로 age 기반으로 'young-ish' top-k.
+
+    BUY 모드 variant 생성에서 invalid 낭비를 줄이기 위해,
+    - receiver_team_id가 주어지면 return_ban_teams(되돌아가기 금지) 사전 필터를 적용한다.
+    - must_be_aggregation_friendly=True면 aggregation_solo_only 후보는 제외한다.
+    """
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     cands: List[PlayerTradeCandidate] = []
     for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
         for pid in out.player_ids_by_bucket.get(b, tuple()):
@@ -2144,6 +2191,12 @@ def _top_k_youngish_players(out: TeamOutgoingCatalog, *, k: int, banned_players:
             c = out.players.get(pid)
             if c is None:
                 continue
+
+            if receiver and receiver in (c.return_ban_teams or ()):
+                continue
+            if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+                continue
+
             age = c.snap.age
             if age is not None and float(age) <= 24.5:
                 cands.append(c)
@@ -2159,7 +2212,17 @@ def _top_k_fillers_by_salary_gap(
     target_salary_m: float,
     k: int,
     banned_players: Set[str],
+    receiver_team_id: Optional[str] = None,
+    must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
+    """target salary 근처 filler 후보 top-k.
+
+    BUY 모드 variant 생성에서 invalid 낭비를 줄이기 위해,
+    - receiver_team_id가 주어지면 return_ban_teams 사전 필터를 적용한다.
+    - must_be_aggregation_friendly=True면 aggregation_solo_only 후보는 제외한다.
+    """
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     ids: List[str] = []
     for b in ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"):
         ids.extend(list(out.player_ids_by_bucket.get(b, tuple())))
@@ -2171,6 +2234,12 @@ def _top_k_fillers_by_salary_gap(
         c = out.players.get(pid)
         if c is None:
             continue
+
+        if receiver and receiver in (c.return_ban_teams or ()):
+            continue
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+            continue
+
         gap = abs(float(c.salary_m) - float(target_salary_m))
         scored.append((gap, float(c.market.total), pid))
     scored.sort(key=lambda x: (x[0], x[1], x[2]))
@@ -2184,12 +2253,32 @@ def _top_k_bucket_players_by_market(
     k: int,
     banned_players: Set[str],
     descending: bool,
+    receiver_team_id: Optional[str] = None,
+    must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
-    ids = [pid for pid in out.player_ids_by_bucket.get(bucket, tuple()) if pid not in banned_players]
+    """특정 버킷에서 market.total 기준 top-k.
+
+    BUY 모드 variant 생성에서 invalid 낭비를 줄이기 위해,
+    - receiver_team_id가 주어지면 return_ban_teams 사전 필터를 적용한다.
+    - must_be_aggregation_friendly=True면 aggregation_solo_only 후보는 제외한다.
+    """
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     scored: List[Tuple[float, str]] = []
-    for pid in ids:
+    for pid in out.player_ids_by_bucket.get(bucket, tuple()):
+        if pid in banned_players:
+            continue
         c = out.players.get(pid)
-        scored.append((float(c.market.total) if c is not None else 0.0, pid))
+        if c is None:
+            continue
+
+        if receiver and receiver in (c.return_ban_teams or ()):
+            continue
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+            continue
+
+        scored.append((float(c.market.total), pid))
+
     scored.sort(key=lambda x: (x[0], x[1]), reverse=bool(descending))
     return [pid for _, pid in scored[: int(k)]]
 
@@ -2197,7 +2286,6 @@ def _top_k_bucket_players_by_market(
 # =============================================================================
 # Validate + Repair
 # =============================================================================
-
 
 def repair_until_valid(
     cand: DealCandidate,
@@ -2292,15 +2380,29 @@ def repair_once(
             banned_players.add(pid)
             return False
         if reason == "aggregation_ban":
+            # aggregation_ban: 해당 선수는 '트레이드 불가'가 아니라
+            # '다른 선수와 묶어서(2+ outgoing) 보낼 수 없음'이므로,
+            # 최소 수정은 pid를 유지하고 나머지 outgoing player를 제거하여 1-for-1로 만드는 것이다.
             team_id = str(failure.team_id or "").upper()
             if not team_id or team_id not in cand.deal.legs:
                 return False
-            assets = cand.deal.legs[team_id]
+            assets = list(cand.deal.legs[team_id] or [])
             players = [a for a in assets if isinstance(a, PlayerAsset)]
             if len(players) <= 1:
                 return False
-            cand.deal.legs[team_id] = [a for a in assets if not (isinstance(a, PlayerAsset) and a.player_id == pid)]
-            cand.tags.append("repair:aggregation_remove")
+
+            keep_player: Optional[PlayerAsset] = None
+            for a in players:
+                if a.player_id == pid:
+                    keep_player = a
+                    break
+            if keep_player is None:
+                # fallback: pid가 leg에 없으면 첫 번째 player만 남긴다.
+                keep_player = players[0]
+
+            non_players: List[Asset] = [a for a in assets if not isinstance(a, PlayerAsset)]
+            cand.deal.legs[team_id] = [keep_player] + non_players
+            cand.tags.append("repair:aggregation_keep_solo")
             return True
         return False
 
