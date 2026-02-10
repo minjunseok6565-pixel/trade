@@ -317,11 +317,22 @@ def maybe_apply_sweeteners(
         if best_prop is None or best_deal is None:
             continue
 
+        min_imp = float(config.sweetener_min_improvement)
         # Commit only if it improves receiver without worsening the other side's verdict.
         old_rv = _receiver_verdict(current_best)
         new_rv = _receiver_verdict(best_prop)
         old_ov = _other_verdict(current_best)
         new_ov = _other_verdict(best_prop)
+
+        # ---- Early stop / waste guard (v1 feature restored, v2-friendly)
+        # 의미 있는 개선이 거의 없으면 더 붙여도 낭비일 확률이 높아 전체 루프 중단.
+        # 단, receiver verdict가 실제로 개선된 경우(예: COUNTER->ACCEPT)는 무조건 허용.
+        score_delta = float(best_prop.score) - float(current_best.score)
+        margin_delta = float(_receiver_margin(best_prop)) - float(_receiver_margin(current_best))
+        verdict_improved = verdict_rank.get(new_rv, 0) > verdict_rank.get(old_rv, 0)
+        if (not verdict_improved) and max(score_delta, margin_delta) < min_imp:
+            # best-of-N으로 봤는데도 이 정도면, 다음 sweetener는 효율이 낮다.
+            break
 
         receiver_improve = verdict_rank.get(new_rv, 0) > verdict_rank.get(old_rv, 0) or (_receiver_margin(best_prop) > _receiver_margin(current_best) + 1e-6)
         other_not_worse = verdict_rank.get(new_ov, 0) >= verdict_rank.get(old_ov, 0)
