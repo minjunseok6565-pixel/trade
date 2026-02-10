@@ -37,6 +37,7 @@ from ..asset_catalog import (
     TradeAssetCatalog,
     build_trade_asset_catalog,
 )
+from .utils import _team_time_horizon
 
 def _is_rebuildish(ts: Any) -> bool:
     th = _team_time_horizon(ts)
