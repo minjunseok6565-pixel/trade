@@ -44,7 +44,7 @@ from .asset_catalog import (
 )
 
 from .dealgen_types import DealGeneratorConfig, DealProposal, DealGenerationStats, _Budgets, _DealSpec, _GenState
-from .dealgen_utils import _canon_team_id, _is_locked
+from .dealgen_utils import _canon_team_id, _is_locked, _is_ban_active
 
 def _spec_to_deal(state: _GenState, spec: _DealSpec) -> Optional[Deal]:
     """Convert a spec to a 2-team Deal object, with strict asset validity checks."""
