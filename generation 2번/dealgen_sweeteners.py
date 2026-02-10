@@ -44,7 +44,7 @@ from .asset_catalog import (
 )
 
 from .dealgen_types import DealGeneratorConfig, DealProposal, DealGenerationStats, _Budgets, _DealSpec, _GenState
-from .dealgen_utils import _deal_complexity_exceeds, _is_locked
+from .dealgen_utils import _deal_complexity_exceeds, _is_locked, _canon_team_id, _deal_fingerprint_2team
 from .dealgen_scoring import _spec_to_deal, _evaluate_and_score
 
 def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budgets, partner_id: Optional[str] = None) -> List[DealProposal]:
