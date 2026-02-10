@@ -44,7 +44,8 @@ from .asset_catalog import (
 )
 
 from .dealgen_types import DealGeneratorConfig, DealProposal, DealGenerationStats, _Budgets, _DealSpec, _GenState
-from .dealgen_utils import _deal_complexity_exceeds, _is_locked
+from .dealgen_utils import _deal_complexity_exceeds, _is_locked, _canon_team_id
+from .dealgen_skeletons import _collect_buyer_player_candidates
 from .dealgen_scoring import _spec_to_deal
 
 def _repair_until_valid(state: _GenState, spec: _DealSpec, *, budgets: _Budgets) -> Optional[Deal]:
