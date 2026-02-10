@@ -200,6 +200,15 @@ def _generate_buy_mode(
 
     partner_counts: Dict[str, int] = {}
 
+    # partner diversity
+    # - soft penalty는 scoring.score_deal()에서 opponent_repeat_penalty로 이미 처리한다.
+    # - hard cap(max_partner_repeats)을 적용하려면, cap 적용 전까지 후보 풀을 넉넉히 유지해야
+    #   결과가 한 팀에 쏠릴 때도 다양화된 최종 리스트를 채울 수 있다.
+    partner_cap = int(getattr(config, "max_partner_repeats", 0) or 0)
+    pool_cap = int(max_results)
+    if partner_cap > 0:
+        pool_cap = max(pool_cap, int(max_results) * max(2, partner_cap))
+
     max_sweetener_trials_per_base = int(getattr(config, "sweetener_max_trials_per_base", 2))
 
     targets = select_targets_buy(
@@ -213,7 +222,7 @@ def _generate_buy_mode(
     )
 
     for t in targets:
-        if len(proposals) >= max_results:
+        if len(proposals) >= pool_cap:
             break
         if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
             break
@@ -282,7 +291,7 @@ def _generate_buy_mode(
         for cand in candidates:
             if attempts >= budget.max_attempts_per_target:
                 break
-            if len(proposals) >= max_results:
+            if len(proposals) >= pool_cap:
                 break
             if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
                 break
@@ -412,12 +421,18 @@ def _generate_buy_mode(
             proposals = _push_best(
                 proposals,
                 pushed,
-                max_results=max_results,
+                max_results=pool_cap,
             )
             partner_counts[pushed.seller_id] = int(partner_counts.get(pushed.seller_id, 0)) + 1
 
     proposals.sort(key=lambda p: p.score, reverse=True)
-    return proposals[:max_results]
+    proposals = _apply_partner_cap(
+        proposals,
+        max_results=max_results,
+        partner_side="seller",  # BUY: 다양화 기준 = seller
+        cap=partner_cap,
+    )
+    return proposals
 
 
 def _generate_sell_mode(
@@ -457,6 +472,12 @@ def _generate_sell_mode(
     proposals: List[DealProposal] = []
     partner_counts: Dict[str, int] = {}
 
+    # partner diversity (SELL 모드에서는 'buyer'가 파트너)
+    partner_cap = int(getattr(config, "max_partner_repeats", 0) or 0)
+    pool_cap = int(max_results)
+    if partner_cap > 0:
+        pool_cap = max(pool_cap, int(max_results) * max(2, partner_cap))
+
     max_sweetener_trials_per_base = int(getattr(config, "sweetener_max_trials_per_base", 2))
 
     sale_assets = select_targets_sell(
@@ -470,7 +491,7 @@ def _generate_sell_mode(
     )
 
     for s in sale_assets:
-        if len(proposals) >= max_results:
+        if len(proposals) >= pool_cap:
             break
         if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
             break
@@ -488,7 +509,7 @@ def _generate_sell_mode(
         )
 
         for buyer_id, match_tag in buyer_candidates:
-            if len(proposals) >= max_results:
+            if len(proposals) >= pool_cap:
                 break
             if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
                 break
@@ -539,7 +560,7 @@ def _generate_sell_mode(
             for cand in candidates:
                 if attempts >= budget.max_attempts_per_target:
                     break
-                if len(proposals) >= max_results:
+                if len(proposals) >= pool_cap:
                     break
                 if stats.validations >= budget.max_validations or stats.evaluations >= budget.max_evaluations:
                     break
@@ -662,11 +683,61 @@ def _generate_sell_mode(
                 if pushed is None:
                     continue
 
-                proposals = _push_best(proposals, pushed, max_results=max_results)
+                proposals = _push_best(proposals, pushed, max_results=pool_cap)
                 partner_counts[pushed.buyer_id] = int(partner_counts.get(pushed.buyer_id, 0)) + 1
 
     proposals.sort(key=lambda p: p.score, reverse=True)
-    return proposals[:max_results]
+    proposals = _apply_partner_cap(
+        proposals,
+        max_results=max_results,
+        partner_side="buyer",  # SELL: 다양화 기준 = buyer
+        cap=partner_cap,
+    )
+    return proposals
+
+
+def _apply_partner_cap(
+    proposals: List[DealProposal],
+    *,
+    max_results: int,
+    partner_side: str,
+    cap: int,
+) -> List[DealProposal]:
+    """Final output 다양화를 위한 hard cap 적용.
+
+    v1은 scoring 단계에서 이미 soft penalty(opponent_repeat_penalty)를 적용하고 있으므로,
+    여기서는 hard cap만 강제한다.
+
+    partner_side:
+      - "seller": BUY 모드에서 seller_id 기준으로 cap
+      - "buyer":  SELL 모드에서 buyer_id 기준으로 cap
+    """
+    max_results_i = max(0, int(max_results))
+    if max_results_i <= 0:
+        return []
+
+    cap_i = int(cap or 0)
+    if cap_i <= 0:
+        return proposals[:max_results_i]
+
+    side = str(partner_side or "").lower()
+    if side not in ("seller", "buyer"):
+        side = "seller"
+
+    counts: Dict[str, int] = {}
+    out: List[DealProposal] = []
+
+    for p in proposals:
+        partner = p.seller_id if side == "seller" else p.buyer_id
+        c = int(counts.get(partner, 0))
+        if c >= cap_i:
+            continue
+        out.append(p)
+        counts[partner] = c + 1
+        if len(out) >= max_results_i:
+            break
+
+    return out
 
 
 def _push_best(existing: List[DealProposal], prop: DealProposal, *, max_results: int) -> List[DealProposal]:
@@ -936,5 +1007,4 @@ def _beam_select_candidates(
     if need > 0:
         out.extend(pool[:need])
     return out[:cap_n]
-
 
