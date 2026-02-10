@@ -318,6 +318,7 @@ def _generate_buy_mode(
             rng=rng,
             banned_asset_keys=banned_asset_keys,
             banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
         )
 
         if not candidates:
