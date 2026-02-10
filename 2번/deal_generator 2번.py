@@ -1012,7 +1012,7 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
     young_k = 2 if rebuildish else 1
     young_pkg_n = 3 if rebuildish else 1
 
-    enable_2for1 = bool(cfg.enable_consolidate_2for1) and (not apron_one_for_one_hint) and win_nowish
+    enable_2for1 = bool(cfg.enable_consolidate_2for1) and win_nowish
 
     skeletons: List[_DealSpec] = []
 
@@ -1110,10 +1110,12 @@ def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: Incom
             sk.tags.append(f"return_need:{rt}")
         skeletons.append(sk)
 
-    # --- archetype: consolidate (2-for-1) (mostly a win-now depth play; disabled for 2nd apron hint)
+    # --- archetype: consolidate (2-for-1) (mostly a win-now depth play; search width reduced for 2nd apron hint)
     if enable_2for1 and cons and filler:
-        top_a = _rank_for_need(cons[:6], need_map=seller_need_map)[:2]
-        top_b = _rank_for_need(filler[:10], need_map=seller_need_map)[:4]
+        a_take = 1 if apron_one_for_one_hint else 2
+        b_take = 2 if apron_one_for_one_hint else 4
+        top_a = _rank_for_need(cons[:6], need_map=seller_need_map)[:a_take]
+        top_b = _rank_for_need(filler[:10], need_map=seller_need_map)[:b_take]
         for a in top_a:
             for b in top_b:
                 if a.player_id == b.player_id:
@@ -1366,10 +1368,31 @@ def _picks_packages(state: _GenState, buyer_out: TeamOutgoingCatalog, *, max_pac
     invalid first-pick combinations and wasting validation budget.
     """
     team_id = buyer_out.team_id
-    picks_second = [pid for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()) if pid not in state.banned_picks[team_id]]
-    picks_first_safe = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()) if pid not in state.banned_picks[team_id]]
-    picks_first_sens = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()) if pid not in state.banned_picks[team_id]]
-    swaps = [sid for sid in buyer_out.swap_ids if sid not in state.banned_swaps[team_id]]
+
+    def _pick_ok(pid: str) -> bool:
+        if pid in state.banned_picks[team_id]:
+            return False
+        cand = buyer_out.picks.get(pid)
+        if cand is None:
+            return False
+        if _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+            return False
+        return True
+
+    def _swap_ok(sid: str) -> bool:
+        if sid in state.banned_swaps[team_id]:
+            return False
+        cand = buyer_out.swaps.get(sid)
+        if cand is None:
+            return False
+        if _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+            return False
+        return True
+
+    picks_second = [pid for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()) if _pick_ok(pid)]
+    picks_first_safe = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()) if _pick_ok(pid)]
+    picks_first_sens = [pid for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()) if _pick_ok(pid)]
+    swaps = [sid for sid in buyer_out.swap_ids if _swap_ok(sid)]
 
     seconds_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
     swap_pkgs: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
@@ -2181,6 +2204,13 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
     if current_spec is None:
         return [proposal]
 
+    origin_spec = current_spec.copy()
+    origin_pick_set = set(origin_spec.buyer_picks_out)
+    origin_swap_set = set(origin_spec.buyer_swaps_out)
+
+    def _added_sweeteners(spec: _DealSpec) -> int:
+        return len(set(spec.buyer_picks_out) - origin_pick_set) + len(set(spec.buyer_swaps_out) - origin_swap_set)
+
     max_add = max(0, int(cfg.max_sweeteners))
     if max_add <= 0:
         return [proposal]
@@ -2191,7 +2221,7 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
     def _count_seconds(spec: _DealSpec) -> int:
         return sum(1 for pid in spec.buyer_picks_out if pid in second_ids)
 
-    committed = 0
+    committed = _added_sweeteners(current_spec)
 
     verdict_rank = {DealVerdict.REJECT: 0, DealVerdict.COUNTER: 1, DealVerdict.ACCEPT: 2}
 
@@ -2201,11 +2231,8 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
         if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
             break
 
-        # Compare top 2~3 candidates per token (budget-capped) and commit the best.
-        base_spec = current_spec
-        used_picks = set(base_spec.buyer_picks_out)
-        used_swaps = set(base_spec.buyer_swaps_out)
-        seconds_added = _count_seconds(base_spec)
+        # Compare top candidates per token (budget-capped) and commit the best.
+        # Always consider the original spec so earlier commits don't block later single-sweetener paths.
 
         # Budget-aware candidate width (each candidate costs ~1 validation + 2 evaluations)
         cand_limit = int(getattr(cfg, "sweetener_candidate_width", 3) or 3)
@@ -2228,123 +2255,185 @@ def _sweetener_loop(state: _GenState, proposal: DealProposal, *, budgets: _Budge
             "SWAP": "sweetener:swap",
         }.get(token, "sweetener:asset")
 
-        candidates: List[Tuple[Optional[str], Optional[str]]] = []
-        if token == "SECOND":
-            if seconds_added >= 2:
-                continue
-            for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()):
-                if pid in used_picks or pid in state.banned_picks[buyer_id]:
-                    continue
-                if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
-                    continue
-                candidates.append((pid, None))
-                if len(candidates) >= cand_limit:
-                    break
+        def _spec_key(s: _DealSpec) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+            return (
+                tuple(s.buyer_players_out),
+                tuple(s.seller_players_out),
+                tuple(sorted(s.buyer_picks_out)),
+                tuple(sorted(s.buyer_swaps_out)),
+                tuple(sorted(s.seller_picks_out)),
+                tuple(sorted(s.seller_swaps_out)),
+            )
 
-        elif token == "FIRST_SAFE":
-            for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()):
-                if pid in used_picks or pid in state.banned_picks[buyer_id]:
-                    continue
-                if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
-                    continue
-                candidates.append((pid, None))
-                if len(candidates) >= cand_limit:
-                    break
+        base_specs: List[_DealSpec] = [origin_spec]
+        if _spec_key(current_spec) != _spec_key(origin_spec) and cand_limit >= 2:
+            base_specs.append(current_spec)
 
-        elif token == "FIRST_SENSITIVE":
-            for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()):
-                if pid in used_picks or pid in state.banned_picks[buyer_id]:
-                    continue
-                if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
-                    continue
-                candidates.append((pid, None))
-                if len(candidates) >= cand_limit:
-                    break
+        # Split candidate width across base specs without exceeding the overall cand_limit.
+        if len(base_specs) == 1:
+            base_limits = [cand_limit]
+        else:
+            per = max(1, cand_limit // len(base_specs))
+            base_limits = [cand_limit - per * (len(base_specs) - 1)] + [per] * (len(base_specs) - 1)
 
-        elif token == "SWAP":
-            for sid in buyer_out.swap_ids:
-                if sid in used_swaps or sid in state.banned_swaps[buyer_id]:
-                    continue
-                candidates.append((None, sid))
-                if len(candidates) >= cand_limit:
-                    break
+        candidates_by_base: List[Tuple[_DealSpec, List[Tuple[Optional[str], Optional[str]]]]] = []
+        for base_spec, base_limit in zip(base_specs, base_limits):
+            used_picks = set(base_spec.buyer_picks_out)
+            used_swaps = set(base_spec.buyer_swaps_out)
+            seconds_added = _count_seconds(base_spec)
 
-        if not candidates:
+            candidates: List[Tuple[Optional[str], Optional[str]]] = []
+            if token == "SECOND":
+                if seconds_added >= 2:
+                    continue
+                for pid in buyer_out.pick_ids_by_bucket.get("SECOND", ()):  # type: ignore[union-attr]
+                    if pid in used_picks or pid in state.banned_picks[buyer_id]:
+                        continue
+                    cand = buyer_out.picks.get(pid)
+                    if cand is None or _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+                        continue
+                    if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
+                        continue
+                    candidates.append((pid, None))
+                    if len(candidates) >= base_limit:
+                        break
+
+            elif token == "FIRST_SAFE":
+                for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SAFE", ()):  # type: ignore[union-attr]
+                    if pid in used_picks or pid in state.banned_picks[buyer_id]:
+                        continue
+                    cand = buyer_out.picks.get(pid)
+                    if cand is None or _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+                        continue
+                    if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
+                        continue
+                    candidates.append((pid, None))
+                    if len(candidates) >= base_limit:
+                        break
+
+            elif token == "FIRST_SENSITIVE":
+                for pid in buyer_out.pick_ids_by_bucket.get("FIRST_SENSITIVE", ()):  # type: ignore[union-attr]
+                    if pid in used_picks or pid in state.banned_picks[buyer_id]:
+                        continue
+                    cand = buyer_out.picks.get(pid)
+                    if cand is None or _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+                        continue
+                    if not _stepien_ok_after(stepien, buyer_id, outgoing_pick_ids=set(used_picks) | {pid}):
+                        continue
+                    candidates.append((pid, None))
+                    if len(candidates) >= base_limit:
+                        break
+
+            elif token == "SWAP":
+                for sid in buyer_out.swap_ids:  # type: ignore[union-attr]
+                    if sid in used_swaps or sid in state.banned_swaps[buyer_id]:
+                        continue
+                    cand = buyer_out.swaps.get(sid)
+                    if cand is None or _is_locked(cand.lock, allow_locked_by_deal_id=state.allow_locked_by_deal_id):
+                        continue
+                    candidates.append((None, sid))
+                    if len(candidates) >= base_limit:
+                        break
+
+            if candidates:
+                candidates_by_base.append((base_spec, candidates))
+
+        if not candidates_by_base:
             continue
 
         best_p: Optional[DealProposal] = None
         best_spec: Optional[_DealSpec] = None
-        best_key: Optional[Tuple[int, float, float]] = None
+        best_key: Optional[Tuple[int, int, int, float, float]] = None
 
-        for cand_pick, cand_swap in candidates:
-            if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
-                break
+        done_token = False
+        for base_spec, candidates in candidates_by_base:
+            for cand_pick, cand_swap in candidates:
+                if state.stats.validations >= budgets.max_validations or state.stats.evaluations >= budgets.max_evaluations:
+                    done_token = True
+                    break
 
-            trial_spec = base_spec.copy()
-            if cand_pick is not None:
-                trial_spec.buyer_picks_out.append(cand_pick)
-                trial_spec.tags.append(cand_tag if token != "SWAP" else "sweetener:pick")
-            if cand_swap is not None:
-                trial_spec.buyer_swaps_out.append(cand_swap)
-                trial_spec.tags.append("sweetener:swap")
+                trial_spec = base_spec.copy()
+                if cand_pick is not None:
+                    trial_spec.buyer_picks_out.append(cand_pick)
+                    trial_spec.tags.append(cand_tag if token != "SWAP" else "sweetener:pick")
+                if cand_swap is not None:
+                    trial_spec.buyer_swaps_out.append(cand_swap)
+                    trial_spec.tags.append("sweetener:swap")
 
-            # Validate without repair (sweetener must remain attached).
-            state.stats.sweetener_trials += 1
-            deal2 = _spec_to_deal(state, trial_spec)
-            if deal2 is None or _deal_complexity_exceeds(cfg, deal2):
-                state.stats.sweetener_rollbacks += 1
-                continue
+                # Validate without repair (sweetener must remain attached).
+                state.stats.sweetener_trials += 1
+                deal2 = _spec_to_deal(state, trial_spec)
+                if deal2 is None or _deal_complexity_exceeds(cfg, deal2):
+                    state.stats.sweetener_rollbacks += 1
+                    continue
 
-            try:
-                state.tick_ctx.validate_deal(deal2, allow_locked_by_deal_id=state.allow_locked_by_deal_id)
-                state.stats.validations += 1
-            except TradeError as err:
-                state.stats.validations += 1
-                state.stats.record_error(err)
-                details = err.details if isinstance(err.details, dict) else {}
-                # Intrinsic horizon: hard-ban the candidate pick only in that case.
-                if str(details.get("rule") or "") == "pick_rules" and str(details.get("reason") or "") == "pick_too_far":
-                    if cand_pick is not None:
-                        state.banned_picks[buyer_id].add(str(cand_pick))
-                        state.stats.pruned_stepien += 1
-                state.stats.sweetener_rollbacks += 1
-                continue
+                try:
+                    state.tick_ctx.validate_deal(deal2, allow_locked_by_deal_id=state.allow_locked_by_deal_id)
+                    state.stats.validations += 1
+                except TradeError as err:
+                    state.stats.validations += 1
+                    state.stats.record_error(err)
+                    details = err.details if isinstance(err.details, dict) else {}
+                    # Intrinsic horizon: hard-ban the candidate pick only in that case.
+                    if str(details.get("rule") or "") == "pick_rules" and str(details.get("reason") or "") == "pick_too_far":
+                        if cand_pick is not None:
+                            state.banned_picks[buyer_id].add(str(cand_pick))
+                            state.stats.pruned_stepien += 1
+                    state.stats.sweetener_rollbacks += 1
+                    continue
 
-            fp = _deal_fingerprint_2team(deal2)
-            if fp in state.seen_fingerprints:
-                state.stats.pruned_duplicate += 1
-                state.stats.sweetener_rollbacks += 1
-                continue
-            state.seen_fingerprints.add(fp)
+                fp = _deal_fingerprint_2team(deal2)
+                if fp in state.seen_fingerprints:
+                    state.stats.pruned_duplicate += 1
+                    state.stats.sweetener_rollbacks += 1
+                    continue
+                state.seen_fingerprints.add(fp)
 
-            p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
-            if p2 is None:
-                state.stats.sweetener_rollbacks += 1
-                continue
-            new_props.append(p2)
+                p2 = _evaluate_and_score(state, deal2, buyer_id=buyer_id, seller_id=seller_id, partner_id=partner_id or seller_id)
+                if p2 is None:
+                    state.stats.sweetener_rollbacks += 1
+                    continue
+                new_props.append(p2)
 
-            new_v = getattr(p2.seller_decision, "verdict", DealVerdict.REJECT)
-            key = (verdict_rank.get(new_v, 0), _margin(p2), float(getattr(p2, "score", 0.0) or 0.0))
-            if best_key is None or key > best_key:
-                best_key = key
-                best_p = p2
-                best_spec = trial_spec
+                seller_v = getattr(p2.seller_decision, "verdict", DealVerdict.REJECT)
+                buyer_v = getattr(p2.buyer_decision, "verdict", DealVerdict.REJECT)
+                both_accept = 1 if (seller_v == DealVerdict.ACCEPT and buyer_v == DealVerdict.ACCEPT) else 0
+                key = (
+                    both_accept,
+                    verdict_rank.get(seller_v, 0),
+                    verdict_rank.get(buyer_v, 0),
+                    _margin(p2),
+                    float(getattr(p2, "score", 0.0) or 0.0),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_p = p2
+                    best_spec = trial_spec
 
-            # If we hit full accept, no need to compare further candidates for this token.
-            if getattr(p2.seller_decision, "verdict", None) == DealVerdict.ACCEPT and getattr(p2.buyer_decision, "verdict", None) == DealVerdict.ACCEPT:
+                # If we hit full accept, no need to compare further candidates for this token.
+                if both_accept:
+                    done_token = True
+                    break
+
+            if done_token:
                 break
 
         if best_p is None or best_spec is None:
             continue
 
-        # Commit only if it improves seller outcome (verdict or margin).
-        old_v = getattr(current_best.seller_decision, "verdict", DealVerdict.REJECT)
-        new_v = getattr(best_p.seller_decision, "verdict", DealVerdict.REJECT)
-        improve = verdict_rank.get(new_v, 0) > verdict_rank.get(old_v, 0) or (_margin(best_p) > _margin(current_best) + 1e-6)
-        if improve:
+        # Commit only if it improves seller outcome (verdict or margin) without worsening buyer verdict.
+        old_sv = getattr(current_best.seller_decision, "verdict", DealVerdict.REJECT)
+        new_sv = getattr(best_p.seller_decision, "verdict", DealVerdict.REJECT)
+        old_bv = getattr(current_best.buyer_decision, "verdict", DealVerdict.REJECT)
+        new_bv = getattr(best_p.buyer_decision, "verdict", DealVerdict.REJECT)
+
+        seller_improve = verdict_rank.get(new_sv, 0) > verdict_rank.get(old_sv, 0) or (_margin(best_p) > _margin(current_best) + 1e-6)
+        buyer_not_worse = verdict_rank.get(new_bv, 0) >= verdict_rank.get(old_bv, 0)
+
+        if seller_improve and buyer_not_worse:
             current_best = best_p
             current_spec = best_spec
-            committed += 1
+            committed = _added_sweeteners(current_spec)
             state.stats.sweetener_commits += 1
             state.stats.sweetener_commit_by_token[str(token)] += 1
 
