@@ -264,6 +264,7 @@ def _generate_buy_mode(
     sweetener_trials_by_base: Dict[str, int] = {}
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
+    banned_receivers_by_player: Dict[str, Set[str]] = {}
 
     proposals: List[DealProposal] = []
 
@@ -337,6 +338,7 @@ def _generate_buy_mode(
             rng=rng,
             banned_asset_keys=banned_asset_keys,
             banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
         )
         variant_cap = min(12, max(6, int(budget.beam_width)))
 
@@ -382,6 +384,7 @@ def _generate_buy_mode(
                 budget=budget,
                 banned_asset_keys=banned_asset_keys,
                 banned_players=banned_players,
+                banned_receivers_by_player=banned_receivers_by_player,
                 stats=stats,
             )
             stats.validations += v_used
@@ -537,6 +540,7 @@ def _generate_sell_mode(
     sweetener_trials_by_base: Dict[str, int] = {}
     banned_asset_keys: Set[str] = set()
     banned_players: Set[str] = set()
+    banned_receivers_by_player: Dict[str, Set[str]] = {}
 
     proposals: List[DealProposal] = []
     partner_counts: Dict[str, int] = {}
@@ -602,6 +606,7 @@ def _generate_sell_mode(
                 rng=rng,
                 banned_asset_keys=banned_asset_keys,
                 banned_players=banned_players,
+                banned_receivers_by_player=banned_receivers_by_player,
             )
 
             if not candidates:
@@ -651,6 +656,7 @@ def _generate_sell_mode(
                     budget=budget,
                     banned_asset_keys=banned_asset_keys,
                     banned_players=banned_players,
+                    banned_receivers_by_player=banned_receivers_by_player,
                     stats=stats,
                 )
                 stats.validations += v_used
