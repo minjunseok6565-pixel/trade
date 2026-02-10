@@ -682,6 +682,53 @@ def _extract_fit_fail_tags(dec: Any) -> Set[str]:
     return out
 
 
+
+def _extract_fit_failed_incoming_player_ids(dec: Any) -> Set[str]:
+    """Extract player_ids of incoming assets that failed fit (DecisionPolicy FIT_FAILS meta).
+
+    DecisionPolicy populates FIT_FAILS.meta as:
+      {"failed_count": int, "failed_samples": [{"asset_key": "player:<id>", "ref_id": <id>, ...}, ...]}
+
+    We primarily use asset_key == 'player:<id>'. As a conservative fallback, we accept
+    numeric-only ref_id values (to avoid treating pick ids as player ids).
+    """
+    out: Set[str] = set()
+    if dec is None:
+        return out
+    reasons = getattr(dec, "reasons", None) or tuple()
+    for r in reasons:
+        try:
+            code = str(getattr(r, "code", "") or "")
+        except Exception:
+            code = ""
+        if code != "FIT_FAILS":
+            continue
+        meta = None
+        for attr in ("meta", "details", "data"):
+            v = getattr(r, attr, None)
+            if isinstance(v, Mapping):
+                meta = v
+                break
+        if not isinstance(meta, Mapping):
+            continue
+        samples = meta.get("failed_samples")
+        if not isinstance(samples, (list, tuple)):
+            continue
+        for s in samples:
+            if not isinstance(s, Mapping):
+                continue
+            akey = str(s.get("asset_key") or "").strip()
+            if akey.startswith("player:"):
+                pid = akey.split("player:", 1)[1].strip()
+                if pid:
+                    out.add(pid)
+                continue
+            rid = str(s.get("ref_id") or "").strip()
+            if rid and re.match(r"^[0-9]+$", rid):
+                out.add(rid)
+    return out
+
+
 def _pick_from_buckets(
     outcat: TeamOutgoingCatalog,
     buckets: Sequence[str],
@@ -1260,10 +1307,23 @@ class DealGenerator:
                                 tags_set=tags_set,
                             )
                         # Re-evaluate only if we can afford it.
+                        # IMPORTANT: deal2 is a *new* deal. Gate it with dedupe + policy caps before committing.
+                        h_deal2: Optional[str] = None
+                        if deal2 is not None:
+                            h_deal2 = _hash_deal_for_dedupe(deal2, ignore_meta=self.cfg.dedupe_ignore_meta)
+                            if h_deal2 in seen_deals:
+                                deal2 = None
+                            elif _deal_num_assets(deal2) > int(budgets["max_assets"]):
+                                deal2 = None
+                            elif _deal_num_players_moved(deal2) > int(budgets["max_players_moved"]):
+                                deal2 = None
+
                         if deal2 is not None:
                             if not budget.try_consume_evaluations(2):
                                 hard_stop = True
                             else:
+                                if h_deal2 is not None:
+                                    seen_deals.add(h_deal2)
                                 deal = deal2
                                 try:
                                     buyer_decision, buyer_eval = evaluate_deal_for_team(
@@ -2007,20 +2067,35 @@ class DealGenerator:
         deal = Deal(teams=list(base_deal.teams), legs={k: list(v) for k, v in base_deal.legs.items()}, meta=dict(base_deal.meta or {}))
         protected = _protected_player_ids_from_meta(deal)
         local_seen: Set[str] = set()  # local pre-validate dedupe for sweetener exploration
+
+        max_assets = int(budgets.get("max_assets", 99_999))
+        max_players_moved = int(budgets.get("max_players_moved", 99_999))
+
         # attempt up to 2 additions
         added = 0
         for kind, bucket in actions:
             if added >= 2:
                 break
+
+            # If we're already at/over caps, don't try to add more assets.
+            if _deal_num_assets(deal) >= max_assets:
+                break
+            if _deal_num_players_moved(deal) > max_players_moved:
+                return None
+
             if kind == "pick" and bucket == "SECOND" and seconds_added >= max_seconds:
                 continue
+
+            # Snapshot state for this attempt (rollback on failure/duplicate/oversize)
+            legs_before = {k: list(v) for k, v in (deal.legs or {}).items()}
+            meta_before = dict(deal.meta or {})
+
             changed = False
             attempt_tags: Set[str] = set()
             tag_added: Optional[str] = None
+
             if kind == "pick":
                 changed = self._add_pick_by_bucket(deal, from_team=buyer_id, to_team=seller_id, catalog=catalog, bucket=bucket)
-                if changed and bucket == "SECOND":
-                    seconds_added += 1
                 if changed:
                     tag_added = f"sweetener:{bucket}"
             elif kind == "swap":
@@ -2034,19 +2109,25 @@ class DealGenerator:
             if not changed:
                 continue
 
-            # dedupe (local pre-check; global dedupe happens after repair/validation)
+            # dedupe (local pre-check; rollback if duplicate)
             h_pre = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
             if h_pre in local_seen:
+                deal.legs = legs_before
+                deal.meta = meta_before
                 continue
             local_seen.add(h_pre)
 
             # validate with minimal repair if needed (counts attempted validations regardless of outcome)
             if not budget.try_consume_validations(1):
+                deal.legs = legs_before
+                deal.meta = meta_before
                 return None
             try:
                 tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
             except TradeError as exc:
                 if exc.code == TRADE_DEADLINE_PASSED:
+                    deal.legs = legs_before
+                    deal.meta = meta_before
                     return None
                 # small repair attempt
                 rep = self._repair_until_valid(
@@ -2062,28 +2143,50 @@ class DealGenerator:
                     tags_set=attempt_tags,
                 )
                 if not rep:
+                    deal.legs = legs_before
+                    deal.meta = meta_before
                     continue
                 if not budget.try_consume_validations(1):
+                    deal.legs = legs_before
+                    deal.meta = meta_before
                     return None
                 try:
                     tick_ctx.validate_deal(deal, allow_locked_by_deal_id=allow_locked_by_deal_id)
                 except Exception:
+                    deal.legs = legs_before
+                    deal.meta = meta_before
                     continue
             except Exception:
+                deal.legs = legs_before
+                deal.meta = meta_before
+                continue
+
+            # Enforce package caps after repair/validation (sweeteners can push us over).
+            if _deal_num_assets(deal) > max_assets:
+                deal.legs = legs_before
+                deal.meta = meta_before
+                continue
+            if _deal_num_players_moved(deal) > max_players_moved:
+                deal.legs = legs_before
+                deal.meta = meta_before
                 continue
 
             # Global dedupe after repair/validation (prevents duplicates from repair paths)
             h_final = _hash_deal_for_dedupe(deal, ignore_meta=self.cfg.dedupe_ignore_meta)
             if h_final in seen_deals:
+                deal.legs = legs_before
+                deal.meta = meta_before
                 continue
 
             # Only now commit the attempt's tags; failed attempts should not pollute tags_set.
             scratch_tags.update(attempt_tags)
             added += 1
+            if kind == "pick" and bucket == "SECOND":
+                seconds_added += 1
+
             # early exit if we've added something meaningful
             if added >= 1 and rng.random() < 0.60:
                 break
-
         if added <= 0:
             return None
         # keep protected meta
@@ -2121,8 +2224,8 @@ class DealGenerator:
         if not seller_need_map:
             return None
 
-        # Focused tags from FIT_FAILS meta (if available)
-        focus_tags = _extract_fit_fail_tags(seller_decision)
+        # Incoming player ids that failed fit (DecisionPolicy FIT_FAILS meta)
+        failed_pids = _extract_fit_failed_incoming_player_ids(seller_decision)
 
         # Seller horizon / rebuildness to adjust weighting
         seller_ts = tick_ctx.get_team_situation(seller_id)
@@ -2145,30 +2248,23 @@ class DealGenerator:
         if buyer_out is None:
             return None
 
-        # Compute current fit for each outgoing player to seller; swap the worst one.
+        # Compute current fit for each outgoing player to seller; prefer swapping players that actually failed fit.
         def _fit_pid(pid: str) -> float:
             c = buyer_out.players.get(pid)
             if c is None:
                 return 0.0
             supply = getattr(c, "supply", None) or {}
-            base_fit = _need_fit_score(supply, seller_need_map)
-            if focus_tags:
-                focused = 0.0
-                for t in focus_tags:
-                    try:
-                        focused += float(supply.get(t, 0.0) or 0.0) * float(seller_need_map.get(t, 1.0) or 1.0)
-                    except Exception:
-                        continue
-                return float(focused)
-            return float(base_fit)
+            return float(_need_fit_score(supply, seller_need_map))
+
+        outgoing_pids = [str(a.player_id) for a in outgoing_players]
+        replace_candidates = [pid for pid in outgoing_pids if pid in set(failed_pids or set()) and pid not in protected]
 
         worst_pid: Optional[str] = None
         worst_fit = 1e9
         worst_salary = 0.0
-        for a in outgoing_players:
-            pid = str(a.player_id)
-            if pid in protected:
-                continue
+
+        scan_pids = replace_candidates if replace_candidates else [pid for pid in outgoing_pids if pid not in protected]
+        for pid in scan_pids:
             f = _fit_pid(pid)
             if f < worst_fit:
                 worst_fit = f
@@ -2209,21 +2305,12 @@ class DealGenerator:
                 ry = 0.0
             return age, ry
 
-        def _focused_fit(c: PlayerTradeCandidate) -> float:
+        def _fit_score(c: PlayerTradeCandidate) -> float:
             supply = getattr(c, "supply", None) or {}
-            if not focus_tags:
-                return _need_fit_score(supply, seller_need_map)
-            s = 0.0
-            for t in focus_tags:
-                try:
-                    s += float(supply.get(t, 0.0) or 0.0) * float(seller_need_map.get(t, 1.0) or 1.0)
-                except Exception:
-                    continue
-            return float(s)
+            return float(_need_fit_score(supply, seller_need_map))
 
         def _primary_score(c: PlayerTradeCandidate) -> float:
-            ff = _focused_fit(c)
-            base_fit = _need_fit_score(getattr(c, "supply", None) or {}, seller_need_map)
+            fit = _fit_score(c)
             market = float(c.market.total)
             market_norm = market / 50.0  # scale helper (rough)
             age, ry = _age_years(c)
@@ -2232,33 +2319,29 @@ class DealGenerator:
                 youth += max(0.0, 30.0 - float(age)) / 10.0
             youth += min(4.0, max(0.0, float(ry))) / 4.0
 
-            # If decision gave focused tags, prioritize solving those first
             if rebuild_like:
-                # rebuild/retool: youth + years matter most, then focused fit (so it still looks coherent)
-                return float(0.55 * youth + 0.30 * ff + 0.15 * base_fit - 0.05 * market_norm)
+                # rebuild/retool: youth/years, then fit; avoid over-weighting pure market value
+                return float(0.55 * youth + 0.40 * fit - 0.05 * market_norm)
             if win_now_like:
-                # win-now: fit/quality matter most; don't overweight youth
-                return float(0.65 * ff + 0.25 * market_norm + 0.10 * base_fit)
+                # win-now: fit + immediate quality
+                return float(0.70 * fit + 0.25 * market_norm + 0.05 * youth)
             # neutral: balanced
-            return float(0.55 * ff + 0.20 * market_norm + 0.15 * youth + 0.10 * base_fit)
+            return float(0.60 * fit + 0.20 * market_norm + 0.20 * youth)
 
-        ranked: List[Tuple[float, float, float, str]] = []
+        ranked: List[Tuple[float, float, float, str, float]] = []
         for c in pool:
             # aggregation solo-only cannot be aggregated with others.
             if bool(c.aggregation_solo_only) and len(outgoing_players) >= 2:
                 continue
-            ff = _focused_fit(c)
-            # If we know which tags failed, require the replacement to address them at least a bit
-            if focus_tags and float(ff) <= 0.01:
-                continue
+            fit = _fit_score(c)
             primary = _primary_score(c)
-            ranked.append((float(primary), abs(float(c.salary_m) - float(worst_salary)), float(c.market.total), c.player_id))
+            ranked.append((float(primary), abs(float(c.salary_m) - float(worst_salary)), float(c.market.total), c.player_id, fit))
         ranked.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
 
         # Try a few top replacements (bounded)
-        for f, _, __, new_pid in ranked[:6]:
-            # require meaningful improvement
-            if float(f) <= float(worst_fit) + 0.03:
+        for primary, _, __, new_pid, new_fit in ranked[:6]:
+            # require meaningful fit improvement
+            if float(new_fit) <= float(worst_fit) + 0.03:
                 continue
 
             new_deal = Deal(
