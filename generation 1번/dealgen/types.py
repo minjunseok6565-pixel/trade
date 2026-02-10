@@ -75,6 +75,13 @@ class DealGeneratorConfig:
     base_max_evaluations: int = 180
     base_max_repairs: int = 2
 
+    # --- "young + pick" heuristic
+    # asset_catalog에 YOUNG 버킷이 없으므로 generator-side에서 정의한다.
+    # 기존(v1): age-only(<= 24.5)
+    # 변경: age + team control(remaining_years) 기반 (fallback으로 age-only 완화)
+    young_age_max: float = 24.5
+    young_min_control_years: float = 2.0
+
     # --- deal shape constraints (generator-side)
     max_assets_per_side: int = 6
     max_players_moved_total: int = 4
