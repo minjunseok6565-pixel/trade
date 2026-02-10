@@ -37,6 +37,7 @@ from ..asset_catalog import (
     TradeAssetCatalog,
     build_trade_asset_catalog,
 )
+from .utils import _canon_team_id
 
 def _pick_from_buckets(
     outcat: TeamOutgoingCatalog,
