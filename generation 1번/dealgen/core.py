@@ -70,6 +70,78 @@ class DealGenerator:
         self.config = config or DealGeneratorConfig()
         self.last_stats: Optional[DealGeneratorStats] = None
 
+        # Cache for per-call asset catalogs built with allow_locked_by_deal_id.
+        #
+        # NOTE:
+        # TradeGenerationTickContext is @dataclass(slots=True) and is NOT weakref-able.
+        # So we keep a single-tick cache keyed by allow_locked_by_deal_id, and clear it
+        # whenever the tick_ctx identity changes.
+        self._asset_catalog_cache_tick_id: Optional[int] = None
+        self._asset_catalog_cache: Dict[str, TradeAssetCatalog] = {}
+
+
+    def _get_asset_catalog_for_call(
+        self,
+        tick_ctx: TradeGenerationTickContext,
+        *,
+        allow_locked_by_deal_id: Optional[str],
+    ) -> Optional[TradeAssetCatalog]:
+        """이번 generate_for_team 호출에 사용할 TradeAssetCatalog를 반환.
+
+        정책:
+        - allow_locked_by_deal_id가 None/blank 이거나, config.rebuild_catalog_when_allow_locked=False면:
+          tick_ctx.asset_catalog을 재사용하되, 없으면 build해서 tick_ctx.asset_catalog에 주입 후 사용.
+        - allow_locked_by_deal_id가 유효하고 rebuild가 True면:
+          allow_locked_by_deal_id별로 catalog를 build하고, tick_ctx 단위(id 기준)로 캐싱하여 재사용.
+        - allow-locked rebuild 실패 시:
+          base catalog(tick_ctx.asset_catalog)을 fallback으로 사용하고,
+          같은 tick에서 반복 rebuild 시도를 막기 위해 fallback을 negative-cache로 저장.
+        """
+        # Normalize allow_locked_by_deal_id (treat empty/whitespace as None)
+        allow_id = str(allow_locked_by_deal_id or "").strip()
+
+        # If allow-locked rebuild is disabled OR allow_id is empty => base catalog path
+        if not allow_id or not bool(getattr(self.config, "rebuild_catalog_when_allow_locked", True)):
+            if tick_ctx.asset_catalog is None:
+                try:
+                    tick_ctx.asset_catalog = build_trade_asset_catalog(tick_ctx=tick_ctx)
+                except Exception:
+                    return None
+            return tick_ctx.asset_catalog
+
+        # Ensure base catalog exists for fallback
+        if tick_ctx.asset_catalog is None:
+            try:
+                tick_ctx.asset_catalog = build_trade_asset_catalog(tick_ctx=tick_ctx)
+            except Exception:
+                return None
+        base_cat = tick_ctx.asset_catalog
+
+        # Single-tick cache: clear whenever tick_ctx identity changes.
+        tick_id = id(tick_ctx)
+        if self._asset_catalog_cache_tick_id != tick_id:
+            self._asset_catalog_cache_tick_id = tick_id
+            self._asset_catalog_cache.clear()
+
+        cached = self._asset_catalog_cache.get(allow_id)
+        if cached is not None:
+            return cached
+
+        # Build allow-locked catalog (and cache)
+        try:
+            cat = build_trade_asset_catalog(
+                tick_ctx=tick_ctx,
+                allow_locked_by_deal_id=allow_id,
+            )
+        except Exception:
+            # Fallback to base catalog and negative-cache to avoid repeated rebuild attempts this tick.
+            self._asset_catalog_cache[allow_id] = base_cat
+            return base_cat
+
+        self._asset_catalog_cache[allow_id] = cat
+        return cat
+
+
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
@@ -93,13 +165,10 @@ class DealGenerator:
         - buyer/seller 모두 evaluate 포함
         """
 
-        # --- asset catalog 확보(allow_locked_by_deal_id가 있으면 선택적으로 재빌드)
-        catalog = tick_ctx.asset_catalog
-        if allow_locked_by_deal_id and self.config.rebuild_catalog_when_allow_locked:
-            try:
-                catalog = build_trade_asset_catalog(tick_ctx=tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)
-            except Exception:
-                catalog = tick_ctx.asset_catalog
+        # --- asset catalog 확보
+        # allow_locked_by_deal_id가 주어진 경우, tick_ctx 단위 캐시를 사용해 1회만 재빌드/재사용한다.
+        # tick_ctx.asset_catalog이 None이면 자동으로 build한다.
+        catalog = self._get_asset_catalog_for_call(tick_ctx, allow_locked_by_deal_id=allow_locked_by_deal_id)
         if catalog is None:
             return []
 
