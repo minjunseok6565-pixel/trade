@@ -17,6 +17,8 @@ from ...errors import (
     PLAYER_NOT_OWNED,
     PICK_NOT_OWNED,
     SWAP_NOT_OWNED,
+    SWAP_NOT_FOUND,
+    SWAP_INVALID,
     TRADE_DEADLINE_PASSED,
     DUPLICATE_ASSET,
 )
@@ -326,7 +328,7 @@ def parse_trade_error(err: TradeError) -> RuleFailure:
             asset_key=str(details.get("asset_key") or "") or None,
             details=details,
         )
-    if err.code in (PLAYER_NOT_OWNED, PICK_NOT_OWNED, SWAP_NOT_OWNED):
+    if err.code in (PLAYER_NOT_OWNED, PICK_NOT_OWNED, SWAP_NOT_OWNED, SWAP_NOT_FOUND, SWAP_INVALID):
         player_id = str(details.get("player_id") or "") or None
         pick_id = str(details.get("pick_id") or "") or None
         swap_id = str(details.get("swap_id") or "") or None
@@ -337,7 +339,7 @@ def parse_trade_error(err: TradeError) -> RuleFailure:
             ak = f"player:{player_id}"
         elif err.code == PICK_NOT_OWNED and pick_id:
             ak = f"pick:{pick_id}"
-        elif err.code == SWAP_NOT_OWNED and swap_id:
+        elif err.code in (SWAP_NOT_OWNED, SWAP_NOT_FOUND, SWAP_INVALID) and swap_id:
             ak = f"swap:{swap_id}"
 
         return RuleFailure(
