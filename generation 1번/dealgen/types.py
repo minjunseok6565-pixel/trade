@@ -114,6 +114,11 @@ class DealGeneratorConfig:
     opponent_repeat_penalty: float = 0.25
     opponent_multi_repeat_penalty: float = 0.18
 
+    # Final output hard cap: 같은 상대팀(파트너) 반복 상한. 0이면 비활성(기존 동작 유지).
+    # - BUY 모드: seller_id 기준
+    # - SELL 모드: buyer_id 기준
+    max_partner_repeats: int = 0
+
     # --- scoring
     score_sigmoid_scale: float = 8.0
     penalty_per_asset: float = 0.15
