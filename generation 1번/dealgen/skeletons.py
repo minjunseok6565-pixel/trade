@@ -48,7 +48,15 @@ from ..asset_catalog import (
 )
 
 from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, TargetCandidate, DealCandidate, SellAssetCandidate
-from .utils import *
+from .utils import (
+    _add_pick_package,
+    _can_absorb_without_outgoing,
+    _clone_deal,
+    _pick_bucket_player,
+    _pick_filler_player_for_salary,
+    _pick_youngish_player,
+    _shape_ok,
+)
 from .targets import _is_seller_willing_to_move_player
 
 
