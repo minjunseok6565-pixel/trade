@@ -87,6 +87,7 @@ def build_offer_skeletons_buy(
     rng: random.Random,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
 ) -> List[DealCandidate]:
     """BUY 모드: target 1명 기준 2~4개 archetype 스켈레톤."""
 
@@ -103,6 +104,11 @@ def build_offer_skeletons_buy(
     cand_target = seller_out.players.get(target.player_id)
     if cand_target is not None:
         if str(buyer_id).upper() in set(cand_target.return_ban_teams or ()):
+            return []
+    # learned receiver-specific ban (from repair stage)
+    buyer_u = str(buyer_id).upper()
+    if banned_receivers_by_player is not None:
+        if buyer_u in banned_receivers_by_player.get(str(target.player_id), set()):
             return []
 
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
@@ -155,6 +161,7 @@ def build_offer_skeletons_buy(
         config=config,
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     if young_id:
@@ -188,6 +195,7 @@ def build_offer_skeletons_buy(
         receiver_team_id=seller_id,
         target_salary_m=target.salary_m,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     if filler_id:
@@ -210,6 +218,7 @@ def build_offer_skeletons_buy(
         bucket="CONSOLIDATE",
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     cheap_id = _pick_bucket_player(
@@ -217,6 +226,7 @@ def build_offer_skeletons_buy(
         bucket="FILLER_CHEAP",
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     if cons_id and cheap_id and cons_id != cheap_id:
@@ -272,6 +282,7 @@ def build_offer_skeletons_sell(
     rng: random.Random,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
 ) -> List[DealCandidate]:
     """SELL 모드: (seller sends sale_asset.player_id) 기준 BUYER 패키지를 생성."""
 
@@ -288,6 +299,11 @@ def build_offer_skeletons_sell(
     c_sale = seller_out.players.get(pid)
     if c_sale is not None:
         if str(buyer_id).upper() in set(c_sale.return_ban_teams or ()):
+            return []
+    # learned receiver-specific ban
+    buyer_u = str(buyer_id).upper()
+    if banned_receivers_by_player is not None:
+        if buyer_u in banned_receivers_by_player.get(str(pid), set()):
             return []
 
     # base deal: seller sends player to buyer
@@ -341,6 +357,7 @@ def build_offer_skeletons_sell(
         config=config,
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     if young_id:
@@ -375,6 +392,7 @@ def build_offer_skeletons_sell(
             receiver_team_id=seller_id,
             target_salary_m=float(sale_asset.salary_m),
             banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
             must_be_aggregation_friendly=True,
         )
         if filler_id:
@@ -397,6 +415,7 @@ def build_offer_skeletons_sell(
         bucket="CONSOLIDATE",
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     cheap_id = _pick_bucket_player(
@@ -404,6 +423,7 @@ def build_offer_skeletons_sell(
         bucket="FILLER_CHEAP",
         receiver_team_id=seller_id,
         banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
     if cons_id and cheap_id and cons_id != cheap_id:
@@ -461,6 +481,7 @@ def expand_variants(
     rng: random.Random,
     banned_asset_keys: Set[str],
     banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
 ) -> List[DealCandidate]:
     """스켈레톤을 '얕게' 확장한다.
 
@@ -544,7 +565,14 @@ def expand_variants(
             _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
     # --- archetype: young + pick variants (top 2 youngish)
-    young_ids = _top_k_youngish_players(buyer_out, config=config, k=2, banned_players=banned_players, receiver_team_id=seller)
+    young_ids = _top_k_youngish_players(
+        buyer_out,
+        config=config,
+        k=2,
+        banned_players=banned_players,
+        receiver_team_id=seller,
+        banned_receivers_by_player=banned_receivers_by_player,
+    )
     for pid in young_ids:
         for prefer, max_picks in [(("SECOND",), 1), (("SECOND", "SECOND"), 2)]:
             d = _base_deal()
@@ -569,6 +597,7 @@ def expand_variants(
         k=3,
         banned_players=banned_players,
         receiver_team_id=seller,
+        banned_receivers_by_player=banned_receivers_by_player,
     )
     for pid in filler_ids:
         d = _base_deal()
@@ -583,6 +612,7 @@ def expand_variants(
         banned_players=banned_players,
         descending=True,
         receiver_team_id=seller,
+        banned_receivers_by_player=banned_receivers_by_player,
     )
     cheap_ids = _top_k_bucket_players_by_market(
         buyer_out,
@@ -634,6 +664,7 @@ def _top_k_youngish_players(
     k: int,
     banned_players: Set[str],
     receiver_team_id: Optional[str] = None,
+    banned_receivers_by_player=banned_receivers_by_player,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
     """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young-ish' top-k.
@@ -655,6 +686,9 @@ def _top_k_youngish_players(
     def _eligible(c: PlayerTradeCandidate, *, require_control: bool) -> bool:
         if receiver and receiver in (c.return_ban_teams or ()):
             return False
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(str(c.player_id), set()):
+                return False
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             return False
         age = getattr(getattr(c, "snap", None), "age", None)
@@ -713,6 +747,7 @@ def _top_k_fillers_by_salary_gap(
     k: int,
     banned_players: Set[str],
     receiver_team_id: Optional[str] = None,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
     """target salary 근처 filler 후보 top-k.
@@ -737,6 +772,9 @@ def _top_k_fillers_by_salary_gap(
 
         if receiver and receiver in (c.return_ban_teams or ()):
             continue
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(str(pid), set()):
+                continue
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             continue
 
@@ -754,6 +792,7 @@ def _top_k_bucket_players_by_market(
     banned_players: Set[str],
     descending: bool,
     receiver_team_id: Optional[str] = None,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
     """특정 버킷에서 market.total 기준 top-k.
@@ -774,6 +813,9 @@ def _top_k_bucket_players_by_market(
 
         if receiver and receiver in (c.return_ban_teams or ()):
             continue
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(str(pid), set()):
+                continue
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             continue
 
