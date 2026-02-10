@@ -298,20 +298,25 @@ def _pick_bucket_player(
     bucket: BucketId,
     receiver_team_id: Optional[str] = None,
     banned_players: Optional[Set[str]] = None,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
     for pid in list(out.player_ids_by_bucket.get(bucket, tuple())):
-        if banned_players and pid in banned_players:
+        pid_s = str(pid)
+        if banned_players and pid_s in banned_players:
             continue
-        c = out.players.get(pid)
+        c = out.players.get(pid_s)
         if c is None:
             continue
         if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
             continue
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(pid_s, set()):
+                continue
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             continue
-        return str(pid)
+        return pid_s
     return None
 
 
@@ -343,6 +348,7 @@ def _pick_youngish_player(
     config: DealGeneratorConfig,
     banned_players: Set[str],
     receiver_team_id: Optional[str] = None,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
     """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young'을 선택.
@@ -360,6 +366,9 @@ def _pick_youngish_player(
     def _eligible(c: PlayerTradeCandidate, *, require_control: bool) -> bool:
         if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
             return False
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(str(c.player_id), set()):
+                return False
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             return False
         age = getattr(getattr(c, "snap", None), "age", None)
@@ -417,6 +426,7 @@ def _pick_filler_player_for_salary(
     receiver_team_id: Optional[str],
     target_salary_m: float,
     banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> Optional[str]:
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
@@ -435,6 +445,9 @@ def _pick_filler_player_for_salary(
             continue
         if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
             continue
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(str(pid), set()):
+                continue
         if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
             continue
         gap = abs(float(c.salary_m) - float(target_salary_m))
