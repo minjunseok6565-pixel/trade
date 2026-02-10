@@ -280,6 +280,7 @@ class RuleFailure:
     message: str
     rule_id: Optional[str] = None
     team_id: Optional[str] = None
+    to_team: Optional[str] = None
     reason: Optional[str] = None
     method: Optional[str] = None
     status: Optional[str] = None
@@ -393,12 +394,15 @@ def parse_trade_error(err: TradeError) -> RuleFailure:
         )
 
     if err.code == DEAL_INVALIDATED and rule_id == "return_to_trading_team_same_season":
+        to_team = str(details.get("to_team") or "") or None
+        to_team = str(to_team).upper() if to_team else None
         return RuleFailure(
             kind=RuleFailureKind.RETURN_TO_TRADING_TEAM,
             code=err.code,
             message=err.message,
             rule_id=rule_id,
             team_id=str(details.get("from_team") or "") or None,
+            to_team=to_team,
             reason=str(details.get("reason") or "") or None,
             player_id=str(details.get("player_id") or "") or None,
             details=details,
