@@ -152,6 +152,7 @@ def build_offer_skeletons_buy(
     # archetype 2) young + pick (one outgoing player)
     young_id = _pick_youngish_player(
         buyer_out,
+        config=config,
         receiver_team_id=seller_id,
         banned_players=banned_players,
         must_be_aggregation_friendly=True,
@@ -337,6 +338,7 @@ def build_offer_skeletons_sell(
     # archetype 2) buyer young + pick
     young_id = _pick_youngish_player(
         buyer_out,
+        config=config,
         receiver_team_id=seller_id,
         banned_players=banned_players,
         must_be_aggregation_friendly=True,
@@ -542,7 +544,7 @@ def expand_variants(
             _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
     # --- archetype: young + pick variants (top 2 youngish)
-    young_ids = _top_k_youngish_players(buyer_out, k=2, banned_players=banned_players, receiver_team_id=seller)
+    young_ids = _top_k_youngish_players(buyer_out, config=config, k=2, banned_players=banned_players, receiver_team_id=seller)
     for pid in young_ids:
         for prefer, max_picks in [(("SECOND",), 1), (("SECOND", "SECOND"), 2)]:
             d = _base_deal()
@@ -628,20 +630,46 @@ def expand_variants(
 def _top_k_youngish_players(
     out: TeamOutgoingCatalog,
     *,
+    config: DealGeneratorConfig,
     k: int,
     banned_players: Set[str],
     receiver_team_id: Optional[str] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
-    """버킷에 YOUNG가 없으므로 age 기반으로 'young-ish' top-k.
+    """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young-ish' top-k.
 
     BUY 모드 variant 생성에서 invalid 낭비를 줄이기 위해,
     - receiver_team_id가 주어지면 return_ban_teams(되돌아가기 금지) 사전 필터를 적용한다.
     - must_be_aggregation_friendly=True면 aggregation_solo_only 후보는 제외한다.
+
+    변경
+    - 기존(v1): age-only(<= young_age_max)
+    - 변경: age + team control(remaining_years) 기반
+      - 1st pass: age <= young_age_max AND remaining_years >= young_min_control_years
+      - fallback: 후보가 없으면 age-only로 완화
     """
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
+    age_max = float(getattr(config, "young_age_max", 24.5) or 24.5)
+    min_control = float(getattr(config, "young_min_control_years", 2.0) or 0.0)
 
-    cands: List[PlayerTradeCandidate] = []
+    def _eligible(c: PlayerTradeCandidate, *, require_control: bool) -> bool:
+        if receiver and receiver in (c.return_ban_teams or ()):
+            return False
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+            return False
+        age = getattr(getattr(c, "snap", None), "age", None)
+        if age is None or float(age) > age_max:
+            return False
+        if require_control:
+            try:
+                ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
+            except Exception:
+                ry = 0.0
+            if ry < min_control:
+                return False
+        return True
+
+    base: List[PlayerTradeCandidate] = []
     for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
         for pid in out.player_ids_by_bucket.get(b, tuple()):
             if pid in banned_players:
@@ -649,20 +677,34 @@ def _top_k_youngish_players(
             c = out.players.get(pid)
             if c is None:
                 continue
+            base.append(c)
 
-            if receiver and receiver in (c.return_ban_teams or ()):
-                continue
-            if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
-                continue
+    if not base:
+        return []
 
-            age = c.snap.age
-            if age is not None and float(age) <= 24.5:
-                cands.append(c)
+    cands: List[PlayerTradeCandidate] = [c for c in base if _eligible(c, require_control=True)]
+    if not cands:
+        cands = [c for c in base if _eligible(c, require_control=False)]
     if not cands:
         return []
-    cands.sort(key=lambda c: (-float(c.market.total), float(c.salary_m), c.player_id))
-    return [c.player_id for c in cands[: int(k)]]
 
+    def _sort_key(c: PlayerTradeCandidate) -> tuple:
+        try:
+            mkt = float(c.market.total)
+        except Exception:
+            mkt = 0.0
+        try:
+            ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
+        except Exception:
+            ry = 0.0
+        try:
+            sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+        except Exception:
+            sal = 0.0
+        return (-mkt, -ry, sal, str(c.player_id))
+
+    cands.sort(key=_sort_key)
+    return [str(c.player_id) for c in cands[: int(k)]]
 
 def _top_k_fillers_by_salary_gap(
     out: TeamOutgoingCatalog,
