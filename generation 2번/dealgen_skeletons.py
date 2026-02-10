@@ -45,7 +45,7 @@ from .asset_catalog import (
 
 from .dealgen_types import DealGeneratorConfig, DealProposal, DealGenerationStats, _Budgets, _DealSpec, _GenState
 from .dealgen_utils import _canon_team_id, _is_ban_active, _is_locked
-from .dealgen_targeting import _best_need_tag
+from .dealgen_targeting import _best_need_tag, _get_need_map, _rank_for_need, _sample_for_counterparty
 from .dealgen_sweeteners import _stepien_ok_after
 
 def _build_offer_skeletons(state: _GenState, *, buyer_id: str, target_ref: IncomingPlayerRef) -> List[_DealSpec]:
