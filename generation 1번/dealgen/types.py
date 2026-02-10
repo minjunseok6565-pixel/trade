@@ -101,6 +101,9 @@ class DealGeneratorConfig:
         "SECOND",  # allow 2nd second-rounder
         "FIRST_SENSITIVE",
     )
+    # sweetener 후보를 token(bucket)별로 몇 개까지 trial 할지(베스트-오브-N).
+    # 예산이 빡빡하면 sweetener.py에서 자동으로 더 줄인다.
+    sweetener_candidate_width: int = 3
 
     # --- target selection / incoming pool
     need_tags_max: int = 4
@@ -187,6 +190,11 @@ class DealGeneratorStats:
 
     sweetener_attempts: int = 0
     sweeteners_added: int = 0
+
+    # sweetener telemetry (v2-style)
+    sweetener_trials: int = 0
+    sweetener_commits: int = 0
+    sweetener_rollbacks: int = 0
 
     # failure kind -> count
     failures_by_kind: Dict[str, int] = field(default_factory=dict)
