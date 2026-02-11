@@ -54,7 +54,7 @@ from .utils import (
     _clone_deal,
     _pick_bucket_player,
     _pick_filler_player_for_salary,
-    _pick_youngish_player,
+    _split_young_candidates,
     _shape_ok,
 )
 from .targets import _is_seller_willing_to_move_player
@@ -156,7 +156,10 @@ def build_offer_skeletons_buy(
         )
 
     # archetype 2) young + pick (one outgoing player)
-    young_id = _pick_youngish_player(
+    seller_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL")
+    rebuildish = seller_horizon in {"REBUILD", "RE_TOOL"}
+
+    prospect_ids, throwin_ids = _split_young_candidates(
         buyer_out,
         config=config,
         receiver_team_id=seller_id,
@@ -164,6 +167,29 @@ def build_offer_skeletons_buy(
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
+
+    young_id: Optional[str] = None
+    source_tag: Optional[str] = None
+
+    if rebuildish:
+        pool = prospect_ids if prospect_ids else throwin_ids
+        if pool:
+            # variety: shuffle among top candidates (deterministic rng)
+            max_prospect = int(getattr(config, "young_prospect_max_candidates", 6) or 6)
+            top_n = max(2, min(max_prospect, len(pool)))
+            bucket = list(pool[:top_n])
+            rng.shuffle(bucket)
+            young_id = bucket[0]
+            source_tag = "young_source:prospect" if prospect_ids else "young_source:throwin"
+    else:
+        # non-rebuild sellers treat "young" as cheap throw-in only (no prospect fallback)
+        pool = throwin_ids
+        if pool:
+            bucket = list(pool[: max(1, min(6, len(pool)))])
+            rng.shuffle(bucket)
+            young_id = bucket[0]
+            source_tag = "young_source:throwin"
+
     if young_id:
         deal2 = _clone_deal(base)
         deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
@@ -178,6 +204,9 @@ def build_offer_skeletons_buy(
             max_picks=1,
             banned_asset_keys=banned_asset_keys,
         )
+        tags = [f"need:{target.need_tag}", "pkg:young+pick"]
+        if source_tag:
+            tags.append(source_tag)
         out.append(
             DealCandidate(
                 deal=deal2,
@@ -185,7 +214,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="young_plus_pick",
-                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:young+pick"], mode="BUY", focal_player_id=target.player_id, archetype="young_plus_pick"),
+                tags=_with_core_tags(tags, mode="BUY", focal_player_id=target.player_id, archetype="young_plus_pick"),
             )
         )
 
@@ -352,7 +381,9 @@ def build_offer_skeletons_sell(
         )
 
     # archetype 2) buyer young + pick
-    young_id = _pick_youngish_player(
+    rebuildish = time_horizon in {"REBUILD", "RE_TOOL"}
+
+    prospect_ids, throwin_ids = _split_young_candidates(
         buyer_out,
         config=config,
         receiver_team_id=seller_id,
@@ -360,6 +391,27 @@ def build_offer_skeletons_sell(
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
     )
+
+    young_id: Optional[str] = None
+    source_tag: Optional[str] = None
+
+    if rebuildish:
+        pool = prospect_ids if prospect_ids else throwin_ids
+        if pool:
+            max_prospect = int(getattr(config, "young_prospect_max_candidates", 6) or 6)
+            top_n = max(2, min(max_prospect, len(pool)))
+            bucket = list(pool[:top_n])
+            rng.shuffle(bucket)
+            young_id = bucket[0]
+            source_tag = "young_source:prospect" if prospect_ids else "young_source:throwin"
+    else:
+        pool = throwin_ids
+        if pool:
+            bucket = list(pool[: max(1, min(6, len(pool)))])
+            rng.shuffle(bucket)
+            young_id = bucket[0]
+            source_tag = "young_source:throwin"
+
     if young_id:
         deal2 = _clone_deal(base)
         deal2.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=young_id))
@@ -374,6 +426,9 @@ def build_offer_skeletons_sell(
             max_picks=1,
             banned_asset_keys=banned_asset_keys,
         )
+        tags = [f"match:{match_tag}", "pkg:young+pick"]
+        if source_tag:
+            tags.append(source_tag)
         out.append(
             DealCandidate(
                 deal=deal2,
@@ -381,7 +436,7 @@ def build_offer_skeletons_sell(
                 seller_id=seller_id,
                 focal_player_id=pid,
                 archetype="buyer_young_plus_pick",
-                tags=_with_core_tags([f"match:{match_tag}", "pkg:young+pick"], mode="SELL", focal_player_id=pid, archetype="buyer_young_plus_pick"),
+                tags=_with_core_tags(tags, mode="SELL", focal_player_id=pid, archetype="buyer_young_plus_pick"),
             )
         )
 
@@ -564,15 +619,47 @@ def expand_variants(
             )
             _push(d, "picks_only", [f"need:{target.need_tag}", "pkg:picks", "var:picks"])
 
-    # --- archetype: young + pick variants (top 2 youngish)
-    young_ids = _top_k_youngish_players(
+    # --- archetype: young + pick variants (prospect vs throw-in split)
+    try:
+        ts_seller = tick_ctx.get_team_situation(seller)
+    except Exception:
+        ts_seller = None
+    seller_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL") if ts_seller is not None else "RE_TOOL"
+    rebuildish = seller_horizon in {"REBUILD", "RE_TOOL"}
+
+    prospect_ids, throwin_ids = _split_young_candidates(
         buyer_out,
         config=config,
-        k=2,
         banned_players=banned_players,
         receiver_team_id=seller,
         banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=True,
     )
+
+    source_tag: Optional[str] = None
+    if rebuildish:
+        pool = prospect_ids if prospect_ids else throwin_ids
+        if pool:
+            source_tag = "young_source:prospect" if prospect_ids else "young_source:throwin"
+            k = 2
+            max_prospect = int(getattr(config, "young_prospect_max_candidates", 6) or 6)
+            top_n = max(2, min(max_prospect, len(pool)))
+            bucket = list(pool[:top_n])
+            rng.shuffle(bucket)
+            young_ids = bucket[:k]
+        else:
+            young_ids = []
+    else:
+        pool = throwin_ids
+        if pool:
+            source_tag = "young_source:throwin"
+            k = 1
+            bucket = list(pool[: max(1, min(8, len(pool)))])
+            rng.shuffle(bucket)
+            young_ids = bucket[:k]
+        else:
+            young_ids = []
+
     for pid in young_ids:
         for prefer, max_picks in [(("SECOND",), 1), (("SECOND", "SECOND"), 2)]:
             d = _base_deal()
@@ -588,7 +675,10 @@ def expand_variants(
                 config=config,
                 banned_asset_keys=banned_asset_keys,
             )
-            _push(d, "young_plus_pick", [f"need:{target.need_tag}", "pkg:young+pick", "var:young"])
+            tags = [f"need:{target.need_tag}", "pkg:young+pick", "var:young"]
+            if source_tag:
+                tags.append(source_tag)
+            _push(d, "young_plus_pick", tags)
 
     # --- archetype: p4p salary variants (top 3 fillers by salary gap)
     filler_ids = _top_k_fillers_by_salary_gap(
@@ -667,78 +757,21 @@ def _top_k_youngish_players(
     banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
 ) -> List[str]:
-    """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young-ish' top-k.
+    """(compat) young-ish top-k.
 
-    BUY 모드 variant 생성에서 invalid 낭비를 줄이기 위해,
-    - receiver_team_id가 주어지면 return_ban_teams(되돌아가기 금지) 사전 필터를 적용한다.
-    - must_be_aggregation_friendly=True면 aggregation_solo_only 후보는 제외한다.
-
-    변경
-    - 기존(v1): age-only(<= young_age_max)
-    - 변경: age + team control(remaining_years) 기반
-      - 1st pass: age <= young_age_max AND remaining_years >= young_min_control_years
-      - fallback: 후보가 없으면 age-only로 완화
+    v2 parity의 prospect/throw-in split 로직을 재사용한다.
+    - prospect_ids + throwin_ids 를 순서대로 이어붙여 top-k 반환
     """
-    receiver = str(receiver_team_id).upper() if receiver_team_id else None
-    age_max = float(getattr(config, "young_age_max", 24.5) or 24.5)
-    min_control = float(getattr(config, "young_min_control_years", 2.0) or 0.0)
-
-    def _eligible(c: PlayerTradeCandidate, *, require_control: bool) -> bool:
-        if receiver and receiver in (c.return_ban_teams or ()):
-            return False
-        if receiver and banned_receivers_by_player is not None:
-            if receiver in banned_receivers_by_player.get(str(c.player_id), set()):
-                return False
-        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
-            return False
-        age = getattr(getattr(c, "snap", None), "age", None)
-        if age is None or float(age) > age_max:
-            return False
-        if require_control:
-            try:
-                ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
-            except Exception:
-                ry = 0.0
-            if ry < min_control:
-                return False
-        return True
-
-    base: List[PlayerTradeCandidate] = []
-    for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
-        for pid in out.player_ids_by_bucket.get(b, tuple()):
-            if pid in banned_players:
-                continue
-            c = out.players.get(pid)
-            if c is None:
-                continue
-            base.append(c)
-
-    if not base:
-        return []
-
-    cands: List[PlayerTradeCandidate] = [c for c in base if _eligible(c, require_control=True)]
-    if not cands:
-        cands = [c for c in base if _eligible(c, require_control=False)]
-    if not cands:
-        return []
-
-    def _sort_key(c: PlayerTradeCandidate) -> tuple:
-        try:
-            mkt = float(c.market.total)
-        except Exception:
-            mkt = 0.0
-        try:
-            ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
-        except Exception:
-            ry = 0.0
-        try:
-            sal = float(getattr(c, "salary_m", 0.0) or 0.0)
-        except Exception:
-            sal = 0.0
-        return (-mkt, -ry, sal, str(c.player_id))
-
-    cands.sort(key=_sort_key)
-    return [str(c.player_id) for c in cands[: int(k)]]
+    prospect_ids, throwin_ids = _split_young_candidates(
+        out,
+        config=config,
+        banned_players=banned_players,
+        receiver_team_id=receiver_team_id,
+        banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=must_be_aggregation_friendly,
+    )
+    merged = list(prospect_ids) + list(throwin_ids)
+    return merged[: int(k)]
 
 def _top_k_fillers_by_salary_gap(
     out: TeamOutgoingCatalog,
@@ -828,4 +861,3 @@ def _top_k_bucket_players_by_market(
 # =============================================================================
 # Validate + Repair
 # =============================================================================
-
