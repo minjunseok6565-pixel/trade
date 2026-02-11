@@ -165,66 +165,104 @@ def select_targets_sell(
     budget: DealGeneratorBudget,
     rng: random.Random,
     banned_players: Set[str],
+    allow_locked_by_deal_id: Optional[str] = None,
 ) -> List[SellAssetCandidate]:
     """SELL 모드: initiator가 내놓을 매물(선수) 후보를 고른다."""
 
-    out_cat = catalog.outgoing_by_team.get(str(seller_id).upper())
+    v2 정합 로직:
+    - locked(allow_locked 예외 포함) 선필터
+    - recent_signing_banned_until 선필터
+    - CORE: SOFT_SELL에서는 제외, SELL에서는 아주 드물게(4%) 허용
+    - 정렬: bucket priority -> surplus_score(desc) -> expiring(desc) -> market_total(asc) -> player_id
+    - 상위 head만 소폭 셔플해 매번 같은 쇼핑리스트가 되지 않게 한다
+    """
+
+    seller_u = str(seller_id).upper()
+    out_cat = catalog.outgoing_by_team.get(seller_u)
     if out_cat is None:
         return []
 
-    # SELL 모드 우선순위: 현실적으로 팔 만한 버킷 중심
-    priority: Tuple[BucketId, ...] = (
-        "VETERAN_SALE",
-        "EXPIRING",
-        "SURPLUS_REDUNDANT",
-        "SURPLUS_LOW_FIT",
-        "FILLER_BAD_CONTRACT",
-        "CONSOLIDATE",
-        "FILLER_CHEAP",
-    )
+    max_targets = int(getattr(budget, "max_targets", 0) or 0)
+    if max_targets <= 0:
+        return []
 
-    ids: List[str] = []
-    for b in priority:
-        ids.extend(list(out_cat.player_ids_by_bucket.get(b, tuple())))
+    ts = tick_ctx.get_team_situation(seller_u)
+    posture = str(getattr(ts, "trade_posture", "SELL") or "SELL").upper()
 
-    # unique preserve order
-    seen: Set[str] = set()
-    uniq_ids = []
-    for pid in ids:
-        if pid in seen or pid in banned_players:
+    allow_id = str(allow_locked_by_deal_id or "").strip() or None
+
+    # v2와 동일한 우선순위(숫자 낮을수록 우선)
+    bucket_pri: Dict[str, int] = {
+        "VETERAN_SALE": 0,
+        "EXPIRING": 1,
+        "SURPLUS_LOW_FIT": 2,
+        "SURPLUS_REDUNDANT": 3,
+        "FILLER_CHEAP": 4,
+        "FILLER_BAD_CONTRACT": 5,
+        "CONSOLIDATE": 6,
+        "CORE": 99,
+    }
+
+    rows: List[Tuple[Tuple[int, float, float, float, str], SellAssetCandidate]] = []
+
+    for pid, c in (out_cat.players or {}).items():
+        if not pid:
             continue
-        seen.add(pid)
-        uniq_ids.append(pid)
-
-    sale: List[SellAssetCandidate] = []
-    for pid in uniq_ids:
-        c = out_cat.players.get(pid)
-        if c is None:
+        if pid in banned_players:
             continue
-        sale.append(
-            SellAssetCandidate(
-                player_id=pid,
-                market_total=float(c.market.total),
-                salary_m=float(c.salary_m),
-                remaining_years=float(c.remaining_years),
-                is_expiring=bool(c.is_expiring),
-                top_tags=tuple(c.top_tags or ()),
-            )
+
+        # (1) locked 선필터 (allow_locked 예외 포함)
+        if _is_locked_candidate(getattr(c, "lock", None), allow_locked_by_deal_id=allow_id):
+            continue
+
+        # (2) recent signing ban 선필터
+        if _is_ban_active(tick_ctx.current_date, getattr(c, "recent_signing_banned_until", None)):
+            continue
+
+        buckets = tuple(getattr(c, "buckets", None) or ())
+
+        # (3) CORE 처리: SOFT_SELL에서는 제외, SELL에서는 4% 확률만 허용
+        if "CORE" in buckets:
+            if posture != "SELL":
+                continue
+            if rng.random() > 0.04:
+                continue
+
+        # (4) 정렬 키 구성 (v2와 동일)
+        if buckets:
+            pri = min(bucket_pri.get(b, 50) for b in buckets)
+        else:
+            pri = bucket_pri.get("FILLER_CHEAP", 4)
+
+        surplus = float(getattr(c, "surplus_score", 0.0) or 0.0)
+        exp = 1.0 if bool(getattr(c, "is_expiring", False)) else 0.0
+        value = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+
+        sale_cand = SellAssetCandidate(
+            player_id=str(pid),
+            market_total=float(value),
+            salary_m=float(getattr(c, "salary_m", 0.0) or 0.0),
+            remaining_years=float(getattr(c, "remaining_years", 0.0) or 0.0),
+            is_expiring=bool(getattr(c, "is_expiring", False)),
+            top_tags=tuple(getattr(c, "top_tags", None) or ()),
         )
 
-    # prefer higher market & more surplus (heuristic: expiring + low fit)
-    def score(x: SellAssetCandidate) -> float:
-        exp_bonus = 0.7 if x.is_expiring else 0.0
-        return float(x.market_total) + exp_bonus - 0.12 * float(x.remaining_years)
+        sort_key = (pri, -surplus, -exp, value, str(pid))
+        rows.append((sort_key, sale_cand))
 
-    sale.sort(key=lambda x: (-score(x), x.salary_m, x.player_id))
+    if not rows:
+        return []
 
-    # deterministically shuffle a bit within top slice for variety
-    top = sale[: max(0, min(len(sale), 24))]
-    rng.shuffle(top)
-    sale = top + sale[len(top) :]
+    rows.sort(key=lambda x: x[0])
+    sale: List[SellAssetCandidate] = [cand for _, cand in rows]
 
-    return sale[: int(budget.max_targets)]
+    # v2 스타일: head만 셔플(과도한 순위 붕괴 방지)
+    head_n = max(6, min(len(sale), max_targets))
+    head = sale[:head_n]
+    rng.shuffle(head)
+    sale = head + sale[head_n:]
+
+    return sale[:max_targets]
 
 
 def select_buyers_for_sale_asset(
@@ -301,6 +339,40 @@ def select_buyers_for_sale_asset(
     return out
 
 
+def _parse_iso_ymd(value: object) -> Optional[date]:
+    """YYYY-MM-DD (or datetime ISO) -> date. 실패 시 None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if len(s) < 10:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except Exception:
+        return None
+
+
+def _is_ban_active(current_date: date, until_iso: Optional[str]) -> bool:
+    """until_iso(YYYY-MM-DD)가 현재 날짜 기준으로 아직 남아있으면 True."""
+    d = _parse_iso_ymd(until_iso)
+    return bool(d is not None and current_date < d)
+
+
+def _is_locked_candidate(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
+    """LockInfo precheck (v2와 동일 정책).
+
+    - is_locked=True 이고 allow_locked_by_deal_id와 무관하면 잠김.
+    - allow_locked_by_deal_id가 lock.deal_id와 같으면(동일 딜 수정) 잠김으로 보지 않는다.
+    """
+    try:
+        if not bool(getattr(lock, "is_locked", False)):
+            return False
+        lock_deal = getattr(lock, "deal_id", None)
+        if allow_locked_by_deal_id and lock_deal and str(lock_deal) == str(allow_locked_by_deal_id):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _is_seller_willing_to_move_player(player_id: str, seller_out: TeamOutgoingCatalog) -> bool:
