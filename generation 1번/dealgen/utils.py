@@ -342,7 +342,7 @@ def _pick_lowest_market_player(
     return best_pid
 
 
-def _pick_youngish_player(
+def _split_young_candidates(
     out: TeamOutgoingCatalog,
     *,
     config: DealGeneratorConfig,
@@ -350,18 +350,36 @@ def _pick_youngish_player(
     receiver_team_id: Optional[str] = None,
     banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
     must_be_aggregation_friendly: bool = True,
-) -> Optional[str]:
-    """버킷에 YOUNG가 없으므로 generator-side 휴리스틱으로 'young'을 선택.
-
-    기존(v1): age-only(<= 24.5)
-    변경: age + team control(remaining_years) 기반
-      - 1st pass: age <= young_age_max AND remaining_years >= young_min_control_years
-      - fallback: 후보가 없으면 age-only로 완화
+) -> Tuple[List[str], List[str]]:
     """
+    Return (young_prospect_ids, young_throwin_ids).
 
+    v2 parity:
+    - young_prospect: top fraction (market.total desc) among young controllable players
+    - young_throwin: young controllable players with market.total <= young_throwin_max_market,
+      excluding prospect ids
+
+    Filters:
+    - receiver return_ban_teams + learned banned_receivers_by_player
+    - aggregation_solo_only excluded if must_be_aggregation_friendly=True
+    - uses buckets (SURPLUS_LOW_FIT, SURPLUS_REDUNDANT, FILLER_CHEAP, CONSOLIDATE)
+
+    Fallback:
+    - if no controllable candidates exist, relax control constraint (age-only) to preserve exploration
+      (keeps current v1 behavior).
+    """
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
+
     age_max = float(getattr(config, "young_age_max", 24.5) or 24.5)
     min_control = float(getattr(config, "young_min_control_years", 2.0) or 0.0)
+
+    throwin_max = float(getattr(config, "young_throwin_max_market", 22.0) or 22.0)
+    frac = float(getattr(config, "young_prospect_top_frac", 0.35) or 0.35)
+    # clamp frac to avoid 0 prospect in small pools
+    frac = max(0.05, min(1.0, frac))
+
+    max_prospect = int(getattr(config, "young_prospect_max_candidates", 6) or 0)
+    max_throwin = int(getattr(config, "young_throwin_max_candidates", 6) or 0)
 
     def _eligible(c: PlayerTradeCandidate, *, require_control: bool) -> bool:
         if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
@@ -383,30 +401,58 @@ def _pick_youngish_player(
                 return False
         return True
 
-    base_cands: List[PlayerTradeCandidate] = []
+    # Base pool from non-core-ish buckets (same as existing v1 youngish selection)
+    base: List[PlayerTradeCandidate] = []
     for b in ("SURPLUS_LOW_FIT", "SURPLUS_REDUNDANT", "FILLER_CHEAP", "CONSOLIDATE"):
         for pid in out.player_ids_by_bucket.get(b, tuple()):
-            if pid in banned_players:
+            pid_s = str(pid)
+            if pid_s in banned_players:
                 continue
-            c = out.players.get(pid)
+            c = out.players.get(pid_s)
             if c is None:
                 continue
-            base_cands.append(c)
+            base.append(c)
 
-    if not base_cands:
-        return None
+    if not base:
+        return ([], [])
 
-    cands: List[PlayerTradeCandidate] = [c for c in base_cands if _eligible(c, require_control=True)]
-    if not cands:
-        cands = [c for c in base_cands if _eligible(c, require_control=False)]
-    if not cands:
-        return None
+    # 1st pass: controllable young
+    young_pool: List[PlayerTradeCandidate] = [c for c in base if _eligible(c, require_control=True)]
+    # fallback: age-only (preserve current v1 behavior)
+    if not young_pool:
+        young_pool = [c for c in base if _eligible(c, require_control=False)]
+    if not young_pool:
+        return ([], [])
 
-    def _sort_key(c: PlayerTradeCandidate) -> tuple:
+    def _mkt(c: PlayerTradeCandidate) -> float:
         try:
-            mkt = float(c.market.total)
+            return float(c.market.total)
         except Exception:
-            mkt = 0.0
+            return 0.0
+
+    young_sorted = sorted(young_pool, key=_mkt, reverse=True)
+
+    # prospect count
+    n = int(math.ceil(len(young_sorted) * frac))
+    n = max(1, min(n, len(young_sorted)))
+    if max_prospect > 0:
+        n = min(n, max_prospect)
+
+    prospect = young_sorted[:n]
+    prospect_ids_set = {str(c.player_id) for c in prospect}
+
+    # throw-in: cheap young bodies excluding prospects
+    throwin: List[PlayerTradeCandidate] = []
+    for c in young_sorted:
+        pid = str(c.player_id)
+        if pid in prospect_ids_set:
+            continue
+        if _mkt(c) <= throwin_max:
+            throwin.append(c)
+
+    # Final sort: prefer higher market, then more control, then lower salary, then stable id
+    def _sort_key(c: PlayerTradeCandidate) -> tuple:
+        mv = _mkt(c)
         try:
             ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
         except Exception:
@@ -415,10 +461,45 @@ def _pick_youngish_player(
             sal = float(getattr(c, "salary_m", 0.0) or 0.0)
         except Exception:
             sal = 0.0
-        return (-mkt, -ry, sal, str(c.player_id))
+        return (-mv, -ry, sal, str(c.player_id))
 
-    cands.sort(key=_sort_key)
-    return str(cands[0].player_id)
+    prospect.sort(key=_sort_key)
+    throwin.sort(key=_sort_key)
+
+    prospect_ids = [str(c.player_id) for c in prospect]
+    throwin_ids = [str(c.player_id) for c in throwin]
+
+    if max_prospect > 0:
+        prospect_ids = prospect_ids[:max_prospect]
+    if max_throwin > 0:
+        throwin_ids = throwin_ids[:max_throwin]
+
+    return (prospect_ids, throwin_ids)
+
+
+def _pick_youngish_player(
+    out: TeamOutgoingCatalog,
+    *,
+    config: DealGeneratorConfig,
+    banned_players: Set[str],
+    receiver_team_id: Optional[str] = None,
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> Optional[str]:
+    """(legacy wrapper) young 후보 1명을 반환.
+    - prospect/throw-in split 로직은 _split_young_candidates가 SSOT.
+    - 이 함수는 기존 호출 호환을 위해 'prospect 우선, 없으면 throw-in'을 반환한다.
+    """
+    prospect_ids, throwin_ids = _split_young_candidates(
+        out,
+        config=config,
+        banned_players=banned_players,
+        receiver_team_id=receiver_team_id,
+        banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=must_be_aggregation_friendly,
+    )
+    pool = prospect_ids if prospect_ids else throwin_ids
+    return pool[0] if pool else None
 
 def _pick_filler_player_for_salary(
     out: TeamOutgoingCatalog,
