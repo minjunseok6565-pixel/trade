@@ -9,11 +9,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable
 
-from . import core, trade_assets, gm
+from . import core, trade_assets, gm, college
 from .registry import EnsureColumnsFn, apply_all
 
 
-DEFAULT_MODULES = (core, trade_assets, gm)
+DEFAULT_MODULES = (core, trade_assets, gm, college)
 
 
 def apply_schema(
