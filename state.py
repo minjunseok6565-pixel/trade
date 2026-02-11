@@ -371,6 +371,7 @@ def startup_init_state() -> None:
     def _impl(state: dict) -> None:
         from state_modules import state_bootstrap
         from state_modules import state_migrations
+        from college.service import ensure_world_bootstrapped as _ensure_college_world_bootstrapped
 
         # Enforce DB path policy early: no implicit defaults.
         league = state.get("league")
@@ -400,6 +401,24 @@ def startup_init_state() -> None:
                 state["league"]["draft_year"] = int(ay) + 1
 
             ensure_schedule_for_active_season(force=False)
+
+        # College world bootstrap (1~4학년 풀 생성 등):
+        # - startup_init_state는 레거시/불완전 상태를 보정할 수 있으므로
+        #   league.season_year가 None인 케이스도 방어해서 season_year를 계산한다.
+        # - DB 스키마는 repo.init_db()에서 보장된다는 전제(DDL은 db_schema로 이관 예정).
+        try:
+            db_path = str((state.get("league") or {})["db_path"])
+        except Exception as exc:
+            raise ValueError("GameState invalid: league.db_path is required for college bootstrap") from exc
+
+        season_year = (state.get("league") or {}).get("season_year")
+        if season_year is None:
+            active = state.get("active_season_id")
+            if active is not None:
+                season_year = _season_year_from_season_id(str(active))
+            else:
+                season_year = int(INITIAL_SEASON_YEAR)
+        _ensure_college_world_bootstrapped(db_path=db_path, season_year=int(season_year))
 
         state_bootstrap.ensure_cap_model_populated_if_needed(state)
         state_bootstrap.validate_repo_integrity_once_startup(state)
