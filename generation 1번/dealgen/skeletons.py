@@ -450,7 +450,6 @@ def build_offer_skeletons_sell(
             banned_players=banned_players,
             # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
             must_be_aggregation_friendly=False,
-            must_be_aggregation_friendly=True,
         )
         if filler_id:
             deal3 = _clone_deal(base)
