@@ -194,7 +194,8 @@ def maybe_apply_fit_swap(
 
     if not bool(getattr(config, "fit_swap_enabled", True)):
         return None
-    if validations_remaining <= 0 or evaluations_remaining <= 0:
+    # evaluate_and_score consumes 2 evaluations (buyer + seller)
+    if validations_remaining <= 0 or evaluations_remaining < 2:
         return None
 
     buyer_id = str(base_prop.buyer_id).upper()
@@ -292,7 +293,9 @@ def maybe_apply_fit_swap(
         max_attempts_per_target=budget.max_attempts_per_target,
         max_validations=budget.max_validations,
         max_evaluations=budget.max_evaluations,
-        max_repairs=min(int(budget.max_repairs), max(0, int(fit_max_repairs))),
+        # Even with 0 repairs, repair_until_valid will validate at least once.
+        # Cap repairs so we can't exceed remaining validations.
+        max_repairs=min(int(budget.max_repairs), max(0, int(fit_max_repairs)), max(0, int(validations_remaining) - 1)),
     )
 
     max_salary_diff = float(getattr(config, "fit_swap_max_salary_diff_m", 3.5) or 3.5)
