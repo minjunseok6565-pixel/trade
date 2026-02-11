@@ -225,7 +225,8 @@ def build_offer_skeletons_buy(
         target_salary_m=target.salary_m,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
-        must_be_aggregation_friendly=True,
+        # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
+        must_be_aggregation_friendly=False,
     )
     if filler_id:
         deal3 = _clone_deal(base)
@@ -447,7 +448,8 @@ def build_offer_skeletons_sell(
             receiver_team_id=seller_id,
             target_salary_m=float(sale_asset.salary_m),
             banned_players=banned_players,
-            banned_receivers_by_player=banned_receivers_by_player,
+            # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
+            must_be_aggregation_friendly=False,
             must_be_aggregation_friendly=True,
         )
         if filler_id:
@@ -687,7 +689,8 @@ def expand_variants(
         k=3,
         banned_players=banned_players,
         receiver_team_id=seller,
-        banned_receivers_by_player=banned_receivers_by_player,
+        # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 변형에서는 허용
+        must_be_aggregation_friendly=False,
     )
     for pid in filler_ids:
         d = _base_deal()
