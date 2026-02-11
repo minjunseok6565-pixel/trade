@@ -751,20 +751,20 @@ def _generate_sell_mode(
                 # (A) repair 이후 base deal identity (수리 과정에서 서로 다른 스켈레톤이 같은 딜로 수렴 가능)
                 h_valid = dedupe_hash(cand2.deal)
 
-            # 이미 출력된 base라면, sweetener/fit-swap 둘 다 더 시도할 여지가 없을 때만 스킵(비용 가드)
-            if h_valid in seen_output:
-                sweet_left = (
-                    bool(getattr(config, "sweetener_enabled", True))
-                    and int(getattr(config, "sweetener_max_additions", 0)) > 0
-                    and int(sweetener_trials_by_base.get(h_valid, 0)) < int(max_sweetener_trials_per_base)
-                )
-                fit_left = (
-                    bool(getattr(config, "fit_swap_enabled", True))
-                    and int(max_fit_swap_trials_per_base) > 0
-                    and int(fit_swap_trials_by_base.get(h_valid, 0)) < int(max_fit_swap_trials_per_base)
-                )
-                if not sweet_left and not fit_left:
-                    continue
+                # 이미 출력된 base라면, sweetener/fit-swap 둘 다 더 시도할 여지가 없을 때만 스킵(비용 가드)
+                if h_valid in seen_output:
+                    sweet_left = (
+                        bool(getattr(config, "sweetener_enabled", True))
+                        and int(getattr(config, "sweetener_max_additions", 0)) > 0
+                        and int(sweetener_trials_by_base.get(h_valid, 0)) < int(max_sweetener_trials_per_base)
+                    )
+                    fit_left = (
+                        bool(getattr(config, "fit_swap_enabled", True))
+                        and int(max_fit_swap_trials_per_base) > 0
+                        and int(fit_swap_trials_by_base.get(h_valid, 0)) < int(max_fit_swap_trials_per_base)
+                    )
+                    if not sweet_left and not fit_left:
+                        continue
 
                 # evaluate (cache)
                 cached = base_eval_cache.get(h_valid)
@@ -921,6 +921,7 @@ def _generate_sell_mode(
 
                 proposals = _push_best(proposals, pushed, max_results=pool_cap)
                 partner_counts[pushed.buyer_id] = int(partner_counts.get(pushed.buyer_id, 0)) + 1
+
 
     proposals.sort(key=lambda p: p.score, reverse=True)
     proposals = _apply_partner_cap(
