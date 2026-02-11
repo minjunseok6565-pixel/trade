@@ -688,6 +688,7 @@ def expand_variants(
         k=3,
         banned_players=banned_players,
         receiver_team_id=seller,
+        banned_receivers_by_player=banned_receivers_by_player,
         # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 변형에서는 허용
         must_be_aggregation_friendly=False,
     )
