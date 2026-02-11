@@ -16,11 +16,13 @@ options, cap holds, signing date rules, etc.) can be layered later.
 
 import datetime as _dt
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol
 
 from league_repo import LeagueRepo
 from contracts.models import new_contract_id, make_contract_record
+from college.service import allocate_player_ids as allocate_player_ids_shared
 
 from .pool import Prospect
 from .types import DraftTurn, TeamId, norm_team_id
@@ -34,20 +36,26 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
 
 
+_PLAYER_ID_RE = re.compile(r"^P\d{6}$")
+
+
+def _looks_like_player_id(x: Any) -> bool:
+    s = str(x or "")
+    return bool(_PLAYER_ID_RE.match(s))
+
+
+def _is_college_player_id(repo: LeagueRepo, player_id: str) -> bool:
+    row = repo._conn.execute(
+        "SELECT 1 FROM college_players WHERE player_id=? LIMIT 1;",
+        (str(player_id),),
+    ).fetchone()
+    return bool(row)
+
+
 def allocate_new_player_id(repo: LeagueRepo) -> str:
-    """Allocate next sequential player_id like P000001."""
-    cur = repo._conn.cursor()
-    row = cur.execute("SELECT player_id FROM players ORDER BY player_id DESC LIMIT 1;").fetchone()
-    last = None
-    if row and row[0]:
-        last = str(row[0])
-    n = 0
-    if last and last.startswith("P") and last[1:].isdigit():
-        try:
-            n = int(last[1:])
-        except Exception:
-            n = 0
-    return f"P{n + 1:06d}"
+    """Allocate next sequential player_id like P000001 (collision-free across NBA+college)."""
+    ids = allocate_player_ids_shared(repo, count=1)
+    return ids[0] if ids else "P000001"
 
 
 class RookieContractPolicy(Protocol):
@@ -93,6 +101,7 @@ class ApplyPickResult:
     contract_id: str
     team_id: TeamId
     tx_entry: Dict[str, Any]
+    promoted_from_college: bool
 
 
 def apply_pick_to_db(
@@ -119,12 +128,32 @@ def apply_pick_to_db(
 
     with LeagueRepo(dbp) as repo:
         repo.init_db()
-        player_id = allocate_new_player_id(repo)
         now = _utc_now_iso()
+
+        # Determine whether we are promoting an existing college player_id.
+        temp_id = str(prospect.temp_id)
+        promoted_from_college = False
+        if _looks_like_player_id(temp_id):
+            # Treat P000123-style temp_id as a real player_id intended for promotion.
+            if not _is_college_player_id(repo, temp_id):
+                raise ValueError(
+                    f"prospect.temp_id looks like a player_id but no college_players row found: {temp_id}"
+                )
+            row = repo._conn.execute(
+                "SELECT 1 FROM players WHERE player_id=? LIMIT 1;",
+                (temp_id,),
+            ).fetchone()
+            if row:
+                raise ValueError(f"cannot promote college player_id already exists in players: {temp_id}")
+            player_id = temp_id
+            promoted_from_college = True
+        else:
+            player_id = allocate_new_player_id(repo)
 
         # Upsert players/roster
         attrs = dict(prospect.attrs) if isinstance(prospect.attrs, dict) else {}
         attrs.setdefault("draft", {})
+        prospect_source = "college" if promoted_from_college else "generated_pool"
         attrs["draft"] = {
             "draft_year": dy,
             "overall_no": int(turn.overall_no),
@@ -134,6 +163,10 @@ def apply_pick_to_db(
             "original_team": str(turn.original_team),
             "drafting_team": str(team_id),
             "prospect_temp_id": str(prospect.temp_id),
+            "prospect_source": prospect_source,
+            "player_id_source": "college" if promoted_from_college else "seq_player_id",
+            "college_promoted": bool(promoted_from_college),
+            **({"college_player_id": str(player_id)} if promoted_from_college else {}),
         }
 
         cur = repo._conn.cursor()
@@ -193,6 +226,14 @@ def apply_pick_to_db(
         repo.upsert_contract_records({contract_id: contract})
         repo.rebuild_contract_indices()
 
+        # If this was a promoted college player, remove college records now that NBA records exist.
+        # Do this after players/roster/contracts are successfully applied, and before tx logging.
+        if promoted_from_college:
+            with repo.transaction() as tcur:
+                tcur.execute("DELETE FROM college_player_season_stats WHERE player_id=?;", (player_id,))
+                tcur.execute("DELETE FROM college_draft_entries WHERE player_id=?;", (player_id,))
+                tcur.execute("DELETE FROM college_players WHERE player_id=?;", (player_id,))
+
         tx_entry = {
             "type": "draft_pick_applied",
             "source": str(source),
@@ -200,6 +241,9 @@ def apply_pick_to_db(
             "season_year": dy - 1,  # drafted after season dy-1
             "teams": [team_id],
             "draft_year": dy,
+            "prospect_temp_id": str(prospect.temp_id),
+            "prospect_source": prospect_source,
+            "college_promoted": bool(promoted_from_college),
             "pick": {
                 "overall_no": int(turn.overall_no),
                 "round": int(turn.round),
@@ -229,4 +273,5 @@ def apply_pick_to_db(
         contract_id=contract_id,
         team_id=team_id,
         tx_entry=tx_entry,
+        promoted_from_college=bool(promoted_from_college),
     )
