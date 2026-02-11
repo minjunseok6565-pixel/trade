@@ -18,9 +18,11 @@ from .scoring import evaluate_and_score, _should_discard_prop
 
 @dataclass(frozen=True, slots=True)
 class FitSwapResult:
-    proposal: DealProposal
+    proposal: Optional[DealProposal]
     validations_used: int
     evaluations_used: int
+    candidates_tried: int = 0
+    swapped: bool = False
 
 
 def _has_reason(dec: Any, code: str) -> bool:
@@ -278,6 +280,21 @@ def maybe_apply_fit_swap(
     if not pool:
         return None
 
+    max_pool = int(getattr(config, "fit_swap_candidate_pool", 0) or 0)
+    if max_pool > 0 and len(pool) > max_pool:
+        pool = list(rng.sample(list(pool), max_pool))
+
+    # fit-swap counter에서는 repair budget을 더 보수적으로(기본 1회)
+    fit_max_repairs = int(getattr(config, "fit_swap_max_repairs", budget.max_repairs) or budget.max_repairs)
+    fit_budget = DealGeneratorBudget(
+        max_targets=budget.max_targets,
+        beam_width=budget.beam_width,
+        max_attempts_per_target=budget.max_attempts_per_target,
+        max_validations=budget.max_validations,
+        max_evaluations=budget.max_evaluations,
+        max_repairs=min(int(budget.max_repairs), max(0, int(fit_max_repairs))),
+    )
+
     max_salary_diff = float(getattr(config, "fit_swap_max_salary_diff_m", 3.5) or 3.5)
     min_improve = float(getattr(config, "fit_swap_min_fit_improvement", 0.03) or 0.03)
 
@@ -300,13 +317,15 @@ def maybe_apply_fit_swap(
     ranked.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
 
     # v2처럼 상위 N개만(폭발 방지)
-    max_tries = int(getattr(config, "fit_swap_max_tries", 6) or 6)
-    max_tries = max(1, min(6, max_tries))
+    max_tries = int(getattr(config, "fit_swap_try_top_n", 6) or 6)
+    max_tries = max(1, min(12, max_tries))
 
     validations_used = 0
     evaluations_used = 0
+    candidates_tried = 0
 
     for _, __, ___, new_pid, new_fit in ranked[:max_tries]:
+        candidates_tried += 1
         if validations_used >= validations_remaining or evaluations_used >= evaluations_remaining:
             break
 
@@ -333,7 +352,7 @@ def maybe_apply_fit_swap(
             seller_id=seller_id,
             focal_player_id=str(protected_player_id) if protected_player_id else "",
             archetype="fit_swap",
-            tags=tuple(list(base_prop.tags) + ["counter:fit_swap"]),
+            tags=list(base_prop.tags) + ["counter:fit_swap"],
             repairs_used=0,
         )
 
@@ -343,7 +362,7 @@ def maybe_apply_fit_swap(
             catalog,
             config,
             allow_locked_by_deal_id=allow_locked_by_deal_id,
-            budget=budget,
+            budget=fit_budget,
             banned_asset_keys=banned_asset_keys,
             banned_players=banned_players,
             banned_receivers_by_player=banned_receivers_by_player,
@@ -374,6 +393,16 @@ def maybe_apply_fit_swap(
             proposal=prop2,
             validations_used=int(validations_used),
             evaluations_used=int(evaluations_used),
+            candidates_tried=int(candidates_tried),
+            swapped=True,
         )
 
+    if candidates_tried > 0 or validations_used > 0 or evaluations_used > 0:
+        return FitSwapResult(
+            proposal=None,
+            validations_used=int(validations_used),
+            evaluations_used=int(evaluations_used),
+            candidates_tried=int(candidates_tried),
+            swapped=False,
+        )
     return None
