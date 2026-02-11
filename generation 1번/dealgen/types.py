@@ -114,6 +114,22 @@ class DealGeneratorConfig:
     # sweetener 후보를 token(bucket)별로 몇 개까지 trial 할지(베스트-오브-N).
     # 예산이 빡빡하면 sweetener.py에서 자동으로 더 줄인다.
     sweetener_candidate_width: int = 3
+    
+    # --- fit swap counter (DecisionReason: FIT_FAILS)
+    # FIT_FAILS(=상대가 받는 incoming 플레이어들의 team-fit 불만)일 때,
+    # outgoing 플레이어 1명을 "더 맞는 선수"로 교체해보는 카운터를 시도한다.
+    fit_swap_enabled: bool = True
+    # base(=sweetener 이전) 딜 하나당 fit-swap 시도 상한
+    fit_swap_max_trials_per_base: int = 1
+    # replacement 후보 풀/시도 제한
+    fit_swap_candidate_pool: int = 18
+    fit_swap_try_top_n: int = 6
+    # 얼마나 fit이 좋아져야 교체 후보로 인정할지
+    fit_swap_min_fit_improvement: float = 0.02
+    # 샐러리 급격히 달라져 수리 비용이 폭증하는 것을 방지(단위: $M)
+    fit_swap_max_salary_diff_m: float = 10.0
+    # fit-swap 카운터에서 허용하는 최대 repair 횟수(최소 수리)
+    fit_swap_max_repairs: int = 1
 
     # --- target selection / incoming pool
     need_tags_max: int = 4
@@ -207,6 +223,11 @@ class DealGeneratorStats:
     sweetener_trials: int = 0
     sweetener_commits: int = 0
     sweetener_rollbacks: int = 0
+
+    # fit swap counter telemetry
+    fit_swap_triggers: int = 0
+    fit_swap_candidates_tried: int = 0
+    fit_swap_success: int = 0
 
     # failure kind -> count
     failures_by_kind: Dict[str, int] = field(default_factory=dict)
