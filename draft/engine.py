@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .finalize import finalize_draft_year, infer_db_path_from_state, infer_draft_year_from_state
 from .types import DraftOrderPlan, DraftTurn, TeamId, norm_team_id
-from .pool import DraftPool, Prospect, generate_pool
+from .pool import DraftPool, Prospect, load_pool_from_db
 from .session import DraftSession, DraftPick
 from .ai import DraftAIPolicy, DraftAIContext, BPAByOVRPolicy
 from .apply import apply_pick_to_db, RookieContractPolicy, SimpleRookieScalePolicy
@@ -75,8 +75,8 @@ def prepare_bundle_from_state(
     settle_db: bool = True,
     db_path: Optional[str] = None,
     draft_year: Optional[int] = None,
-    pool_size: int = 90,
-    pool_seed: Optional[int] = None,
+    pool_limit: Optional[int] = None,
+    pool_season_year: Optional[int] = None,
     session_meta: Optional[Dict[str, Any]] = None,
 ) -> DraftEngineBundle:
     """Compute order, settle picks, build turns, and create a session with a pool.
@@ -101,10 +101,11 @@ def prepare_bundle_from_state(
     settlement_events = list(finalized.get("settlement_events") or [])
 
     # Pool + session
-    pool = generate_pool(
+    pool = load_pool_from_db(
+        db_path=dbp,
         draft_year=int(plan.draft_year),
-        n=int(pool_size),
-        rng_seed=int(pool_seed) if pool_seed is not None else int(rng_seed),
+        season_year=pool_season_year,
+        limit=pool_limit,
     )
     session = DraftSession(
         draft_year=int(plan.draft_year),
@@ -126,8 +127,9 @@ def prepare_bundle_from_state(
         meta={
             "rng_seed": int(rng_seed),
             "tie_break_seed": int(tie_break_seed) if tie_break_seed is not None else None,
-            "pool_seed": int(pool_seed) if pool_seed is not None else int(rng_seed),
-            "pool_size": int(pool_size),
+            "pool_source": "college_db",
+            "pool_limit": int(pool_limit) if pool_limit is not None else None,
+            "pool_season_year": int(pool_season_year) if pool_season_year is not None else None,
             "use_lottery": bool(use_lottery),
             "settle_db": bool(settle_db),
         },
@@ -254,8 +256,8 @@ def prepare_bundle_from_global_state(
     tie_break_seed: Optional[int] = None,
     use_lottery: bool = True,
     settle_db: bool = True,
-    pool_size: int = 90,
-    pool_seed: Optional[int] = None,
+    pool_limit: Optional[int] = None,
+    pool_season_year: Optional[int] = None,
     session_meta: Optional[Dict[str, Any]] = None,
 ) -> DraftEngineBundle:
     import state  # local import to avoid cycles at module import time
@@ -269,7 +271,7 @@ def prepare_bundle_from_global_state(
         settle_db=bool(settle_db),
         db_path=None,
         draft_year=None,
-        pool_size=int(pool_size),
-        pool_seed=pool_seed,
+        pool_limit=pool_limit,
+        pool_season_year=pool_season_year,
         session_meta=session_meta,
     )
