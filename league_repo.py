@@ -239,183 +239,23 @@ class LeagueRepo:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};")
 
     def init_db(self) -> None:
-        """Create tables if they don't exist."""
+        """Apply SQLite schema (DDL + migrations) via db_schema."""
         now = _utc_now_iso()
+        try:
+            # db_schema is the extracted schema/migration layer (split out of league_repo.py).
+            from db_schema import apply_schema
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "db_schema package is required. Ensure db_schema/ is on PYTHONPATH.\n"
+                f"Import error: {e}"
+            ) from e
+
         with self.transaction() as cur:
-            cur.executescript(
-                f"""
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                INSERT INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-                INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', '{now}');
-
-                CREATE TABLE IF NOT EXISTS players (
-                    player_id TEXT PRIMARY KEY,
-                    name TEXT,
-                    pos TEXT,
-                    age INTEGER,
-                    height_in INTEGER,
-                    weight_lb INTEGER,
-                    ovr INTEGER,
-                    attrs_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS roster (
-                    player_id TEXT PRIMARY KEY,
-                    team_id TEXT NOT NULL,
-                    salary_amount INTEGER,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_roster_team_id ON roster(team_id);
-
-                CREATE TABLE IF NOT EXISTS contracts (
-                    contract_id TEXT PRIMARY KEY,
-                    player_id TEXT NOT NULL,
-                    team_id TEXT NOT NULL,
-                    start_season_id TEXT,
-                    end_season_id TEXT,
-                    salary_by_season_json TEXT,
-                    contract_type TEXT,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_contracts_player_id ON contracts(player_id);
-                CREATE INDEX IF NOT EXISTS idx_contracts_team_id ON contracts(team_id);
-
-                -- Draft picks (SSOT)
-                CREATE TABLE IF NOT EXISTS draft_picks (
-                    pick_id TEXT PRIMARY KEY,
-                    year INTEGER NOT NULL,
-                    round INTEGER NOT NULL,
-                    original_team TEXT NOT NULL,
-                    owner_team TEXT NOT NULL,
-                    protection_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_draft_picks_owner ON draft_picks(owner_team);
-                CREATE INDEX IF NOT EXISTS idx_draft_picks_year_round ON draft_picks(year, round);
-
-                -- Swap rights (SSOT)
-                CREATE TABLE IF NOT EXISTS swap_rights (
-                    swap_id TEXT PRIMARY KEY,
-                    pick_id_a TEXT NOT NULL,
-                    pick_id_b TEXT NOT NULL,
-                    year INTEGER,
-                    round INTEGER,
-                    owner_team TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_by_deal_id TEXT,
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_swap_rights_owner ON swap_rights(owner_team);
-                CREATE INDEX IF NOT EXISTS idx_swap_rights_year_round ON swap_rights(year, round);
-
-                -- Fixed assets (SSOT)
-                CREATE TABLE IF NOT EXISTS fixed_assets (
-                    asset_id TEXT PRIMARY KEY,
-                    label TEXT,
-                    value REAL,
-                    owner_team TEXT NOT NULL,
-                    source_pick_id TEXT,
-                    draft_year INTEGER,
-                    attrs_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_fixed_assets_owner ON fixed_assets(owner_team);
-
-                -- Transactions log (SSOT)
-                CREATE TABLE IF NOT EXISTS transactions_log (
-                    tx_hash TEXT PRIMARY KEY,
-                    tx_type TEXT NOT NULL,
-                    tx_date TEXT,
-                    season_year INTEGER,
-                    deal_id TEXT,
-                    source TEXT,
-                    teams_json TEXT,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions_log(tx_date);
-
-                -- Contract indices (legacy-compatible SSOT)
-                CREATE TABLE IF NOT EXISTS player_contracts (
-                    player_id TEXT NOT NULL,
-                    contract_id TEXT NOT NULL,
-                    PRIMARY KEY(player_id, contract_id),
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE,
-                    FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS active_contracts (
-                    player_id TEXT PRIMARY KEY,
-                    contract_id TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE,
-                    FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS free_agents (
-                    player_id TEXT PRIMARY KEY,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(player_id) REFERENCES players(player_id) ON DELETE CASCADE
-                );
-
-
-                -- AI GM profiles (team_id -> JSON blob)
-                CREATE TABLE IF NOT EXISTS gm_profiles (
-                    team_id TEXT PRIMARY KEY,
-                    profile_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                """
-            )
-          
-            # Extend contracts table with full JSON storage (keeps contract shape stable across versions)
-            self._ensure_table_columns(
+            apply_schema(
                 cur,
-                "contracts",
-                {
-                    "signed_date": "TEXT",
-                    "start_season_year": "INTEGER",
-                    "years": "INTEGER",
-                    "options_json": "TEXT",
-                    "status": "TEXT",
-                    "contract_json": "TEXT",
-                },
-            )
-
-            # Ensure transactions_log has season_year as a first-class column (SSOT)
-            # This keeps rule queries fast and avoids parsing payload_json for season filtering.
-            self._ensure_table_columns(
-                cur,
-                "transactions_log",
-                {
-                    "season_year": "INTEGER",
-                },
-            )
-
-            # Indices for fast rule filtering (safe after ensuring columns exist).
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tx_season_year ON transactions_log(season_year);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tx_season_type_date ON transactions_log(season_year, tx_type, tx_date);"
+                now=now,
+                schema_version=SCHEMA_VERSION,
+                ensure_columns=self._ensure_table_columns,
             )
 
     # ------------------------
