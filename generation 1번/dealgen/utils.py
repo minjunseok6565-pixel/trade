@@ -364,9 +364,6 @@ def _split_young_candidates(
     - aggregation_solo_only excluded if must_be_aggregation_friendly=True
     - uses buckets (SURPLUS_LOW_FIT, SURPLUS_REDUNDANT, FILLER_CHEAP, CONSOLIDATE)
 
-    Fallback:
-    - if no controllable candidates exist, relax control constraint (age-only) to preserve exploration
-      (keeps current v1 behavior).
     """
     receiver = str(receiver_team_id).upper() if receiver_team_id else None
 
@@ -416,11 +413,8 @@ def _split_young_candidates(
     if not base:
         return ([], [])
 
-    # 1st pass: controllable young
+    # controllable young only (v2 parity; no age-only fallback)
     young_pool: List[PlayerTradeCandidate] = [c for c in base if _eligible(c, require_control=True)]
-    # fallback: age-only (preserve current v1 behavior)
-    if not young_pool:
-        young_pool = [c for c in base if _eligible(c, require_control=False)]
     if not young_pool:
         return ([], [])
 
@@ -450,18 +444,14 @@ def _split_young_candidates(
         if _mkt(c) <= throwin_max:
             throwin.append(c)
 
-    # Final sort: prefer higher market, then more control, then lower salary, then stable id
+    # Final sort (v2 parity): prefer higher market, then lower salary, then stable id
     def _sort_key(c: PlayerTradeCandidate) -> tuple:
         mv = _mkt(c)
-        try:
-            ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
-        except Exception:
-            ry = 0.0
         try:
             sal = float(getattr(c, "salary_m", 0.0) or 0.0)
         except Exception:
             sal = 0.0
-        return (-mv, -ry, sal, str(c.player_id))
+        return (-mv, sal, str(c.player_id))
 
     prospect.sort(key=_sort_key)
     throwin.sort(key=_sort_key)
