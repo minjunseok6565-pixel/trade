@@ -304,6 +304,35 @@ def start_new_season(
 
         offseason_result = None
         if run_offseason and prev_year is not None and int(prev_year) != int(target_year):
+            db_path = str(league.get("db_path"))
+            draft_year = int(prev_year) + 1
+
+            # --- College season finalize + draft declarations (prev season -> next draft)
+            from college.service import finalize_season_and_generate_entries
+            finalize_season_and_generate_entries(
+                db_path=db_path,
+                season_year=int(prev_year),
+                draft_year=draft_year,
+            )
+
+            # --- Draft pick order computation (pick_id -> slot), then pass into offseason settlement.
+            from draft.finalize import compute_plan_from_state
+            plan = compute_plan_from_state(
+                state,
+                draft_year=draft_year,
+                rng_seed=int(prev_year) + 100_003,
+                tie_break_seed=int(prev_year) + 200_017,
+                use_lottery=True,
+            )
+            draft_pick_order_by_pick_id = dict(plan.pick_order_by_pick_id)
+
+            # Cache for UI / fallback readers (contracts.offseason can also read this).
+            orders = state.get("draft_pick_orders")
+            if not isinstance(orders, dict):
+                orders = {}
+                state["draft_pick_orders"] = orders
+            orders[str(draft_year)] = draft_pick_order_by_pick_id
+
             from contracts.offseason import process_offseason
 
             offseason_result = process_offseason(
@@ -311,7 +340,7 @@ def start_new_season(
                 from_season_year=int(prev_year),
                 to_season_year=int(target_year),
                 decision_policy=None,
-                draft_pick_order_by_pick_id=None,
+                draft_pick_order_by_pick_id=draft_pick_order_by_pick_id,
             )
 
         next_sid = _season_id_for_year(int(target_year))
