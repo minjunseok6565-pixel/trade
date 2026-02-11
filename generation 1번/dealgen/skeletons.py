@@ -50,10 +50,15 @@ from ..asset_catalog import (
 from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, TargetCandidate, DealCandidate, SellAssetCandidate
 from .utils import (
     _add_pick_package,
+    _best_need_tag,
     _can_absorb_without_outgoing,
     _clone_deal,
+    _get_need_map,
     _pick_bucket_player,
+    _pick_bucket_player_for_need,
     _pick_filler_player_for_salary,
+    _pick_from_id_pool_for_need,
+    _pick_return_player_salaryish_with_need,
     _split_young_candidates,
     _shape_ok,
 )
@@ -113,6 +118,7 @@ def build_offer_skeletons_buy(
 
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
     ts_seller = tick_ctx.get_team_situation(seller_id)
+    seller_need_map = _get_need_map(tick_ctx, seller_id)
 
     # soft 2nd apron guard는 _soft_guard_second_apron_candidates(=payroll_after_est 기반)에서 처리
 
@@ -185,9 +191,18 @@ def build_offer_skeletons_buy(
         # non-rebuild sellers treat "young" as cheap throw-in only (no prospect fallback)
         pool = throwin_ids
         if pool:
-            bucket = list(pool[: max(1, min(6, len(pool)))])
-            rng.shuffle(bucket)
-            young_id = bucket[0]
+            young_id = _pick_from_id_pool_for_need(
+                buyer_out,
+                pool_ids=pool,
+                receiver_team_id=seller_id,
+                target_salary_m=float(target.salary_m),
+                need_map=seller_need_map,
+                rng=rng,
+                banned_players=banned_players,
+                banned_receivers_by_player=banned_receivers_by_player,
+                must_be_aggregation_friendly=True,
+                top_scan=6,
+            )
             source_tag = "young_source:throwin"
 
     if young_id:
@@ -207,6 +222,11 @@ def build_offer_skeletons_buy(
         tags = [f"need:{target.need_tag}", "pkg:young+pick"]
         if source_tag:
             tags.append(source_tag)
+        c_ret = buyer_out.players.get(str(young_id))
+        if c_ret is not None:
+            rt = _best_need_tag(seller_need_map, c_ret)
+            if rt:
+                tags.append(f"return_need:{rt}")
         out.append(
             DealCandidate(
                 deal=deal2,
@@ -219,10 +239,12 @@ def build_offer_skeletons_buy(
         )
 
     # archetype 3) player-for-player (salary-ish)
-    filler_id = _pick_filler_player_for_salary(
+    filler_id = _pick_return_player_salaryish_with_need(
         buyer_out,
         receiver_team_id=seller_id,
-        target_salary_m=target.salary_m,
+        target_salary_m=float(target.salary_m),
+        need_map=seller_need_map,
+        rng=rng,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
         # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
@@ -231,6 +253,14 @@ def build_offer_skeletons_buy(
     if filler_id:
         deal3 = _clone_deal(base)
         deal3.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=filler_id))
+
+        tags = [f"need:{target.need_tag}", "pkg:player_for_player"]
+        c_ret = buyer_out.players.get(str(filler_id))
+        if c_ret is not None:
+            rt = _best_need_tag(seller_need_map, c_ret)
+            if rt:
+                tags.append(f"return_need:{rt}")
+        
         out.append(
             DealCandidate(
                 deal=deal3,
@@ -238,26 +268,28 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="p4p_salary",
-                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:player_for_player"], mode="BUY", focal_player_id=target.player_id, archetype="p4p_salary"),
+                tags=_with_core_tags(tags, mode="BUY", focal_player_id=target.player_id, archetype="p4p_salary"),
             )
         )
 
     # archetype 4) consolidate 2-for-1
-    cons_id = _pick_bucket_player(
+    cons_id = _pick_bucket_player_for_need(
         buyer_out,
         bucket="CONSOLIDATE",
         receiver_team_id=seller_id,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
+        need_map=seller_need_map,
     )
-    cheap_id = _pick_bucket_player(
+    cheap_id = _pick_bucket_player_for_need(
         buyer_out,
         bucket="FILLER_CHEAP",
         receiver_team_id=seller_id,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
+        need_map=seller_need_map,
     )
     if cons_id and cheap_id and cons_id != cheap_id:
         deal4 = _clone_deal(base)
@@ -278,6 +310,17 @@ def build_offer_skeletons_buy(
             max_picks=1,
             banned_asset_keys=banned_asset_keys,
         )
+        tags = [f"need:{target.need_tag}", "pkg:consolidate"]
+        rt_seen: Set[str] = set()
+        for _pid in (cons_id, cheap_id):
+            c_ret = buyer_out.players.get(str(_pid))
+            if c_ret is None:
+                continue
+            rt = _best_need_tag(seller_need_map, c_ret)
+            if rt and rt not in rt_seen:
+                rt_seen.add(rt)
+                tags.append(f"return_need:{rt}")
+                
         out.append(
             DealCandidate(
                 deal=deal4,
@@ -285,7 +328,7 @@ def build_offer_skeletons_buy(
                 seller_id=seller_id,
                 focal_player_id=target.player_id,
                 archetype="consolidate_2_for_1",
-                tags=_with_core_tags([f"need:{target.need_tag}", "pkg:consolidate"], mode="BUY", focal_player_id=target.player_id, archetype="consolidate_2_for_1"),
+                tags=_with_core_tags(tags, mode="BUY", focal_player_id=target.player_id, archetype="consolidate_2_for_1"),
             )
         )
 
@@ -348,6 +391,7 @@ def build_offer_skeletons_sell(
     ts_seller = tick_ctx.get_team_situation(seller_id)
     ts_buyer = tick_ctx.get_team_situation(buyer_id)
     time_horizon = str(getattr(ts_seller, "time_horizon", "RE_TOOL") or "RE_TOOL")
+    seller_need_map = _get_need_map(tick_ctx, seller_id)
 
     # soft 2nd apron guard는 _soft_guard_second_apron_candidates(=payroll_after_est 기반)에서 처리
 
@@ -408,9 +452,18 @@ def build_offer_skeletons_sell(
     else:
         pool = throwin_ids
         if pool:
-            bucket = list(pool[: max(1, min(6, len(pool)))])
-            rng.shuffle(bucket)
-            young_id = bucket[0]
+            young_id = _pick_from_id_pool_for_need(
+                buyer_out,
+                pool_ids=pool,
+                receiver_team_id=seller_id,
+                target_salary_m=float(sale_asset.salary_m),
+                need_map=seller_need_map,
+                rng=rng,
+                banned_players=banned_players,
+                banned_receivers_by_player=banned_receivers_by_player,
+                must_be_aggregation_friendly=True,
+                top_scan=6,
+            )
             source_tag = "young_source:throwin"
 
     if young_id:
@@ -430,6 +483,11 @@ def build_offer_skeletons_sell(
         tags = [f"match:{match_tag}", "pkg:young+pick"]
         if source_tag:
             tags.append(source_tag)
+        c_ret = buyer_out.players.get(str(young_id))
+        if c_ret is not None:
+            rt = _best_need_tag(seller_need_map, c_ret)
+            if rt:
+                tags.append(f"return_need:{rt}")
         out.append(
             DealCandidate(
                 deal=deal2,
@@ -443,10 +501,12 @@ def build_offer_skeletons_sell(
 
     # archetype 3) buyer sends salary-ish player back (WIN_NOW seller라면 우선)
     if time_horizon in {"WIN_NOW", "RE_TOOL"}:
-        filler_id = _pick_filler_player_for_salary(
+        filler_id = _pick_return_player_salaryish_with_need(
             buyer_out,
             receiver_team_id=seller_id,
             target_salary_m=float(sale_asset.salary_m),
+            need_map=seller_need_map,
+            rng=rng,
             banned_players=banned_players,
             banned_receivers_by_player=banned_receivers_by_player,
             # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
@@ -455,6 +515,14 @@ def build_offer_skeletons_sell(
         if filler_id:
             deal3 = _clone_deal(base)
             deal3.legs[str(buyer_id).upper()].append(PlayerAsset(kind="player", player_id=filler_id))
+
+            tags = [f"match:{match_tag}", "pkg:player_for_player"]
+            c_ret = buyer_out.players.get(str(filler_id))
+            if c_ret is not None:
+                rt = _best_need_tag(seller_need_map, c_ret)
+                if rt:
+                    tags.append(f"return_need:{rt}")
+            
             out.append(
                 DealCandidate(
                     deal=deal3,
@@ -462,26 +530,28 @@ def build_offer_skeletons_sell(
                     seller_id=seller_id,
                     focal_player_id=pid,
                     archetype="buyer_p4p",
-                    tags=_with_core_tags([f"match:{match_tag}", "pkg:player_for_player"], mode="SELL", focal_player_id=pid, archetype="buyer_p4p"),
+                    tags=_with_core_tags(tags, mode="SELL", focal_player_id=pid, archetype="buyer_p4p"),
                 )
             )
 
     # archetype 4) consolidate (buyer 2-for-1)
-    cons_id = _pick_bucket_player(
+    cons_id = _pick_bucket_player_for_need(
         buyer_out,
         bucket="CONSOLIDATE",
         receiver_team_id=seller_id,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
+        need_map=seller_need_map,
     )
-    cheap_id = _pick_bucket_player(
+    cheap_id = _pick_bucket_player_for_need(
         buyer_out,
         bucket="FILLER_CHEAP",
         receiver_team_id=seller_id,
         banned_players=banned_players,
         banned_receivers_by_player=banned_receivers_by_player,
         must_be_aggregation_friendly=True,
+        need_map=seller_need_map,
     )
     if cons_id and cheap_id and cons_id != cheap_id:
         deal4 = _clone_deal(base)
@@ -499,6 +569,16 @@ def build_offer_skeletons_sell(
             max_picks=1,
             banned_asset_keys=banned_asset_keys,
         )
+        tags = [f"match:{match_tag}", "pkg:consolidate"]
+        rt_seen: Set[str] = set()
+        for _pid in (cons_id, cheap_id):
+            c_ret = buyer_out.players.get(str(_pid))
+            if c_ret is None:
+                continue
+            rt = _best_need_tag(seller_need_map, c_ret)
+            if rt and rt not in rt_seen:
+                rt_seen.add(rt)
+                tags.append(f"return_need:{rt}")
         out.append(
             DealCandidate(
                 deal=deal4,
@@ -506,7 +586,7 @@ def build_offer_skeletons_sell(
                 seller_id=seller_id,
                 focal_player_id=pid,
                 archetype="buyer_consolidate",
-                tags=_with_core_tags([f"match:{match_tag}", "pkg:consolidate"], mode="SELL", focal_player_id=pid, archetype="buyer_consolidate"),
+                tags=_with_core_tags(tags, mode="SELL", focal_player_id=pid, archetype="buyer_consolidate"),
             )
         )
 
