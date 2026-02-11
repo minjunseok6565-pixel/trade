@@ -84,6 +84,14 @@ class DealGeneratorConfig:
     young_age_max: float = 24.5
     young_min_control_years: float = 2.0
 
+    # --- young split (prospect vs throw-in)  [v2 parity]
+    # Throw-in: cheap young bodies
+    young_throwin_max_market: float = 22.0
+    # Prospect pool: top fraction among young controllable (by market.total desc)
+    young_prospect_top_frac: float = 0.35
+    young_prospect_max_candidates: int = 6
+    young_throwin_max_candidates: int = 6
+
     # --- deal shape constraints (generator-side)
     max_assets_per_side: int = 6
     max_players_moved_total: int = 4
