@@ -167,7 +167,7 @@ def select_targets_sell(
     banned_players: Set[str],
     allow_locked_by_deal_id: Optional[str] = None,
 ) -> List[SellAssetCandidate]:
-    """SELL 모드: initiator가 내놓을 매물(선수) 후보를 고른다."""
+    """SELL 모드: initiator가 내놓을 매물(선수) 후보를 고른다.
 
     v2 정합 로직:
     - locked(allow_locked 예외 포함) 선필터
