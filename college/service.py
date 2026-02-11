@@ -52,11 +52,40 @@ def _get_meta(repo: LeagueRepo, key: str) -> Optional[str]:
     return str(row[0]) if row[0] is not None else None
 
 
-def _set_meta(repo: LeagueRepo, key: str, value: str) -> None:
-    repo._conn.execute(
-        "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-        (key, value),
+def _set_meta(repo: LeagueRepo, key: str, value: str, cur=None) -> None:
+    """Write meta within an explicit transaction cursor.
+
+    IMPORTANT: Avoid repo._conn.execute() for writes because sqlite3 will start an implicit
+    transaction that can conflict with LeagueRepo.transaction()'s BEGIN.
+
+    Policy:
+      - If cur is provided, execute using that cursor.
+      - Else if the connection is already inside a transaction, execute via a fresh cursor
+        (do NOT start a nested BEGIN).
+      - Else open a short repo.transaction() and execute inside.
+    """
+
+    sql = (
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
     )
+    params = (key, value)
+
+    if cur is not None:
+        cur.execute(sql, params)
+        return
+
+    # If caller already started a transaction but didn't pass cur, avoid nested BEGIN.
+    if bool(getattr(repo._conn, "in_transaction", False)):
+        c = repo._conn.cursor()
+        try:
+            c.execute(sql, params)
+        finally:
+            c.close()
+        return
+
+    with repo.transaction() as cur2:
+        cur2.execute(sql, params)
 
 
 # ----------------------------
@@ -88,7 +117,7 @@ def _compute_max_player_num(repo: LeagueRepo) -> int:
     return int(max_n)
 
 
-def allocate_player_ids(repo: LeagueRepo, *, count: int) -> List[str]:
+def allocate_player_ids(repo: LeagueRepo, *, count: int, cur=None) -> List[str]:
     """
     Allocate sequential player_id values: P000001, P000002, ...
 
@@ -100,33 +129,51 @@ def allocate_player_ids(repo: LeagueRepo, *, count: int) -> List[str]:
         return []
 
     key = "seq_player_id"
-    cur = _get_meta(repo, key)
-    if cur is None:
-        # initialize from max among players and college_players
-        max_n = _compute_max_player_num(repo)
-        _set_meta(repo, key, str(max_n))
-        cur_n = max_n
-    else:
+
+    def _allocate_player_ids_in_tx(*, count: int, cur) -> List[str]:
+        """Allocate ids and update meta within the provided transaction cursor."""
+        cur_val = _get_meta(repo, key)
+        if cur_val is None:
+            # initialize from max among players and college_players
+            max_n = _compute_max_player_num(repo)
+            _set_meta(repo, key, str(max_n), cur=cur)
+            cur_n = max_n
+        else:
+            try:
+                cur_n = int(cur_val)
+            except Exception:
+                cur_n = _compute_max_player_num(repo)
+                _set_meta(repo, key, str(cur_n), cur=cur)
+
+        ids: List[str] = []
+        for _ in range(int(count)):
+            cur_n += 1
+            ids.append(f"P{cur_n:06d}")
+
+        _set_meta(repo, key, str(cur_n), cur=cur)
+        return ids
+
+    # If caller provides a cursor, we are already inside an explicit transaction.
+    if cur is not None:
+        return _allocate_player_ids_in_tx(count=n, cur=cur)
+
+    # If caller already started a transaction but didn't pass cur, avoid nested BEGIN.
+    if bool(getattr(repo._conn, "in_transaction", False)):
+        c = repo._conn.cursor()
         try:
-            cur_n = int(cur)
-        except Exception:
-            cur_n = _compute_max_player_num(repo)
-            _set_meta(repo, key, str(cur_n))
+            return _allocate_player_ids_in_tx(count=n, cur=c)
+        finally:
+            c.close()
 
-    ids: List[str] = []
-    for i in range(n):
-        cur_n += 1
-        ids.append(f"P{cur_n:06d}")
-
-    _set_meta(repo, key, str(cur_n))
-    return ids
+    with repo.transaction() as cur2:
+        return _allocate_player_ids_in_tx(count=n, cur=cur2)
 
 
 # ----------------------------
 # class strength
 # ----------------------------
 
-def get_or_create_class_strength(repo: LeagueRepo, *, draft_year: int, seed_salt: str) -> float:
+def get_or_create_class_strength(repo: LeagueRepo, *, draft_year: int, seed_salt: str, cur=None) -> float:
     """
     Fetch class strength from DB or create it deterministically if missing.
     """
@@ -141,10 +188,19 @@ def get_or_create_class_strength(repo: LeagueRepo, *, draft_year: int, seed_salt
     lo, hi = config.CLASS_STRENGTH_CLAMP
     strength = float(max(lo, min(hi, strength)))
 
-    repo._conn.execute(
-        "INSERT INTO draft_class_strength(draft_year, strength, seed, created_at) VALUES (?, ?, ?, ?);",
-        (dy, float(strength), int(seed), _utc_now_iso()),
-    )
+    sql = "INSERT INTO draft_class_strength(draft_year, strength, seed, created_at) VALUES (?, ?, ?, ?);"
+    params = (dy, float(strength), int(seed), _utc_now_iso())
+    if cur is not None:
+        cur.execute(sql, params)
+    elif bool(getattr(repo._conn, "in_transaction", False)):
+        c = repo._conn.cursor()
+        try:
+            c.execute(sql, params)
+        finally:
+            c.close()
+    else:
+        with repo.transaction() as cur2:
+            cur2.execute(sql, params)
     return float(strength)
 
 
@@ -199,6 +255,7 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
 
         # Ensure initial players
         existing_player_count = repo._conn.execute("SELECT COUNT(*) FROM college_players;").fetchone()[0]
+        created_players = False
         if int(existing_player_count) <= 0:
             # Strength provider: use draft_year = entry_season_year + 1 as the cohort's "expected draft year"
             def strength_for_entry(entry_season_year: int) -> float:
@@ -213,29 +270,10 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
                 class_strength_for_entry_season=strength_for_entry,
             )
 
-            # Allocate real IDs
-            new_ids = allocate_player_ids(repo, count=len(tmp_players))
-            players: List[CollegePlayer] = []
-            for pid, p in zip(new_ids, tmp_players):
-                players.append(
-                    CollegePlayer(
-                        player_id=pid,
-                        name=p.name,
-                        pos=p.pos,
-                        age=p.age,
-                        height_in=p.height_in,
-                        weight_lb=p.weight_lb,
-                        ovr=p.ovr,
-                        college_team_id=p.college_team_id,
-                        class_year=p.class_year,
-                        entry_season_year=p.entry_season_year,
-                        status=p.status,
-                        attrs=p.attrs,
-                    )
-                )
-
+            # Allocate IDs + insert + bootstrap marker in ONE transaction.
             with repo.transaction() as cur:
-                for p in players:
+                new_ids = allocate_player_ids(repo, count=len(tmp_players), cur=cur)
+                for pid, p in zip(new_ids, tmp_players):
                     cur.execute(
                         """
                         INSERT INTO college_players(
@@ -245,7 +283,7 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
-                            p.player_id,
+                            pid,
                             p.college_team_id,
                             int(p.class_year),
                             int(p.entry_season_year),
@@ -260,7 +298,11 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
                         ),
                     )
 
-        _set_meta(repo, marker_key, str(sy))
+                _set_meta(repo, marker_key, str(sy), cur=cur)
+                created_players = True
+        # If players already existed but marker was missing/outdated, set it now.
+        if not created_players:
+            _set_meta(repo, marker_key, str(sy))
 
 
 # ----------------------------
@@ -497,29 +539,10 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
         rng = random.Random(_stable_seed("freshmen_gen", ty))
         tmp_fresh = generate_freshmen_for_season(rng, entry_season_year=ty, teams=teams, class_strength=float(strength))
 
-        # Allocate IDs + insert
-        new_ids = allocate_player_ids(repo, count=len(tmp_fresh))
-        fresh: List[CollegePlayer] = []
-        for pid, p in zip(new_ids, tmp_fresh):
-            fresh.append(
-                CollegePlayer(
-                    player_id=pid,
-                    name=p.name,
-                    pos=p.pos,
-                    age=p.age,
-                    height_in=p.height_in,
-                    weight_lb=p.weight_lb,
-                    ovr=p.ovr,
-                    college_team_id=p.college_team_id,
-                    class_year=1,
-                    entry_season_year=ty,
-                    status="ACTIVE",
-                    attrs=p.attrs,
-                )
-            )
-
+        # Allocate IDs + insert in ONE transaction (keeps seq_player_id and rows consistent)
         with repo.transaction() as cur:
-            for p in fresh:
+            new_ids = allocate_player_ids(repo, count=len(tmp_fresh), cur=cur)
+            for pid, p in zip(new_ids, tmp_fresh):
                 cur.execute(
                     """
                     INSERT INTO college_players(
@@ -529,11 +552,11 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
-                        p.player_id,
+                        pid,
                         p.college_team_id,
-                        int(p.class_year),
-                        int(p.entry_season_year),
-                        p.status,
+                        1,
+                        int(ty),
+                        "ACTIVE",
                         p.name,
                         p.pos,
                         int(p.age),
