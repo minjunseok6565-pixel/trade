@@ -463,12 +463,24 @@ def _generate_buy_mode(
                 if int(fit_swap_trials_by_base.get(h_valid, 0)) < int(max_fit_swap_trials_per_base):
                     try:
                         from .fit_swap import maybe_apply_fit_swap  # local import to avoid cycles
-                    except Exception:
+                    except ImportError:
                         maybe_apply_fit_swap = None  # type: ignore
 
                     if maybe_apply_fit_swap is not None:
                         val_rem = max(0, int(budget.max_validations) - int(stats.validations))
                         eval_rem = max(0, int(budget.max_evaluations) - int(stats.evaluations))
+
+                        trial_idx = int(fit_swap_trials_by_base.get(h_valid, 0))
+                        local_seed = _compute_sweetener_seed(
+                            config,
+                            tick_ctx,
+                            initiator_team_id=buyer_id,
+                            counterparty_team_id=seller_id,
+                            base_hash=pre_sweet_hash,
+                            skeleton_hash=f"fit_swap|{h}",
+                            trial_index=trial_idx,
+                        )
+                        local_rng = random.Random(int(local_seed))
 
                         res = maybe_apply_fit_swap(
                             pre_sweet_prop,
@@ -484,6 +496,8 @@ def _generate_buy_mode(
                             banned_receivers_by_player=banned_receivers_by_player,
                             protected_player_id=cand2.focal_player_id,
                             opponent_repeat_count=int(partner_counts.get(seller_id, 0)),
+                            rng=local_rng,
+                            stats=stats,
                         )
 
                         # budget counters
@@ -796,12 +810,24 @@ def _generate_sell_mode(
                     if int(fit_swap_trials_by_base.get(h_valid, 0)) < int(max_fit_swap_trials_per_base):
                         try:
                             from .fit_swap import maybe_apply_fit_swap  # local import to avoid cycles
-                        except Exception:
+                        except ImportError:
                             maybe_apply_fit_swap = None  # type: ignore
 
                         if maybe_apply_fit_swap is not None:
                             val_rem = max(0, int(budget.max_validations) - int(stats.validations))
                             eval_rem = max(0, int(budget.max_evaluations) - int(stats.evaluations))
+
+                            trial_idx = int(fit_swap_trials_by_base.get(h_valid, 0))
+                            local_seed = _compute_sweetener_seed(
+                                config,
+                                tick_ctx,
+                                initiator_team_id=seller_id,
+                                counterparty_team_id=buyer_id,
+                                base_hash=pre_sweet_hash,
+                                skeleton_hash=f"fit_swap|{h}",
+                                trial_index=trial_idx,
+                            )
+                            local_rng = random.Random(int(local_seed))
 
                             res = maybe_apply_fit_swap(
                                 pre_sweet_prop,
@@ -817,6 +843,8 @@ def _generate_sell_mode(
                                 banned_receivers_by_player=banned_receivers_by_player,
                                 protected_player_id=cand2.focal_player_id,
                                 opponent_repeat_count=int(partner_counts.get(buyer_id, 0)),
+                                rng=local_rng,
+                                stats=stats,
                             )
 
                             # budget counters
