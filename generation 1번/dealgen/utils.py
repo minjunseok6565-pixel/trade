@@ -466,6 +466,349 @@ def _split_young_candidates(
 
     return (prospect_ids, throwin_ids)
 
+# =============================================================================
+# Need-fit helpers (A: counterparty return selection)
+# =============================================================================
+
+
+def _get_need_map(tick_ctx: TradeGenerationTickContext, team_id: str) -> Dict[str, float]:
+    """Best-effort need_map for a team.
+
+    Primary source: tick_ctx.get_decision_context(team_id).need_map (SSOT for valuation).
+    Fallback: tick_ctx.get_team_situation(team_id).needs -> {tag: weight}
+    """
+    tid = str(team_id or "").upper()
+    out: Dict[str, float] = {}
+    try:
+        dc = tick_ctx.get_decision_context(tid)
+        nm = getattr(dc, "need_map", {}) or {}
+        if isinstance(nm, dict):
+            for k, v in nm.items():
+                if not k:
+                    continue
+                try:
+                    out[str(k)] = float(v)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    if out:
+        return out
+
+    # Fallback
+    try:
+        ts = tick_ctx.get_team_situation(tid)
+        needs = getattr(ts, "needs", None)
+        if isinstance(needs, list):
+            for n in needs:
+                tag = getattr(n, "tag", None)
+                w = getattr(n, "weight", None)
+                if not tag:
+                    continue
+                try:
+                    out[str(tag)] = float(w)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return out
+
+
+def _need_fit_score(need_map: Mapping[str, float], cand: PlayerTradeCandidate) -> float:
+    """How well a candidate matches a team's needs (0..~)."""
+    if not need_map:
+        return 0.0
+    supply = getattr(cand, "supply", {}) or {}
+    tags = getattr(cand, "top_tags", ()) or ()
+    score = 0.0
+    for t in tags:
+        try:
+            w = float(need_map.get(t, 0.0) or 0.0)
+            s = float(supply.get(t, 0.0) or 0.0)
+        except Exception:
+            continue
+        score += w * (0.4 + 0.6 * s)
+    return float(score)
+
+
+def _best_need_tag(need_map: Mapping[str, float], cand: PlayerTradeCandidate) -> str:
+    """Return the best-matching need tag for narrative tags (or empty)."""
+    if not need_map:
+        return ""
+    supply = getattr(cand, "supply", {}) or {}
+    tags = getattr(cand, "top_tags", ()) or ()
+    best_t = ""
+    best = 0.0
+    for t in tags:
+        try:
+            w = float(need_map.get(t, 0.0) or 0.0)
+            s = float(supply.get(t, 0.0) or 0.0)
+            sc = w * (0.4 + 0.6 * s)
+        except Exception:
+            continue
+        if sc > best:
+            best = sc
+            best_t = str(t)
+    return best_t if best > 0.05 else ""
+
+
+def _rank_for_need(
+    cands: Sequence[PlayerTradeCandidate], *, need_map: Mapping[str, float]
+) -> List[PlayerTradeCandidate]:
+    """Deterministic ranking of candidates by need fit (then by market value, then salary)."""
+    rows = []
+    for c in cands:
+        nf = _need_fit_score(need_map, c)
+        mv = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+        rows.append((nf, mv, sal, c.player_id, c))
+    rows.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    return [r[-1] for r in rows]
+
+
+def _sample_for_counterparty(
+    cands: Sequence[PlayerTradeCandidate],
+    target_salary_m: float,
+    *,
+    need_map: Mapping[str, float],
+    rng: random.Random,
+    k: int,
+) -> List[PlayerTradeCandidate]:
+    """Sample candidates with a blend of salary proximity and need fit.
+
+    This is purely a heuristic for *plausible* packages; SSOT evaluation decides acceptance later.
+    """
+    rows = []
+    for c in cands:
+        try:
+            sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+        except Exception:
+            sal = 0.0
+        mv = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+        nf = _need_fit_score(need_map, c)
+        dist = abs(sal - float(target_salary_m))
+        # Higher is better: need fit dominates slightly; salary distance keeps things plausible.
+        score = (1.45 * nf) - (0.14 * dist) - (0.015 * max(0.0, mv - 18.0))
+        rows.append((score, -nf, dist, mv, c.player_id, c))
+
+    rows.sort(key=lambda x: (x[0], x[1], -x[2], x[4]), reverse=True)
+    top = [r[-1] for r in rows[: max(2, min(10, len(rows)))]]
+    rng.shuffle(top)
+    return top[: max(0, k)]
+
+
+def _collect_player_candidates_from_buckets(
+    out: TeamOutgoingCatalog,
+    *,
+    buckets: Sequence[BucketId],
+    receiver_team_id: Optional[str],
+    banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> List[PlayerTradeCandidate]:
+    """Collect PlayerTradeCandidate objects from given buckets with the same filters as v1 pickers."""
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+    seen: Set[str] = set()
+    cands: List[PlayerTradeCandidate] = []
+
+    for b in buckets:
+        for pid in out.player_ids_by_bucket.get(b, tuple()):
+            pid_s = str(pid)
+            if not pid_s or pid_s in seen:
+                continue
+            seen.add(pid_s)
+            if pid_s in banned_players:
+                continue
+            c = out.players.get(pid_s)
+            if c is None:
+                continue
+            if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
+                continue
+            if receiver and banned_receivers_by_player is not None:
+                if receiver in banned_receivers_by_player.get(pid_s, set()):
+                    continue
+            if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+                continue
+            cands.append(c)
+
+    return cands
+
+
+def _collect_player_candidates_from_ids(
+    out: TeamOutgoingCatalog,
+    *,
+    player_ids: Sequence[str],
+    receiver_team_id: Optional[str],
+    banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> List[PlayerTradeCandidate]:
+    receiver = str(receiver_team_id).upper() if receiver_team_id else None
+    cands: List[PlayerTradeCandidate] = []
+    for pid in player_ids:
+        pid_s = str(pid)
+        if not pid_s:
+            continue
+        if pid_s in banned_players:
+            continue
+        c = out.players.get(pid_s)
+        if c is None:
+            continue
+        if receiver and receiver in set(getattr(c, "return_ban_teams", None) or ()):
+            continue
+        if receiver and banned_receivers_by_player is not None:
+            if receiver in banned_receivers_by_player.get(pid_s, set()):
+                continue
+        if must_be_aggregation_friendly and bool(getattr(c, "aggregation_solo_only", False)):
+            continue
+        cands.append(c)
+    return cands
+
+
+def _pick_bucket_player_for_need(
+    out: TeamOutgoingCatalog,
+    *,
+    bucket: BucketId,
+    receiver_team_id: Optional[str],
+    banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+    need_map: Optional[Mapping[str, float]] = None,
+) -> Optional[str]:
+    """v1 _pick_bucket_player + v2 need-fit ranking (A absorption).
+
+    - need_map이 비어있으면 기존 v1 방식(_pick_bucket_player)으로 fallback.
+    - need_map이 있으면 bucket 내 후보를 need-fit으로 랭킹해 1순위를 선택.
+    """
+    if not need_map:
+        return _pick_bucket_player(
+            out,
+            bucket=bucket,
+            receiver_team_id=receiver_team_id,
+            banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
+            must_be_aggregation_friendly=must_be_aggregation_friendly,
+        )
+
+    cands = _collect_player_candidates_from_buckets(
+        out,
+        buckets=(bucket,),
+        receiver_team_id=receiver_team_id,
+        banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=must_be_aggregation_friendly,
+    )
+    if not cands:
+        return None
+    ranked = _rank_for_need(cands, need_map=need_map)
+    return str(ranked[0].player_id) if ranked else None
+
+
+def _pick_return_player_salaryish_with_need(
+    out: TeamOutgoingCatalog,
+    *,
+    receiver_team_id: Optional[str],
+    target_salary_m: float,
+    need_map: Optional[Mapping[str, float]],
+    rng: random.Random,
+    banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+) -> Optional[str]:
+    """Return player selection for p4p/salary-ish archetypes with need-fit.
+
+    - need_map이 비어있으면 기존 v1의 _pick_filler_player_for_salary로 fallback.
+    - need_map이 있으면 (match-ish buckets) 후보를 모아 _sample_for_counterparty로 1명 선택.
+    """
+    if not need_map:
+        return _pick_filler_player_for_salary(
+            out,
+            receiver_team_id=receiver_team_id,
+            target_salary_m=float(target_salary_m),
+            banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
+            must_be_aggregation_friendly=must_be_aggregation_friendly,
+        )
+
+    # v2의 "match" 후보 풀 감각을 v1에 맞게 최소 구현:
+    # (즉시전력/가치자산/샐매 가능 바디가 섞이되 CORE는 포함하지 않음)
+    buckets: Tuple[BucketId, ...] = (
+        "EXPIRING",
+        "SURPLUS_LOW_FIT",
+        "SURPLUS_REDUNDANT",
+        "CONSOLIDATE",
+        "FILLER_CHEAP",
+        "FILLER_BAD_CONTRACT",
+    )
+    cands = _collect_player_candidates_from_buckets(
+        out,
+        buckets=buckets,
+        receiver_team_id=receiver_team_id,
+        banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=must_be_aggregation_friendly,
+    )
+    if not cands:
+        return None
+
+    picked = _sample_for_counterparty(
+        cands,
+        float(target_salary_m),
+        need_map=need_map,
+        rng=rng,
+        k=1,
+    )
+    return str(picked[0].player_id) if picked else None
+
+
+def _pick_from_id_pool_for_need(
+    out: TeamOutgoingCatalog,
+    *,
+    pool_ids: Sequence[str],
+    receiver_team_id: Optional[str],
+    target_salary_m: float,
+    need_map: Optional[Mapping[str, float]],
+    rng: random.Random,
+    banned_players: Set[str],
+    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
+    must_be_aggregation_friendly: bool = True,
+    top_scan: int = 6,
+) -> Optional[str]:
+    """Pick 1 player from an explicit id pool (used for young throw-in) with optional need-fit.
+
+    - need_map이 없으면 기존 v1 방식처럼 top_scan 범위에서 shuffle 후 1명 선택.
+    - need_map이 있으면 후보 cand를 만들어 _sample_for_counterparty로 1명 선택.
+    """
+    if not pool_ids:
+        return None
+
+    scan_ids = list(pool_ids[: max(1, min(int(top_scan), len(pool_ids)))])
+    if not need_map:
+        rng.shuffle(scan_ids)
+        return str(scan_ids[0]) if scan_ids else None
+
+    cands = _collect_player_candidates_from_ids(
+        out,
+        player_ids=scan_ids,
+        receiver_team_id=receiver_team_id,
+        banned_players=banned_players,
+        banned_receivers_by_player=banned_receivers_by_player,
+        must_be_aggregation_friendly=must_be_aggregation_friendly,
+    )
+    if not cands:
+        return None
+
+    picked = _sample_for_counterparty(
+        cands,
+        float(target_salary_m),
+        need_map=need_map,
+        rng=rng,
+        k=1,
+    )
+    return str(picked[0].player_id) if picked else None
+
 
 def _pick_youngish_player(
     out: TeamOutgoingCatalog,
