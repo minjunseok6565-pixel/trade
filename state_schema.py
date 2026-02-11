@@ -11,7 +11,9 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "schema_version",
     "turn",
     "active_season_id",
+    "draft_pick_orders",
     "season_history",
+    "draft_pick_orders": {},  # draft_year(str/int) -> {pick_id: slot_int}
     "games",
     "player_stats",
     "team_stats",
@@ -215,6 +217,17 @@ def validate_game_state(state: dict) -> None:
     _require_container(state, "player_stats", dict, "dict")
     _require_container(state, "team_stats", dict, "dict")
     _require_container(state, "game_results", dict, "dict")
+    draft_pick_orders = _require_container(state, "draft_pick_orders", dict, "dict")
+
+    # Validate draft_pick_orders content shape (best-effort; tolerant on year key types).
+    for y, mapping in draft_pick_orders.items():
+        if not isinstance(mapping, dict):
+            raise ValueError(f"GameState invalid: draft_pick_orders[{y!r}] must be dict")
+        for pick_id, slot in mapping.items():
+            if not isinstance(pick_id, str):
+                raise ValueError("GameState invalid: draft_pick_orders values must have str pick_id keys")
+            if not isinstance(slot, int):
+                raise ValueError("GameState invalid: draft_pick_orders values must have int slot values")
 
     active_season_id = state.get("active_season_id")
     if active_season_id is not None and not isinstance(active_season_id, str):
