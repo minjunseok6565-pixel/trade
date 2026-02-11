@@ -11,9 +11,8 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "schema_version",
     "turn",
     "active_season_id",
-    "draft_pick_orders",
     "season_history",
-    "draft_pick_orders": {},  # draft_year(str/int) -> {pick_id: slot_int}
+    "draft_pick_orders",  # draft_year(str/int) -> {pick_id: slot_int}
     "games",
     "player_stats",
     "team_stats",
@@ -80,6 +79,7 @@ def create_default_game_state() -> Dict[str, Any]:
         "schema_version": STATE_SCHEMA_VERSION,
         "turn": 0,
         "active_season_id": None,
+        "draft_pick_orders": {},  # draft_year -> {pick_id: slot_int}
         "season_history": {},
         "games": [],  # 각 경기의 메타 데이터
         "player_stats": {},  # player_id -> 시즌 누적 스탯
@@ -315,7 +315,7 @@ def validate_game_state(state: dict) -> None:
     if not isinstance(master_schedule.get("by_id"), dict):
         raise ValueError("GameState invalid: league.master_schedule.by_id must be dict")
 
-        # -----------------------------
+    # -----------------------------
     # SSOT: active_season_id <-> league.season_year/draft_year 일치 강제
     # -----------------------------
     league_year = league.get("season_year")
