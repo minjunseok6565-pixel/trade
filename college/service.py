@@ -42,90 +42,6 @@ def _stable_seed(*parts: object) -> int:
 
 
 # ----------------------------
-# schema
-# ----------------------------
-
-def ensure_college_schema(repo: LeagueRepo) -> None:
-    """
-    Ensure college tables exist (idempotent).
-
-    For early integration convenience, this lives in college.service.
-    Later, you can move the DDL into LeagueRepo.init_db() by calling this.
-    """
-    with repo.transaction() as cur:
-        cur.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS college_teams (
-                college_team_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                conference TEXT NOT NULL,
-                meta_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS college_players (
-                player_id TEXT PRIMARY KEY,
-                college_team_id TEXT NOT NULL,
-                class_year INTEGER NOT NULL,
-                entry_season_year INTEGER NOT NULL,
-                status TEXT NOT NULL,
-
-                name TEXT NOT NULL,
-                pos TEXT NOT NULL,
-                age INTEGER NOT NULL,
-                height_in INTEGER NOT NULL,
-                weight_lb INTEGER NOT NULL,
-                ovr INTEGER NOT NULL,
-                attrs_json TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_college_players_team ON college_players(college_team_id);
-            CREATE INDEX IF NOT EXISTS idx_college_players_status ON college_players(status);
-            CREATE INDEX IF NOT EXISTS idx_college_players_entry ON college_players(entry_season_year);
-
-            CREATE TABLE IF NOT EXISTS college_player_season_stats (
-                season_year INTEGER NOT NULL,
-                player_id TEXT NOT NULL,
-                college_team_id TEXT NOT NULL,
-                stats_json TEXT NOT NULL,
-                PRIMARY KEY (season_year, player_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_college_player_stats_season_team ON college_player_season_stats(season_year, college_team_id);
-
-            CREATE TABLE IF NOT EXISTS college_team_season_stats (
-                season_year INTEGER NOT NULL,
-                college_team_id TEXT NOT NULL,
-                wins INTEGER NOT NULL,
-                losses INTEGER NOT NULL,
-                srs REAL NOT NULL,
-                pace REAL NOT NULL,
-                off_ppg REAL NOT NULL,
-                def_ppg REAL NOT NULL,
-                meta_json TEXT NOT NULL,
-                PRIMARY KEY (season_year, college_team_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS college_draft_entries (
-                draft_year INTEGER NOT NULL,
-                player_id TEXT NOT NULL,
-                declared_at TEXT NOT NULL,
-                decision_json TEXT NOT NULL,
-                PRIMARY KEY (draft_year, player_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_college_entries_year ON college_draft_entries(draft_year);
-
-            CREATE TABLE IF NOT EXISTS draft_class_strength (
-                draft_year INTEGER PRIMARY KEY,
-                strength REAL NOT NULL,
-                seed INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-
-
-# ----------------------------
 # meta helpers
 # ----------------------------
 
@@ -248,7 +164,6 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
     sy = int(season_year)
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        ensure_college_schema(repo)
 
         # If already bootstrapped for this season year, skip.
         marker_key = "college_bootstrap_season_year"
@@ -416,7 +331,6 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
 
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        ensure_college_schema(repo)
 
         # Ensure class strength exists for this draft year
         strength = get_or_create_class_strength(repo, draft_year=dy, seed_salt=f"entries@{sy}")
@@ -552,7 +466,6 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
 
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        ensure_college_schema(repo)
 
         # Reset DECLARED -> ACTIVE (they returned if not drafted)
         with repo.transaction() as cur:
@@ -640,7 +553,6 @@ def remove_drafted_player(db_path: str, player_id: str) -> None:
     pid = str(player_id)
     with LeagueRepo(db_path) as repo:
         repo.init_db()
-        ensure_college_schema(repo)
         with repo.transaction() as cur:
             cur.execute("DELETE FROM college_player_season_stats WHERE player_id=?;", (pid,))
             cur.execute("DELETE FROM college_draft_entries WHERE player_id=?;", (pid,))
