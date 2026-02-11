@@ -448,6 +448,7 @@ def build_offer_skeletons_sell(
             receiver_team_id=seller_id,
             target_salary_m=float(sale_asset.salary_m),
             banned_players=banned_players,
+            banned_receivers_by_player=banned_receivers_by_player,
             # aggregation_solo_only는 '묶음 금지'이므로 1-for-1(p4p) 스켈레톤에서는 허용
             must_be_aggregation_friendly=False,
         )
