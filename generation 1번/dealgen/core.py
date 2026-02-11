@@ -562,6 +562,7 @@ def _generate_sell_mode(
         budget=budget,
         rng=rng,
         banned_players=banned_players,
+        allow_locked_by_deal_id=allow_locked_by_deal_id,
     )
 
     for s in sale_assets:
