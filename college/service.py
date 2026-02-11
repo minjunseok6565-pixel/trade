@@ -398,6 +398,12 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
         stats_by_pid: Dict[str, CollegeSeasonStats] = {}
         for pid, sjson in rows:
             d = json_loads(str(sjson)) or {}
+            # stats_json에는 직렬화 버전 키(__v)가 포함될 수 있으므로,
+            # dataclass 생성 전에 제거해서 slots/필드 불일치로 인한 TypeError를 방지한다.
+            if isinstance(d, dict):
+                d.pop("__v", None)
+            else:
+                d = {}
             stats_by_pid[str(pid)] = CollegeSeasonStats(**d)
 
         # Decide declarations
