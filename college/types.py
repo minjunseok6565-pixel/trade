@@ -79,6 +79,11 @@ class CollegeSeasonStats:
 
     meta: JsonDict
 
+    def to_json_dict(self) -> JsonDict:
+        """Stable JSON payload for DB storage (slots-safe; no __dict__ dependency)."""
+        from .serialization import season_stats_to_json
+        return season_stats_to_json(self)
+
 
 @dataclass(frozen=True, slots=True)
 class CollegeTeamSeasonStats:
@@ -107,3 +112,8 @@ class DraftEntryDecisionTrace:
     projected_pick: Optional[int]
     factors: JsonDict  # component scores (ovr, age, class, production, risk, etc.)
     notes: JsonDict    # any extra notes (thresholds, clamps, etc.)
+
+    def to_json_dict(self) -> JsonDict:
+        """Stable JSON payload for DB storage (slots-safe; no __dict__ dependency)."""
+        from .serialization import decision_trace_to_json
+        return decision_trace_to_json(self)
