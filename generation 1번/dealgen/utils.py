@@ -591,7 +591,7 @@ def _sample_for_counterparty(
         dist = abs(sal - float(target_salary_m))
         # Higher is better: need fit dominates slightly; salary distance keeps things plausible.
         score = (1.45 * nf) - (0.14 * dist) - (0.015 * max(0.0, mv - 18.0))
-        rows.append((score, -nf, dist, mv, c.player_id, c))
+        rows.append((score, nf, dist, mv, c.player_id, c))
 
     rows.sort(key=lambda x: (x[0], x[1], -x[2], x[4]), reverse=True)
     top = [r[-1] for r in rows[: max(2, min(10, len(rows)))]]
