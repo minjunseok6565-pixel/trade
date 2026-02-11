@@ -500,6 +500,11 @@ def _generate_buy_mode(
                             stats=stats,
                         )
 
+                        # maybe_apply_fit_swap can return None (e.g. no FIT_FAILS / empty pool / budget gate).
+                        # Count it as a trial to avoid repeatedly retrying the same base deal.
+                        if res is None:
+                            fit_swap_trials_by_base[h_valid] = int(fit_swap_trials_by_base.get(h_valid, 0)) + 1
+                            
                         # budget counters
                         stats.validations += int(getattr(res, "validations_used", 0) or 0)
                         stats.evaluations += int(getattr(res, "evaluations_used", 0) or 0)
@@ -846,6 +851,10 @@ def _generate_sell_mode(
                                 rng=local_rng,
                                 stats=stats,
                             )
+                            # maybe_apply_fit_swap can return None (e.g. no FIT_FAILS / empty pool / budget gate).
+                            # Count it as a trial to avoid repeatedly retrying the same base deal.
+                            if res is None:
+                                fit_swap_trials_by_base[h_valid] = int(fit_swap_trials_by_base.get(h_valid, 0)) + 1
 
                             # budget counters
                             stats.validations += int(getattr(res, "validations_used", 0) or 0)
