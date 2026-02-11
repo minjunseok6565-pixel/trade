@@ -379,7 +379,7 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
                             int(ps.season_year),
                             ps.player_id,
                             ps.college_team_id,
-                            json_dumps(ps.__dict__),
+                            json_dumps(ps.to_json_dict()),
                         ),
                     )
 
@@ -438,7 +438,7 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
                     INSERT INTO college_draft_entries(draft_year, player_id, declared_at, decision_json)
                     VALUES (?, ?, ?, ?);
                     """,
-                    (int(dy), tr.player_id, now, json_dumps(tr.__dict__)),
+                    (int(dy), tr.player_id, now, json_dumps(tr.to_json_dict())),
                 )
                 cur.execute(
                     "UPDATE college_players SET status='DECLARED' WHERE player_id=?;",
