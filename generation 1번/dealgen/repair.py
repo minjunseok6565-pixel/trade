@@ -419,6 +419,9 @@ def _repair_salary_matching(
 
     # max_players_per_side guard는 이미 위에서 통과했으므로, 여기서는 후보 스캔/선정만 한다.
     already = {a.player_id for a in cand.deal.legs.get(failing_team, []) if isinstance(a, PlayerAsset)}
+    # aggregation_solo_only는 "묶음(2+ outgoing) 금지"이므로,
+    # 현재 outgoing이 0명(=단독 트레이드)인 경우에만 허용한다.
+    allow_solo_only = (len(already) == 0)
 
     # 후보 filler를 버킷에서 전수 스캔하고, "salary matching을 실제로 통과시키는" 후보만 남긴다.
     buckets: Tuple[BucketId, ...] = ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT")
@@ -441,7 +444,8 @@ def _repair_salary_matching(
             # return-ban / aggregation-solo-only 필터 (기존 _pick_bucket_player와 동일한 의도)
             if receiver_team and receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
                 continue
-            if bool(getattr(c, "aggregation_solo_only", False)):
+            # solo-only는 단독 outgoing이면 허용, 이미 outgoing이 있으면 추가 outgoing으로 붙이지 않음
+            if bool(getattr(c, "aggregation_solo_only", False)) and not allow_solo_only:
                 continue
 
             filler_salary_d = int(round(float(c.salary_m) * 1_000_000.0))
@@ -567,8 +571,6 @@ def _repair_second_apron_salary_mismatch(
                     continue
                 if receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
                     continue
-                if bool(getattr(c, "aggregation_solo_only", False)):
-                    continue
 
                 sal_d = int(round(float(c.salary_m) * 1_000_000.0))
                 if sal_d < required_out_d:
@@ -629,9 +631,7 @@ def _repair_second_apron_salary_mismatch(
                 continue
             if receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
                 continue
-            if bool(getattr(c, "aggregation_solo_only", False)):
-                continue
-
+                
             sal_d = int(round(float(c.salary_m) * 1_000_000.0))
             if sal_d > max_in_d:
                 continue
@@ -751,11 +751,41 @@ def _repair_roster_limit(cand: DealCandidate, problem_team: str, catalog: TradeA
         return False
 
     already = {a.player_id for a in cand.deal.legs.get(problem_team, []) if isinstance(a, PlayerAsset)}
-    filler = _pick_lowest_market_player(
-        prob_out,
-        buckets=("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"),
-        banned_players=already,
-    )
+    # aggregation_solo_only는 "묶음(2+ outgoing) 금지"이므로,
+    # 현재 outgoing이 0명인 경우에만 solo-only를 허용한다.
+    allow_solo_only = (len(already) == 0)
+
+    # 기존 outgoing에 solo-only가 포함되어 있으면(=단독만 허용),
+    # 여기서 outgoing을 추가하면 aggregation_ban으로 재실패할 가능성이 높으므로 수리하지 않는다.
+    for pid0 in already:
+        c0 = prob_out.players.get(pid0)
+        if c0 is not None and bool(getattr(c0, "aggregation_solo_only", False)):
+            return False
+
+    receiver_team = other_team
+
+    # 낮은 market을 우선으로 보내되, return-ban / solo-only 조건을 반영해서 후보를 고른다.
+    best_pid: Optional[str] = None
+    best_key: Optional[Tuple[float, float, str]] = None  # (market_total, salary_m, pid)
+    for b in ("FILLER_CHEAP", "EXPIRING", "FILLER_BAD_CONTRACT"):
+        for pid in prob_out.player_ids_by_bucket.get(b, tuple()):
+            pid = str(pid)
+            if pid in already:
+                continue
+            c = prob_out.players.get(pid)
+            if c is None:
+                continue
+            if receiver_team and receiver_team in set(getattr(c, "return_ban_teams", None) or ()):
+                continue
+            if bool(getattr(c, "aggregation_solo_only", False)) and not allow_solo_only:
+                continue
+            mkt = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+            sal = float(getattr(c, "salary_m", 0.0) or 0.0)
+            key = (mkt, sal, pid)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_pid = pid
+    filler = best_pid
     if not filler:
         return False
     cand.deal.legs[problem_team].append(PlayerAsset(kind="player", player_id=filler))
