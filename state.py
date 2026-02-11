@@ -343,6 +343,31 @@ def start_new_season(
                 draft_pick_order_by_pick_id=draft_pick_order_by_pick_id,
             )
 
+            # --- College offseason advance (class_year++ / graduation / freshmen for to_season_year)
+            # NOTE: once the NBA draft is executed (college entrants consumed),
+            # this should remain AFTER draft completion so DECLARED players can be drafted first.
+            from college.service import advance_offseason as _college_advance_offseason
+
+            fy_i = int(prev_year)
+            ty_i = int(target_year)
+            if ty_i > fy_i:
+                if ty_i == fy_i + 1:
+                    _college_advance_offseason(
+                        db_path=db_path,
+                        from_season_year=fy_i,
+                        to_season_year=ty_i,
+                    )
+                else:
+                    # Stepwise advance to satisfy the consecutive-year constraint.
+                    y = fy_i
+                    while y < ty_i:
+                        _college_advance_offseason(
+                            db_path=db_path,
+                            from_season_year=y,
+                            to_season_year=y + 1,
+                        )
+                        y += 1
+
         next_sid = _season_id_for_year(int(target_year))
         set_active_season_id(next_sid)
 
