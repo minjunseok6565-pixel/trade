@@ -158,17 +158,54 @@ def generate_player_profile(
 
 
 def build_college_teams() -> List[CollegeTeam]:
+    """Build the full list of college teams.
+
+    Uses configured seeds for the first N teams, and deterministically auto-generates
+    additional teams if COLLEGE_TEAM_COUNT > len(COLLEGE_TEAMS).
+    """
     teams: List[CollegeTeam] = []
-    for seed in config.COLLEGE_TEAMS:
+
+    seeds_by_id = {s.college_team_id: s for s in config.COLLEGE_TEAMS}
+    confs = list(getattr(config, "COLLEGE_CONFERENCES", None) or ["North", "South", "East", "West"])
+
+    for i in range(1, int(config.COLLEGE_TEAM_COUNT) + 1):
+        tid = f"COL_{i:03d}"
+        seed = seeds_by_id.get(tid)
+        if seed is not None:
+            name = seed.name
+            conf = seed.conference
+        else:
+            conf = confs[(i - 1) % len(confs)]
+            name = _auto_team_name(i, conf)
+
         teams.append(
             CollegeTeam(
-                college_team_id=seed.college_team_id,
-                name=seed.name,
-                conference=seed.conference,
+                college_team_id=tid,
+                name=str(name),
+                conference=str(conf),
                 meta={},
             )
         )
+
     return teams
+
+
+def _auto_team_name(i: int, conference: str) -> str:
+    """Deterministically generate additional fictional team names.
+
+    Avoid randomness at import time; output must be stable across runs.
+    """
+    prefixes = [
+        "Great", "Iron", "Pine", "Cedar", "Metro", "Summit", "Blue", "Stone", "Coastal", "Bayou",
+        "Sun", "Desert", "Gulf", "Magnolia", "River", "Capitol", "Atlantic", "Crown", "Palisade", "Pacific",
+        "Redstone", "Sierra", "Canyon", "Golden", "Frontier", "Highland", "Sequoia", "Prairie", "Lakeside", "Harbor",
+    ]
+    suffixes = ["State", "University", "College", "Tech", "A&M", "Institute", "Poly", "Academy"]
+
+    p = prefixes[(i - 1) % len(prefixes)]
+    s = suffixes[((i - 1) // len(prefixes)) % len(suffixes)]
+    # Add numeric tail to guarantee uniqueness at high team counts.
+    return f"{p} {conference} {s} {i:03d}"
 
 
 def generate_initial_world_players(
@@ -192,7 +229,7 @@ def generate_initial_world_players(
     tmp_id_counter = 0
 
     for college_team_id in team_ids:
-        for class_year, n in config.CLASS_YEAR_COUNTS_PER_TEAM.items():
+        for class_year, n in config.BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM.items():
             entry_season = int(season_year - (class_year - 1))
             cs = float(class_strength_for_entry_season(entry_season))
 
@@ -219,6 +256,52 @@ def generate_initial_world_players(
                 )
 
     return players
+
+
+def generate_players_for_team_class(
+    rng: random.Random,
+    *,
+    college_team_id: str,
+    class_year: int,
+    entry_season_year: int,
+    class_strength: float,
+    count: int,
+) -> List[CollegePlayer]:
+    """Generate players for a single team and a single class year.
+
+    This is primarily used by the deficit-fill offseason logic. The service layer
+    rewrites player_id using DB-allocated ids.
+    """
+    out: List[CollegePlayer] = []
+    n = int(count)
+    if n <= 0:
+        return out
+
+    cy = int(class_year)
+    esy = int(entry_season_year)
+
+    # Temporary ids only need to be unique within this batch.
+    for k in range(n):
+        prof = generate_player_profile(rng, class_strength=float(class_strength), class_year=cy)
+        tmp_pid = f"TMPF{esy}{cy}{k + 1:05d}"
+        out.append(
+            CollegePlayer(
+                player_id=tmp_pid,
+                name=prof.name,
+                pos=prof.pos,
+                age=prof.age,
+                height_in=prof.height_in,
+                weight_lb=prof.weight_lb,
+                ovr=prof.ovr,
+                college_team_id=str(college_team_id),
+                class_year=cy,
+                entry_season_year=esy,
+                status="ACTIVE",
+                attrs=prof.attrs,
+            )
+        )
+
+    return out
 
 
 def generate_freshmen_for_season(
