@@ -202,6 +202,9 @@ class LeagueRepo:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON;")
         self._conn.execute("PRAGMA journal_mode = WAL;")  # good safety for frequent writes
+        # Nested transaction support (SAVEPOINT) for callers that compose repo methods.
+        # (SQLite raises if BEGIN is issued while a transaction is already active.)
+        self._savepoint_seq = 0
 
     def close(self) -> None:
         try:
@@ -211,19 +214,45 @@ class LeagueRepo:
 
     @contextlib.contextmanager
     def transaction(self):
-        """Atomic transaction helper (safe even if executescript commits internally)."""
+        """
+        Atomic transaction helper.
+
+        Supports nesting via SAVEPOINT:
+        - outermost: BEGIN ... COMMIT/ROLLBACK
+        - nested: SAVEPOINT ... RELEASE (or ROLLBACK TO + RELEASE on error)
+        """
         cur = self._conn.cursor()
+        nested = bool(getattr(self._conn, "in_transaction", False))
+        sp_name = None
         try:
-            self._conn.execute("BEGIN;")
+            if nested:
+                self._savepoint_seq += 1
+                sp_name = f"sp_{self._savepoint_seq}"
+                cur.execute(f"SAVEPOINT {sp_name};")
+            else:
+                self._conn.execute("BEGIN;")
+
             yield cur
-            # conn.commit() is safe even if no transaction is active
-            self._conn.commit()
+
+            if nested and sp_name:
+                cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+            else:
+                self._conn.commit()
         except Exception:
-            # conn.rollback() is safe even if no transaction is active
-            self._conn.rollback()
+            if nested and sp_name:
+                # Roll back to the savepoint only; do NOT rollback the outer transaction here.
+                try:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                finally:
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+            else:
+                self._conn.rollback()
             raise
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     # ------------------------
     # Schema

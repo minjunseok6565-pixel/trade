@@ -9,11 +9,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable
 
-from . import core, trade_assets, gm, college
+from . import core, trade_assets, draft, gm, college
 from .registry import EnsureColumnsFn, apply_all
 
 
-DEFAULT_MODULES = (core, trade_assets, gm, college)
+DEFAULT_MODULES = (core, trade_assets, draft, gm, college)
 
 
 def apply_schema(
@@ -27,7 +27,7 @@ def apply_schema(
     """Apply the schema and migrations.
 
     The default module order matches the intended split:
-    core -> trade_assets -> gm
+    core -> trade_assets -> draft -> gm
     """
     apply_all(
         cur,
