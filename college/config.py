@@ -27,7 +27,7 @@ COLLEGE_TEAM_MINUTES_PER_GAME: int = 200  # 40 * 5
 #  - BOOTSTRAP: used only at game start to generate 1~4 class years
 #  - TARGET: used at offseason end (deficit-fill) as the desired roster shape
 #
-# NOTE: After switching to deficit-fill, freshmen per year is NOT a fixed number.
+# NOTE: Offseason roster policy (freshmen + top-up) is controlled by OFFSEASON_* below.
 BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = {
     1: 3,  # freshmen
     2: 4,  # soph
@@ -51,8 +51,22 @@ assert sum(TARGET_CLASS_YEAR_COUNTS_PER_TEAM.values()) == COLLEGE_ROSTER_SIZE, (
 # Backwards-compat alias used by older generation helpers.
 CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = dict(BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM)
 
-# Legacy / testing knob (no longer used by core offseason logic).
-FRESHMEN_PER_TEAM_PER_YEAR: int = int(TARGET_CLASS_YEAR_COUNTS_PER_TEAM.get(1, 0))
+# ----------------------------
+# Offseason roster policy
+# ----------------------------
+
+# Always add this many freshmen (class_year=1) each offseason per team.
+OFFSEASON_FRESHMEN_PER_TEAM: int = 4
+
+# After adding freshmen, if ACTIVE roster is still below this threshold,
+# top-up from 2nd/3rd year (priority: 2 > 3) to reach this minimum.
+OFFSEASON_MIN_ROSTER: int = 14
+
+# Hard cap after offseason actions (trim lowest OVR if exceeded).
+OFFSEASON_HARD_CAP: int = COLLEGE_ROSTER_SIZE
+
+# Legacy / testing knob (kept for backwards compatibility).
+FRESHMEN_PER_TEAM_PER_YEAR: int = OFFSEASON_FRESHMEN_PER_TEAM
 
 # Draft eligibility baseline
 MIN_DRAFT_ELIGIBLE_AGE: int = 19
