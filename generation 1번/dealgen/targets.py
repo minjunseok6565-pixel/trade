@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 import random
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..generation_tick import TradeGenerationTickContext
 from ..asset_catalog import TradeAssetCatalog, IncomingPlayerRef, TeamOutgoingCatalog
