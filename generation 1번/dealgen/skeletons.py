@@ -831,32 +831,6 @@ def expand_variants(
     return out
 
 
-def _top_k_youngish_players(
-    out: TeamOutgoingCatalog,
-    *,
-    config: DealGeneratorConfig,
-    k: int,
-    banned_players: Set[str],
-    receiver_team_id: Optional[str] = None,
-    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
-    must_be_aggregation_friendly: bool = True,
-) -> List[str]:
-    """(compat) young-ish top-k.
-
-    v2 parity의 prospect/throw-in split 로직을 재사용한다.
-    - prospect_ids + throwin_ids 를 순서대로 이어붙여 top-k 반환
-    """
-    prospect_ids, throwin_ids = _split_young_candidates(
-        out,
-        config=config,
-        banned_players=banned_players,
-        receiver_team_id=receiver_team_id,
-        banned_receivers_by_player=banned_receivers_by_player,
-        must_be_aggregation_friendly=must_be_aggregation_friendly,
-    )
-    merged = list(prospect_ids) + list(throwin_ids)
-    return merged[: int(k)]
-
 def _top_k_fillers_by_salary_gap(
     out: TeamOutgoingCatalog,
     *,
