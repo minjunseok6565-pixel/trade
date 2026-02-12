@@ -136,6 +136,11 @@ class DealGeneratorConfig:
     incoming_pool_per_tag: int = 60
     incoming_use_cheap_pool: bool = True
 
+    # --- target diversity / spam prevention (v2 absorption)
+    # 동일 타깃(같은 선수)이 결과 상단에 반복 노출되는 것을 억제하기 위한 soft penalty.
+    # v2는 core 단계에서 target_seen 카운트 기반으로 score를 감점한다.
+    target_repeat_penalty: float = 0.15
+
     # --- opponent diversity / spam prevention
     opponent_repeat_penalty: float = 0.25
     opponent_multi_repeat_penalty: float = 0.18
