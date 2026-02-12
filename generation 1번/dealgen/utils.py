@@ -157,6 +157,22 @@ def _clone_deal(deal: Deal) -> Deal:
         legs={tid: list(assets) for tid, assets in deal.legs.items()},
     )
 
+def _is_locked_candidate(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
+    """LockInfo precheck (SSOT).
+
+    - is_locked=True 이고 allow_locked_by_deal_id와 무관하면 잠김.
+    - allow_locked_by_deal_id가 lock.deal_id와 같으면(동일 딜 수정) 잠김으로 보지 않는다.
+    """
+    try:
+        if not bool(getattr(lock, "is_locked", False)):
+            return False
+        lock_deal = getattr(lock, "deal_id", None)
+        if allow_locked_by_deal_id and lock_deal and str(lock_deal) == str(allow_locked_by_deal_id):
+            return False
+        return True
+    except Exception:
+        return False
+
 
 def _shape_ok(deal: Deal, *, config: DealGeneratorConfig, catalog: Optional[TradeAssetCatalog] = None) -> bool:
     for assets in deal.legs.values():
