@@ -19,7 +19,7 @@ from .dedupe import dedupe_hash
 from .targets import select_targets_buy, select_targets_sell, select_buyers_for_sale_asset
 from .skeletons import build_offer_skeletons_buy, build_offer_skeletons_sell, expand_variants
 from .repair import repair_until_valid
-from .scoring import evaluate_and_score, _proposal_from_cached_eval
+from .scoring import evaluate_and_score, _proposal_from_cached_eval, _should_discard_prop
 from .sweetener import maybe_apply_sweeteners
 
 # =============================================================================
@@ -997,43 +997,6 @@ def _push_best(existing: List[DealProposal], prop: DealProposal, *, max_results:
     existing.append(prop)
     existing.sort(key=lambda p: p.score, reverse=True)
     return existing[: max_results]
-
-
-def _should_discard_prop(prop: DealProposal, cfg: DealGeneratorConfig) -> bool:
-    """상위 후보로 올릴 가치가 거의 없는 오퍼를 early discard.
-
-    목표
-    - 유저가 보기에 "NBA스럽지 않은"(한쪽이 극단적으로 손해) 오퍼가 상위에 뜨는 것을 방지
-    - sweetener loop 이전에도 과감히 거른다(비용/노이즈 감소)
-
-    주의
-    - 이 함수는 '완전 불가능'을 판단하지 않는다(그건 validate).
-    - 여기서는 '게임 경험' 기준으로 너무 엉터리인 오퍼를 제거한다.
-    """
-
-    mb = float(prop.buyer_eval.net_surplus) - float(prop.buyer_decision.required_surplus)
-    ms = float(prop.seller_eval.net_surplus) - float(prop.seller_decision.required_surplus)
-
-    # buyer는 게임상 '내 팀'일 가능성이 높으므로 더 강하게 보호
-    if mb < float(cfg.discard_if_overpay_below):
-        return True
-
-    # 어느 한쪽이 극단적으로 손해면 폐기(상대에게도 NBA스럽지 않음)
-    if mb < float(getattr(cfg, "discard_if_any_margin_below", -22.0)) or ms < float(getattr(cfg, "discard_if_any_margin_below", -22.0)):
-        return True
-
-    # REJECT인데 deficit이 큰 경우는 거의 의미 없음(스윗너 1~2개로도 복구 어려움)
-    rej_thr = float(getattr(cfg, "discard_if_reject_margin_below", -14.0))
-    if prop.buyer_decision.verdict == DealVerdict.REJECT and mb < rej_thr:
-        return True
-    if prop.seller_decision.verdict == DealVerdict.REJECT and ms < rej_thr:
-        return True
-
-    # 양쪽 모두 별로면 폐기
-    if mb < float(cfg.discard_if_both_margins_below) and ms < float(cfg.discard_if_both_margins_below):
-        return True
-
-    return False
 
 
 def _incoming_player_count(deal: Deal, team_id: str) -> int:
