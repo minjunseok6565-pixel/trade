@@ -1,62 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date
-from enum import Enum
-import hashlib
-import json
-import math
 import random
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from ...errors import (
-    TradeError,
-    DEAL_INVALIDATED,
-    ROSTER_LIMIT,
-    ASSET_LOCKED,
-    PLAYER_NOT_OWNED,
-    PICK_NOT_OWNED,
-    SWAP_NOT_OWNED,
-    TRADE_DEADLINE_PASSED,
-    DUPLICATE_ASSET,
-)
-from ...models import (
-    Deal,
-    PlayerAsset,
-    PickAsset,
-    SwapAsset,
-    Asset,
-    asset_key,
-    canonicalize_deal,
-    serialize_deal,
-    resolve_asset_receiver,
-)
-from ...valuation.service import evaluate_deal_for_team
-from ...valuation.types import DealDecision, DealVerdict, TeamDealEvaluation
+from ...models import Deal, PlayerAsset
 
 from ..generation_tick import TradeGenerationTickContext
-from ..asset_catalog import (
-    TradeAssetCatalog,
-    IncomingPlayerRef,
-    TeamOutgoingCatalog,
-    PlayerTradeCandidate,
-    PickTradeCandidate,
-    SwapTradeCandidate,
-    PickBucketId,
-    BucketId,
-    build_trade_asset_catalog,
-)
+from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, BucketId
 
-from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, TargetCandidate, DealCandidate, SellAssetCandidate
+from .types import DealGeneratorConfig, DealGeneratorBudget, TargetCandidate, DealCandidate, SellAssetCandidate
 from .utils import (
     _add_pick_package,
     _best_need_tag,
     _can_absorb_without_outgoing,
     _clone_deal,
     _get_need_map,
-    _pick_bucket_player,
     _pick_bucket_player_for_need,
-    _pick_filler_player_for_salary,
     _pick_from_id_pool_for_need,
     _pick_return_player_salaryish_with_need,
     _split_young_candidates,
