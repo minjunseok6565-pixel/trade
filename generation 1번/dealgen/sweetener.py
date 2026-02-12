@@ -56,6 +56,42 @@ from .scoring import evaluate_and_score, _should_discard_prop
 # =============================================================================
 
 
+def _sweetener_close_corridor(team_eval: TeamDealEvaluation, cfg: DealGeneratorConfig) -> float:
+    """Sweetener attempt window scaled by deal size (v2 absorption).
+
+    v2 공식:
+      scale = max(team_eval.outgoing_total, 6.0)
+      close = min(cap, max(floor, ratio * scale))
+      eligible if margin >= -close
+
+    v1 호환:
+      - 기존 sweetener_max_deficit는 '최종 상한'으로 존중한다.
+      - 새 노브가 없거나 0이면 legacy(=sweetener_max_deficit)로 동작.
+    """
+    base_max = float(getattr(cfg, "sweetener_max_deficit", 0.0) or 0.0)
+
+    ratio = float(getattr(cfg, "sweetener_close_corridor_ratio", 0.0) or 0.0)
+    floor = float(getattr(cfg, "sweetener_close_floor", 0.0) or 0.0)
+    cap = float(getattr(cfg, "sweetener_close_cap", 0.0) or 0.0)
+
+    # If scaling knobs are disabled/missing, fallback to legacy behavior.
+    if ratio <= 0.0 and cap <= 0.0 and floor <= 0.0:
+        return base_max if base_max > 0.0 else 0.0
+
+    scale = float(getattr(team_eval, "outgoing_total", 0.0) or 0.0)
+    scale = max(scale, 6.0)
+
+    close = max(floor, ratio * scale)
+    if cap > 0.0:
+        close = min(cap, close)
+
+    # Keep legacy hard cap as a safety bound (if set).
+    if base_max > 0.0:
+        close = min(base_max, close)
+
+    return float(close)
+
+
 def maybe_apply_sweeteners(
     base: DealProposal,
     *,
@@ -103,9 +139,13 @@ def maybe_apply_sweeteners(
     receiver: Optional[str] = None
     deficit = 0.0
 
-    if base.seller_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and ms < 0.0 and abs(ms) <= float(config.sweetener_max_deficit):
+    # v2-style "close corridor": scale by the *receiver* side outgoing_total
+    close_seller = _sweetener_close_corridor(base.seller_eval, config)
+    close_buyer = _sweetener_close_corridor(base.buyer_eval, config)
+
+    if base.seller_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and ms < 0.0 and abs(ms) <= float(close_seller):
         giver, receiver, deficit = base.buyer_id, base.seller_id, abs(ms)
-    elif base.buyer_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and mb < 0.0 and abs(mb) <= float(config.sweetener_max_deficit):
+    elif base.buyer_decision.verdict in (DealVerdict.REJECT, DealVerdict.COUNTER) and mb < 0.0 and abs(mb) <= float(close_buyer):
         giver, receiver, deficit = base.seller_id, base.buyer_id, abs(mb)
     else:
         return base, 0, 0
