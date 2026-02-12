@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from ...errors import TradeError
 from ...models import Deal, PickAsset, SwapAsset, Asset, asset_key, canonicalize_deal
