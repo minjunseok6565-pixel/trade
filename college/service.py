@@ -9,7 +9,7 @@ from league_repo import LeagueRepo
 
 from . import config
 from .declarations import declare_probability
-from .generation import build_college_teams, generate_freshmen_for_season, generate_initial_world_players, sample_class_strength
+from .generation import build_college_teams, generate_initial_world_players, generate_players_for_team_class, sample_class_strength
 from .sim import simulate_college_season
 from .types import (
     CollegePlayer,
@@ -216,52 +216,59 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
       state.startup_init_state() after NBA season/year is established.
 
     Idempotent: safe to call multiple times.
+
+    Upgrade-safe:
+      - If COLLEGE_TEAM_COUNT increases, missing teams will be inserted.
+      - If some teams exist but have no players (e.g., newly inserted teams),
+        bootstrap players will be created only for those teams.
     """
     sy = int(season_year)
     with LeagueRepo(db_path) as repo:
         repo.init_db()
 
-        # If already bootstrapped for this season year, skip.
         marker_key = "college_bootstrap_season_year"
         marker = _get_meta(repo, marker_key)
-        if marker == str(sy):
-            return
 
-        # Ensure teams
-        existing_team_count = repo._conn.execute("SELECT COUNT(*) FROM college_teams;").fetchone()[0]
-        if int(existing_team_count) <= 0:
-            teams = build_college_teams()
-            with repo.transaction() as cur:
-                for t in teams:
-                    cur.execute(
-                        "INSERT INTO college_teams(college_team_id, name, conference, meta_json) VALUES (?, ?, ?, ?);",
-                        (t.college_team_id, t.name, t.conference, json_dumps(t.meta)),
-                    )
+        # Ensure teams (insert missing). Do NOT gate this on marker/meta so that
+        # increasing COLLEGE_TEAM_COUNT is naturally supported.
+        seed_teams = build_college_teams()
+        with repo.transaction() as cur:
+            for t in seed_teams:
+                cur.execute(
+                    "INSERT OR IGNORE INTO college_teams(college_team_id, name, conference, meta_json) VALUES (?, ?, ?, ?);",
+                    (t.college_team_id, t.name, t.conference, json_dumps(t.meta)),
+                )
 
         # Load teams (ordered)
-        team_rows = repo._conn.execute(
-            "SELECT college_team_id, name, conference, meta_json FROM college_teams ORDER BY college_team_id ASC;"
-        ).fetchall()
-        teams: List[CollegeTeam] = []
-        for r in team_rows:
-            teams.append(
-                CollegeTeam(
-                    college_team_id=str(r[0]),
-                    name=str(r[1]),
-                    conference=str(r[2]),
-                    meta=json_loads(str(r[3])) or {},
-                )
-            )
+        teams = _load_teams(repo)
+        if not teams:
+            # Defensive: schema exists but teams are missing for some reason.
+            return
+
+        # Fast skip: if marker matches AND every team has at least one player.
+        if marker == str(sy):
+            missing = repo._conn.execute(
+                """
+                SELECT t.college_team_id
+                FROM college_teams t
+                LEFT JOIN (SELECT DISTINCT college_team_id FROM college_players) p
+                  ON p.college_team_id = t.college_team_id
+                WHERE p.college_team_id IS NULL
+                LIMIT 1;
+                """
+            ).fetchone()
+            if missing is None:
+                return
+
+        # Strength provider: use draft_year = entry_season_year + 1 as the cohort's "expected draft year"
+        def strength_for_entry(entry_season_year: int) -> float:
+            dy = int(entry_season_year) + 1
+            return get_or_create_class_strength(repo, draft_year=dy, seed_salt=f"bootstrap@{sy}")
 
         # Ensure initial players
         existing_player_count = repo._conn.execute("SELECT COUNT(*) FROM college_players;").fetchone()[0]
         created_players = False
         if int(existing_player_count) <= 0:
-            # Strength provider: use draft_year = entry_season_year + 1 as the cohort's "expected draft year"
-            def strength_for_entry(entry_season_year: int) -> float:
-                dy = int(entry_season_year) + 1
-                return get_or_create_class_strength(repo, draft_year=dy, seed_salt=f"bootstrap@{sy}")
-
             rng = random.Random(_stable_seed("college_bootstrap_players", sy))
             tmp_players = generate_initial_world_players(
                 rng,
@@ -270,7 +277,6 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
                 class_strength_for_entry_season=strength_for_entry,
             )
 
-            # Allocate IDs + insert + bootstrap marker in ONE transaction.
             with repo.transaction() as cur:
                 new_ids = allocate_player_ids(repo, count=len(tmp_players), cur=cur)
                 for pid, p in zip(new_ids, tmp_players):
@@ -300,6 +306,68 @@ def ensure_world_bootstrapped(db_path: str, season_year: int) -> None:
 
                 _set_meta(repo, marker_key, str(sy), cur=cur)
                 created_players = True
+
+        else:
+            # Only bootstrap players for teams that currently have none.
+            rows = repo._conn.execute(
+                """
+                SELECT t.college_team_id
+                FROM college_teams t
+                LEFT JOIN (SELECT DISTINCT college_team_id FROM college_players) p
+                  ON p.college_team_id = t.college_team_id
+                WHERE p.college_team_id IS NULL
+                ORDER BY t.college_team_id ASC;
+                """
+            ).fetchall()
+            missing_team_ids = [str(r[0]) for r in rows]
+
+            if missing_team_ids:
+                team_by_id = {t.college_team_id: t for t in teams}
+                tmp_players = []
+                for tid in missing_team_ids:
+                    t = team_by_id.get(tid)
+                    if t is None:
+                        continue
+                    rng = random.Random(_stable_seed("college_bootstrap_players", sy, tid))
+                    tmp_players.extend(
+                        generate_initial_world_players(
+                            rng,
+                            season_year=sy,
+                            teams=[t],
+                            class_strength_for_entry_season=strength_for_entry,
+                        )
+                    )
+
+                if tmp_players:
+                    with repo.transaction() as cur:
+                        new_ids = allocate_player_ids(repo, count=len(tmp_players), cur=cur)
+                        for pid, p in zip(new_ids, tmp_players):
+                            cur.execute(
+                                """
+                                INSERT INTO college_players(
+                                    player_id, college_team_id, class_year, entry_season_year, status,
+                                    name, pos, age, height_in, weight_lb, ovr, attrs_json
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                """,
+                                (
+                                    pid,
+                                    p.college_team_id,
+                                    int(p.class_year),
+                                    int(p.entry_season_year),
+                                    str(p.status),
+                                    p.name,
+                                    p.pos,
+                                    int(p.age),
+                                    int(p.height_in),
+                                    int(p.weight_lb),
+                                    int(p.ovr),
+                                    json_dumps(p.attrs),
+                                ),
+                            )
+
+                        _set_meta(repo, marker_key, str(sy), cur=cur)
+                        created_players = True
         # If players already existed but marker was missing/outdated, set it now.
         if not created_players:
             _set_meta(repo, marker_key, str(sy))
@@ -501,10 +569,13 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
 def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) -> None:
     """
     Advance college world from from_season_year -> to_season_year:
+    - Reset DECLARED -> ACTIVE (undrafted return-to-school model; can be expanded later)
     - Increment class_year (+ age)
     - Graduate/remove players beyond 4
-    - Reset DECLARED -> ACTIVE (undrafted return-to-school model; can be expanded later)
-    - Generate freshmen for to_season_year and insert
+    - Deficit-fill to reach COLLEGE_ROSTER_SIZE using TARGET_CLASS_YEAR_COUNTS_PER_TEAM
+
+    Idempotent safety:
+      - Guard against double-running the same to_season_year.
     """
     fy = int(from_season_year)
     ty = int(to_season_year)
@@ -515,57 +586,161 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
     with LeagueRepo(db_path) as repo:
         repo.init_db()
 
-        # Reset DECLARED -> ACTIVE (they returned if not drafted)
+        meta_key = f"college_advanced_to_{ty}"
+        if _get_meta(repo, meta_key) == "1":
+            return
+
+        # Load teams (ordered)
+        teams = _load_teams(repo)
+        team_ids = [t.college_team_id for t in teams]
+
+        roster_size = int(config.COLLEGE_ROSTER_SIZE)
+        target_dist = dict(getattr(config, "TARGET_CLASS_YEAR_COUNTS_PER_TEAM", {}) or {})
+
+        if sum(int(v) for v in target_dist.values()) != roster_size:
+            raise ValueError("TARGET_CLASS_YEAR_COUNTS_PER_TEAM must sum to COLLEGE_ROSTER_SIZE")
+
         with repo.transaction() as cur:
+            # (1) Reset DECLARED -> ACTIVE (they returned if not drafted)
             cur.execute("UPDATE college_players SET status='ACTIVE' WHERE status='DECLARED';")
 
-        # Graduate (class_year>=4) after increment step:
-        # First increment class_year for all ACTIVE
-        with repo.transaction() as cur:
-            cur.execute(
-                "UPDATE college_players SET class_year = class_year + 1, age = age + 1 WHERE status='ACTIVE';"
-            )
+            # (2) Grade bump: increment class_year/age for all ACTIVE
+            cur.execute("UPDATE college_players SET class_year = class_year + 1, age = age + 1 WHERE status='ACTIVE';")
 
-        # Remove those now beyond 4 (graduated)
-        with repo.transaction() as cur:
+            # (3) Graduate: remove those now beyond 4
             cur.execute("DELETE FROM college_players WHERE status='ACTIVE' AND class_year > 4;")
 
-        # Load teams
-        teams = _load_teams(repo)
-
-        # Create freshmen cohort (strength tied to expected draft_year = entry_season + 1)
-        dy = ty + 1
-        strength = get_or_create_class_strength(repo, draft_year=dy, seed_salt=f"freshmen@{ty}")
-        rng = random.Random(_stable_seed("freshmen_gen", ty))
-        tmp_fresh = generate_freshmen_for_season(rng, entry_season_year=ty, teams=teams, class_strength=float(strength))
-
-        # Allocate IDs + insert in ONE transaction (keeps seq_player_id and rows consistent)
-        with repo.transaction() as cur:
-            new_ids = allocate_player_ids(repo, count=len(tmp_fresh), cur=cur)
-            for pid, p in zip(new_ids, tmp_fresh):
-                cur.execute(
+            # (4) Safety trim: if any team is over roster_size, trim lowest OVR first.
+            for tid in team_ids:
+                row = repo._conn.execute(
+                    "SELECT COUNT(*) FROM college_players WHERE status='ACTIVE' AND college_team_id=?;",
+                    (tid,),
+                ).fetchone()
+                total = int(row[0] or 0)
+                if total <= roster_size:
+                    continue
+                excess = int(total - roster_size)
+                pid_rows = repo._conn.execute(
                     """
-                    INSERT INTO college_players(
-                        player_id, college_team_id, class_year, entry_season_year, status,
-                        name, pos, age, height_in, weight_lb, ovr, attrs_json
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    SELECT player_id
+                    FROM college_players
+                    WHERE status='ACTIVE' AND college_team_id=?
+                    ORDER BY ovr ASC, player_id ASC
+                    LIMIT ?;
                     """,
-                    (
-                        pid,
-                        p.college_team_id,
-                        1,
-                        int(ty),
-                        "ACTIVE",
-                        p.name,
-                        p.pos,
-                        int(p.age),
-                        int(p.height_in),
-                        int(p.weight_lb),
-                        int(p.ovr),
-                        json_dumps(p.attrs),
-                    ),
-                )
+                    (tid, excess),
+                ).fetchall()
+                pids = [str(r[0]) for r in pid_rows]
+                for pid in pids:
+                    cur.execute("DELETE FROM college_player_season_stats WHERE player_id=?;", (pid,))
+                    cur.execute("DELETE FROM college_players WHERE player_id=?;", (pid,))
+
+            # (5) Aggregate current counts by team/class
+            rows = repo._conn.execute(
+                """
+                SELECT college_team_id, class_year, COUNT(*) AS cnt
+                FROM college_players
+                WHERE status='ACTIVE'
+                GROUP BY college_team_id, class_year;
+                """
+            ).fetchall()
+
+            counts: Dict[str, Dict[int, int]] = {tid: {1: 0, 2: 0, 3: 0, 4: 0} for tid in team_ids}
+            for team_id, class_year, cnt in rows:
+                tid = str(team_id)
+                cy = int(class_year)
+                if tid not in counts:
+                    counts[tid] = {1: 0, 2: 0, 3: 0, 4: 0}
+                if cy in (1, 2, 3, 4):
+                    counts[tid][cy] = int(cnt)
+
+            # (6) Compute deficit-fill plan toward target distribution (adds only)
+            plan: Dict[str, Dict[int, int]] = {}
+            for tid in team_ids:
+                cur_counts = counts.get(tid) or {1: 0, 2: 0, 3: 0, 4: 0}
+                total = int(sum(int(v) for v in cur_counts.values()))
+                slots = int(roster_size - total)
+                if slots <= 0:
+                    continue
+
+                need = {cy: max(0, int(target_dist.get(cy, 0)) - int(cur_counts.get(cy, 0))) for cy in (1, 2, 3, 4)}
+                p = {1: 0, 2: 0, 3: 0, 4: 0}
+                remaining = int(slots)
+
+                # Fill the biggest deficits first; ties prefer lower class year.
+                for cy, nneed in sorted(need.items(), key=lambda kv: (-kv[1], kv[0])):
+                    if remaining <= 0:
+                        break
+                    take = int(min(int(nneed), remaining))
+                    if take > 0:
+                        p[cy] += take
+                        remaining -= take
+
+                # If roster is below cap but already over target in all classes (rare), fill with 1st-years.
+                if remaining > 0:
+                    p[1] += int(remaining)
+
+                plan[tid] = p
+
+            # (7) Generate deficit-fill players (may include transfers/upperclassmen)
+            tmp_new: List[CollegePlayer] = []
+            strength_cache: Dict[int, float] = {}
+
+            for tid, by_class in plan.items():
+                for cy in (1, 2, 3, 4):
+                    n_new = int(by_class.get(cy, 0) or 0)
+                    if n_new <= 0:
+                        continue
+
+                    entry_season_year = int(ty - (cy - 1))
+                    draft_year = int(entry_season_year) + 1
+
+                    if draft_year not in strength_cache:
+                        strength_cache[draft_year] = float(
+                            get_or_create_class_strength(repo, draft_year=draft_year, seed_salt=f"fill@{ty}", cur=cur)
+                        )
+
+                    rng = random.Random(_stable_seed("college_deficit_fill", ty, tid, cy))
+                    tmp_new.extend(
+                        generate_players_for_team_class(
+                            rng,
+                            college_team_id=tid,
+                            class_year=cy,
+                            entry_season_year=entry_season_year,
+                            class_strength=float(strength_cache[draft_year]),
+                            count=n_new,
+                        )
+                    )
+
+            # (8) Insert new players (single id allocation for collision safety)
+            if tmp_new:
+                new_ids = allocate_player_ids(repo, count=len(tmp_new), cur=cur)
+                for pid, p in zip(new_ids, tmp_new):
+                    cur.execute(
+                        """
+                        INSERT INTO college_players(
+                            player_id, college_team_id, class_year, entry_season_year, status,
+                            name, pos, age, height_in, weight_lb, ovr, attrs_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            pid,
+                            p.college_team_id,
+                            int(p.class_year),
+                            int(p.entry_season_year),
+                            "ACTIVE",
+                            p.name,
+                            p.pos,
+                            int(p.age),
+                            int(p.height_in),
+                            int(p.weight_lb),
+                            int(p.ovr),
+                            json_dumps(p.attrs),
+                        ),
+                    )
+
+            _set_meta(repo, meta_key, "1", cur=cur)
 
 
 # ----------------------------

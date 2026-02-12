@@ -14,24 +14,45 @@ from typing import Dict, List, Tuple
 # League shape
 # ----------------------------
 
-COLLEGE_TEAM_COUNT: int = 32
-COLLEGE_ROSTER_SIZE: int = 12  # per team (scholarship-like)
+COLLEGE_TEAM_COUNT: int = 200
+COLLEGE_ROSTER_SIZE: int = 15  # per team (scholarship-like)
 COLLEGE_SEASON_GAMES_PER_TEAM: int = 34
 
 # Team minutes per game in a 40-min NCAA-style game.
 COLLEGE_TEAM_MINUTES_PER_GAME: int = 200  # 40 * 5
 
 # Freshmen generated each offseason per team.
-# For initial bootstrap, we generate 1~4 class years using this distribution.
-CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = {
+#
+# We keep two distributions:
+#  - BOOTSTRAP: used only at game start to generate 1~4 class years
+#  - TARGET: used at offseason end (deficit-fill) as the desired roster shape
+#
+# NOTE: After switching to deficit-fill, freshmen per year is NOT a fixed number.
+BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = {
     1: 3,  # freshmen
-    2: 3,  # soph
-    3: 3,  # junior
-    4: 3,  # senior
+    2: 4,  # soph
+    3: 4,  # junior
+    4: 4,  # senior
 }
-assert sum(CLASS_YEAR_COUNTS_PER_TEAM.values()) == COLLEGE_ROSTER_SIZE, "class-year distribution must match roster size"
+assert sum(BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM.values()) == COLLEGE_ROSTER_SIZE, (
+    "bootstrap class-year distribution must match roster size"
+)
 
-FRESHMEN_PER_TEAM_PER_YEAR: int = CLASS_YEAR_COUNTS_PER_TEAM[1]
+TARGET_CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = {
+    1: 3,
+    2: 4,
+    3: 4,
+    4: 4,
+}
+assert sum(TARGET_CLASS_YEAR_COUNTS_PER_TEAM.values()) == COLLEGE_ROSTER_SIZE, (
+    "target class-year distribution must match roster size"
+)
+
+# Backwards-compat alias used by older generation helpers.
+CLASS_YEAR_COUNTS_PER_TEAM: Dict[int, int] = dict(BOOTSTRAP_CLASS_YEAR_COUNTS_PER_TEAM)
+
+# Legacy / testing knob (no longer used by core offseason logic).
+FRESHMEN_PER_TEAM_PER_YEAR: int = int(TARGET_CLASS_YEAR_COUNTS_PER_TEAM.get(1, 0))
 
 # Draft eligibility baseline
 MIN_DRAFT_ELIGIBLE_AGE: int = 19
@@ -96,6 +117,13 @@ FT_PCT_STD: float = 0.06
 # Fictional team list (avoid licensing issues)
 # ----------------------------
 
+COLLEGE_CONFERENCES: List[str] = [
+    "North",
+    "South",
+    "East",
+    "West",
+]
+
 @dataclass(frozen=True, slots=True)
 class CollegeTeamSeed:
     college_team_id: str
@@ -142,4 +170,4 @@ COLLEGE_TEAMS: List[CollegeTeamSeed] = [
     CollegeTeamSeed("COL_031", "Highland Poly", "West"),
     CollegeTeamSeed("COL_032", "Sequoia University", "West"),
 ]
-assert len(COLLEGE_TEAMS) == COLLEGE_TEAM_COUNT, "COLLEGE_TEAMS length must match COLLEGE_TEAM_COUNT"
+assert len(COLLEGE_TEAMS) <= COLLEGE_TEAM_COUNT, "COLLEGE_TEAMS must not exceed COLLEGE_TEAM_COUNT"
