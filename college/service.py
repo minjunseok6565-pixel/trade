@@ -572,7 +572,9 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
     - Reset DECLARED -> ACTIVE (undrafted return-to-school model; can be expanded later)
     - Increment class_year (+ age)
     - Graduate/remove players beyond 4
-    - Deficit-fill to reach COLLEGE_ROSTER_SIZE using TARGET_CLASS_YEAR_COUNTS_PER_TEAM
+    - Always add a fixed number of freshmen per team
+    - After freshmen, if roster is still below a minimum threshold, top-up from 2nd/3rd year
+    - Enforce a hard cap via trim (lowest OVR first)
 
     Idempotent safety:
       - Guard against double-running the same to_season_year.
@@ -594,32 +596,47 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
         teams = _load_teams(repo)
         team_ids = [t.college_team_id for t in teams]
 
-        roster_size = int(config.COLLEGE_ROSTER_SIZE)
-        target_dist = dict(getattr(config, "TARGET_CLASS_YEAR_COUNTS_PER_TEAM", {}) or {})
+        roster_cap = int(config.COLLEGE_ROSTER_SIZE)
+        hard_cap = int(getattr(config, "OFFSEASON_HARD_CAP", roster_cap))
+        freshmen_per_team = int(getattr(config, "OFFSEASON_FRESHMEN_PER_TEAM", 4))
+        min_roster = int(getattr(config, "OFFSEASON_MIN_ROSTER", 14))
 
-        if sum(int(v) for v in target_dist.values()) != roster_size:
-            raise ValueError("TARGET_CLASS_YEAR_COUNTS_PER_TEAM must sum to COLLEGE_ROSTER_SIZE")
+        if min_roster < 0:
+            raise ValueError("OFFSEASON_MIN_ROSTER must be >= 0")
+        if hard_cap <= 0:
+            raise ValueError("OFFSEASON_HARD_CAP must be > 0")
+        if min_roster > hard_cap:
+            raise ValueError("OFFSEASON_MIN_ROSTER must be <= OFFSEASON_HARD_CAP")
+        if freshmen_per_team < 0:
+            raise ValueError("OFFSEASON_FRESHMEN_PER_TEAM must be >= 0")
 
         with repo.transaction() as cur:
             # (1) Reset DECLARED -> ACTIVE (they returned if not drafted)
             cur.execute("UPDATE college_players SET status='ACTIVE' WHERE status='DECLARED';")
 
-            # (2) Grade bump: increment class_year/age for all ACTIVE
-            cur.execute("UPDATE college_players SET class_year = class_year + 1, age = age + 1 WHERE status='ACTIVE';")
+            # (2) Progress class year + age for ACTIVE
+            cur.execute(
+                """
+                UPDATE college_players
+                SET class_year = class_year + 1,
+                    age = age + 1
+                WHERE status='ACTIVE';
+                """
+            )
 
             # (3) Graduate: remove those now beyond 4
             cur.execute("DELETE FROM college_players WHERE status='ACTIVE' AND class_year > 4;")
 
-            # (4) Safety trim: if any team is over roster_size, trim lowest OVR first.
+            # (4) Safety trim (pre-add): if any team is over hard_cap, trim lowest OVR first.
             for tid in team_ids:
                 row = repo._conn.execute(
                     "SELECT COUNT(*) FROM college_players WHERE status='ACTIVE' AND college_team_id=?;",
                     (tid,),
                 ).fetchone()
                 total = int(row[0] or 0)
-                if total <= roster_size:
+                if total <= hard_cap:
                     continue
-                excess = int(total - roster_size)
+                excess = int(total - hard_cap)
                 pid_rows = repo._conn.execute(
                     """
                     SELECT player_id
@@ -635,84 +652,95 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
                     cur.execute("DELETE FROM college_player_season_stats WHERE player_id=?;", (pid,))
                     cur.execute("DELETE FROM college_players WHERE player_id=?;", (pid,))
 
-            # (5) Aggregate current counts by team/class
+            # (5) Aggregate current ACTIVE totals by team (after bump+graduation+pre-trim)
             rows = repo._conn.execute(
                 """
-                SELECT college_team_id, class_year, COUNT(*) AS cnt
+                SELECT college_team_id, COUNT(*) AS cnt
                 FROM college_players
                 WHERE status='ACTIVE'
-                GROUP BY college_team_id, class_year;
+                GROUP BY college_team_id;
                 """
             ).fetchall()
 
-            counts: Dict[str, Dict[int, int]] = {tid: {1: 0, 2: 0, 3: 0, 4: 0} for tid in team_ids}
-            for team_id, class_year, cnt in rows:
-                tid = str(team_id)
-                cy = int(class_year)
-                if tid not in counts:
-                    counts[tid] = {1: 0, 2: 0, 3: 0, 4: 0}
-                if cy in (1, 2, 3, 4):
-                    counts[tid][cy] = int(cnt)
+            total_by_team: Dict[str, int] = {tid: 0 for tid in team_ids}
+            for team_id, cnt in rows:
+                total_by_team[str(team_id)] = int(cnt)
 
-            # (6) Compute deficit-fill plan toward target distribution (adds only)
-            plan: Dict[str, Dict[int, int]] = {}
-            for tid in team_ids:
-                cur_counts = counts.get(tid) or {1: 0, 2: 0, 3: 0, 4: 0}
-                total = int(sum(int(v) for v in cur_counts.values()))
-                slots = int(roster_size - total)
-                if slots <= 0:
-                    continue
-
-                need = {cy: max(0, int(target_dist.get(cy, 0)) - int(cur_counts.get(cy, 0))) for cy in (1, 2, 3, 4)}
-                p = {1: 0, 2: 0, 3: 0, 4: 0}
-                remaining = int(slots)
-
-                # Fill the biggest deficits first; ties prefer lower class year.
-                for cy, nneed in sorted(need.items(), key=lambda kv: (-kv[1], kv[0])):
-                    if remaining <= 0:
-                        break
-                    take = int(min(int(nneed), remaining))
-                    if take > 0:
-                        p[cy] += take
-                        remaining -= take
-
-                # If roster is below cap but already over target in all classes (rare), fill with 1st-years.
-                if remaining > 0:
-                    p[1] += int(remaining)
-
-                plan[tid] = p
-
-            # (7) Generate deficit-fill players (may include transfers/upperclassmen)
-            tmp_new: List[CollegePlayer] = []
+            # class_strength cache by expected draft_year (= entry_season_year + 1)
             strength_cache: Dict[int, float] = {}
 
-            for tid, by_class in plan.items():
-                for cy in (1, 2, 3, 4):
-                    n_new = int(by_class.get(cy, 0) or 0)
-                    if n_new <= 0:
-                        continue
+            def _strength_for_entry(entry_season_year: int, *, seed_tag: str) -> float:
+                dy = int(entry_season_year) + 1
+                v = strength_cache.get(dy)
+                if v is None:
+                    v = float(get_or_create_class_strength(repo, draft_year=dy, seed_salt=f"{seed_tag}@{ty}", cur=cur))
+                    strength_cache[dy] = v
+                return float(v)
 
-                    entry_season_year = int(ty - (cy - 1))
-                    draft_year = int(entry_season_year) + 1
+            # (6) Build offseason additions:
+            #  - Always add freshmen_per_team of class_year=1 (entry=ty)
+            #  - After freshmen, if total < min_roster, top-up from class_year=2 then 3:
+            #       d = min_roster - (total + freshmen_per_team)
+            #       add3 = d // 2
+            #       add2 = d - add3
+            tmp_new: List[CollegePlayer] = []
 
-                    if draft_year not in strength_cache:
-                        strength_cache[draft_year] = float(
-                            get_or_create_class_strength(repo, draft_year=draft_year, seed_salt=f"fill@{ty}", cur=cur)
-                        )
+            for tid in team_ids:
+                pre_total = int(total_by_team.get(tid, 0))
 
-                    rng = random.Random(_stable_seed("college_deficit_fill", ty, tid, cy))
+                # 6-A) Freshmen (always)
+                if freshmen_per_team > 0:
+                    rng_f = random.Random(_stable_seed("college_offseason_freshmen", ty, tid))
+                    cs_f = _strength_for_entry(ty, seed_tag="freshmen")
                     tmp_new.extend(
                         generate_players_for_team_class(
-                            rng,
+                            rng_f,
                             college_team_id=tid,
-                            class_year=cy,
-                            entry_season_year=entry_season_year,
-                            class_strength=float(strength_cache[draft_year]),
-                            count=n_new,
+                            class_year=1,
+                            entry_season_year=ty,
+                            class_strength=cs_f,
+                            count=freshmen_per_team,
                         )
                     )
 
-            # (8) Insert new players (single id allocation for collision safety)
+                # 6-B) Top-up if still below min_roster after freshmen
+                post_fresh_total = pre_total + int(freshmen_per_team)
+                if post_fresh_total < min_roster:
+                    d = int(min_roster - post_fresh_total)
+                    add3 = int(d // 2)
+                    add2 = int(d - add3)
+
+                    # Sophomores first (entry=ty-1)
+                    if add2 > 0:
+                        rng_2 = random.Random(_stable_seed("college_offseason_topup", ty, tid, 2))
+                        cs_2 = _strength_for_entry(ty - 1, seed_tag="topup2")
+                        tmp_new.extend(
+                            generate_players_for_team_class(
+                                rng_2,
+                                college_team_id=tid,
+                                class_year=2,
+                                entry_season_year=ty - 1,
+                                class_strength=cs_2,
+                                count=add2,
+                            )
+                        )
+
+                    # Then juniors (entry=ty-2)
+                    if add3 > 0:
+                        rng_3 = random.Random(_stable_seed("college_offseason_topup", ty, tid, 3))
+                        cs_3 = _strength_for_entry(ty - 2, seed_tag="topup3")
+                        tmp_new.extend(
+                            generate_players_for_team_class(
+                                rng_3,
+                                college_team_id=tid,
+                                class_year=3,
+                                entry_season_year=ty - 2,
+                                class_strength=cs_3,
+                                count=add3,
+                            )
+                        )
+
+            # (7) Insert new players (single id allocation for collision safety)
             if tmp_new:
                 new_ids = allocate_player_ids(repo, count=len(tmp_new), cur=cur)
                 for pid, p in zip(new_ids, tmp_new):
@@ -739,6 +767,30 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
                             json_dumps(p.attrs),
                         ),
                     )
+
+            # (7.5) Final hard-cap trim AFTER additions (trim lowest OVR first)
+            for tid in team_ids:
+                row = repo._conn.execute(
+                    "SELECT COUNT(*) FROM college_players WHERE status='ACTIVE' AND college_team_id=?;",
+                    (tid,),
+                ).fetchone()
+                total = int(row[0] or 0)
+                if total <= hard_cap:
+                    continue
+                excess = int(total - hard_cap)
+                pid_rows = repo._conn.execute(
+                    """
+                    SELECT player_id
+                    FROM college_players
+                    WHERE status='ACTIVE' AND college_team_id=?
+                    ORDER BY ovr ASC, player_id ASC
+                    LIMIT ?;
+                    """,
+                    (tid, excess),
+                ).fetchall()
+                for (pid,) in pid_rows:
+                    cur.execute("DELETE FROM college_player_season_stats WHERE player_id=?;", (str(pid),))
+                    cur.execute("DELETE FROM college_players WHERE player_id=?;", (str(pid),))
 
             _set_meta(repo, meta_key, "1", cur=cur)
 
