@@ -4,7 +4,7 @@ import random
 from typing import List, Optional, Set, Tuple
 
 from ...errors import TradeError
-from ...models import Deal, PickAsset, SwapAsset, Asset, asset_key, canonicalize_deal
+from ...models import Deal, PickAsset, SwapAsset, Asset, asset_key
 from ...valuation.types import DealVerdict, TeamDealEvaluation
 
 from ..generation_tick import TradeGenerationTickContext
@@ -12,6 +12,7 @@ from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, PickBucketId
 
 from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, DealProposal, RuleFailureKind, parse_trade_error
 from .utils import _clone_deal, _count_swaps, _count_picks, _count_seconds, _team_pick_flow, _is_locked_candidate
+from .dedupe import deal_signature_payload
 from .scoring import evaluate_and_score, _should_discard_prop
 
 # =============================================================================
@@ -151,12 +152,6 @@ def maybe_apply_sweeteners(
     # deterministic shuffle inside same bucket selection
     bucket_order = list(config.sweetener_try_buckets)
 
-    def _deal_sig(d: Deal) -> str:
-        try:
-            return serialize_deal(canonicalize_deal(d))
-        except Exception:
-            return repr(d)
-
     def _receiver_verdict(p: DealProposal) -> DealVerdict:
         return p.buyer_decision.verdict if receiver_u == str(p.buyer_id).upper() else p.seller_decision.verdict
 
@@ -189,7 +184,7 @@ def maybe_apply_sweeteners(
 
         # origin 기반도 항상 포함(이전 commit이 이후 token의 단일 경로를 막지 않게)
         base_deals: List[Deal] = [origin_deal]
-        if cand_limit >= 2 and _deal_sig(current_deal) != _deal_sig(origin_deal):
+        if cand_limit >= 2 and deal_signature_payload(current_deal) != deal_signature_payload(origin_deal):
             base_deals.append(current_deal)
 
         # split candidate width across base_deals
