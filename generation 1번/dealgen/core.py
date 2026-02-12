@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from enum import Enum
 import hashlib
@@ -272,6 +272,7 @@ def _generate_buy_mode(
 
     partner_counts: Dict[str, int] = {}
 
+    target_counts: Dict[str, int] = {}
     # partner diversity
     # - soft penalty는 scoring.score_deal()에서 opponent_repeat_penalty로 이미 처리한다.
     # - hard cap(max_partner_repeats)을 적용하려면, cap 적용 전까지 후보 풀을 넉넉히 유지해야
@@ -280,6 +281,10 @@ def _generate_buy_mode(
     pool_cap = int(max_results)
     if partner_cap > 0:
         pool_cap = max(pool_cap, int(max_results) * max(2, partner_cap))
+
+    # target diversity: target_repeat_penalty가 켜져 있으면 상단이 빨리 채워져도 더 많은 타깃을 보게 pool을 넓힌다.
+    if float(getattr(config, "target_repeat_penalty", 0.0) or 0.0) > 0.0:
+        pool_cap = max(pool_cap, int(max_results) * 2)
 
     max_sweetener_trials_per_base = int(getattr(config, "sweetener_max_trials_per_base", 2))
     max_fit_swap_trials_per_base = int(getattr(config, "fit_swap_max_trials_per_base", 1))
@@ -301,6 +306,8 @@ def _generate_buy_mode(
             break
 
         stats.targets_considered += 1
+
+        target_pid = str(getattr(t, "player_id", "") or "")
 
         seller_id = str(t.from_team).upper()
         if seller_id == buyer_id:
@@ -571,12 +578,22 @@ def _generate_buy_mode(
             if pushed is None:
                 continue
 
+            # (C) target repetition penalty (v2 absorption) - apply only at final push stage
+            if target_pid:
+                pushed = _apply_target_repeat_penalty(
+                    pushed,
+                    target_repeat_count=int(target_counts.get(target_pid, 0)),
+                    cfg=config,
+                )
+
             proposals = _push_best(
                 proposals,
                 pushed,
                 max_results=pool_cap,
             )
             partner_counts[pushed.seller_id] = int(partner_counts.get(pushed.seller_id, 0)) + 1
+            if target_pid:
+                target_counts[target_pid] = int(target_counts.get(target_pid, 0)) + 1
 
     proposals.sort(key=lambda p: p.score, reverse=True)
     proposals = _apply_partner_cap(
@@ -628,11 +645,16 @@ def _generate_sell_mode(
     proposals: List[DealProposal] = []
     partner_counts: Dict[str, int] = {}
 
+    target_counts: Dict[str, int] = {}
     # partner diversity (SELL 모드에서는 'buyer'가 파트너)
     partner_cap = int(getattr(config, "max_partner_repeats", 0) or 0)
     pool_cap = int(max_results)
     if partner_cap > 0:
         pool_cap = max(pool_cap, int(max_results) * max(2, partner_cap))
+
+    # target diversity: target_repeat_penalty가 켜져 있으면 상단이 빨리 채워져도 더 많은 타깃을 보게 pool을 넓힌다.
+    if float(getattr(config, "target_repeat_penalty", 0.0) or 0.0) > 0.0:
+        pool_cap = max(pool_cap, int(max_results) * 2)
 
     max_sweetener_trials_per_base = int(getattr(config, "sweetener_max_trials_per_base", 2))
     max_fit_swap_trials_per_base = int(getattr(config, "fit_swap_max_trials_per_base", 1))
@@ -655,6 +677,8 @@ def _generate_sell_mode(
             break
 
         stats.targets_considered += 1
+
+        target_pid = str(getattr(s, "player_id", "") or "")
 
         buyer_candidates = select_buyers_for_sale_asset(
             seller_id,
@@ -919,8 +943,17 @@ def _generate_sell_mode(
                 if pushed is None:
                     continue
 
+                if target_pid:
+                    pushed = _apply_target_repeat_penalty(
+                        pushed,
+                        target_repeat_count=int(target_counts.get(target_pid, 0)),
+                        cfg=config,
+                    )
+
                 proposals = _push_best(proposals, pushed, max_results=pool_cap)
                 partner_counts[pushed.buyer_id] = int(partner_counts.get(pushed.buyer_id, 0)) + 1
+                if target_pid:
+                    target_counts[target_pid] = int(target_counts.get(target_pid, 0)) + 1
 
 
     proposals.sort(key=lambda p: p.score, reverse=True)
@@ -931,6 +964,25 @@ def _generate_sell_mode(
         cap=partner_cap,
     )
     return proposals
+
+
+def _apply_target_repeat_penalty(
+    prop: DealProposal,
+    *,
+    target_repeat_count: int,
+    cfg: DealGeneratorConfig,
+) -> DealProposal:
+    """동일 타깃 반복 노출 억제용 score 감점(v2 absorption).
+
+    - v1의 sweetener/fit-swap 내부 선택은 base score를 기준으로 진행되므로,
+      여기서는 '최종 push 직전'에만 감점을 적용해 결과 다양성만 유도한다.
+    """
+
+    pen = float(getattr(cfg, "target_repeat_penalty", 0.0) or 0.0)
+    c = int(target_repeat_count or 0)
+    if pen <= 0.0 or c <= 0:
+        return prop
+    return replace(prop, score=float(prop.score) - pen * float(c))
 
 
 def _apply_partner_cap(
