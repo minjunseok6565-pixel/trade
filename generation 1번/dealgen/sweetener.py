@@ -11,7 +11,7 @@ from ..generation_tick import TradeGenerationTickContext
 from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, PickBucketId
 
 from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, DealProposal, RuleFailureKind, parse_trade_error
-from .utils import _clone_deal, _count_swaps, _count_picks, _count_seconds, _team_pick_flow
+from .utils import _clone_deal, _count_swaps, _count_picks, _count_seconds, _team_pick_flow, _is_locked_candidate
 from .scoring import evaluate_and_score, _should_discard_prop
 
 # =============================================================================
@@ -358,23 +358,6 @@ def maybe_apply_sweeteners(
             break
 
     return current_best, extra_v, extra_e
-
-
-def _is_locked_candidate(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
-    """LockInfo precheck.
-
-    - is_locked=True 이고 allow_locked_by_deal_id와 무관하면 잠김.
-    - allow_locked_by_deal_id가 lock.deal_id와 같으면(동일 딜 수정) 잠김으로 보지 않는다.
-    """
-    try:
-        if not bool(getattr(lock, 'is_locked', False)):
-            return False
-        lock_deal = getattr(lock, 'deal_id', None)
-        if allow_locked_by_deal_id and lock_deal and str(lock_deal) == str(allow_locked_by_deal_id):
-            return False
-        return True
-    except Exception:
-        return False
 
 
 def _all_pick_ids_in_deal(deal: Deal, team_id: str) -> Set[str]:
