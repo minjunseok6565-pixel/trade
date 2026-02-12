@@ -320,28 +320,6 @@ def _pick_bucket_player(
     return None
 
 
-def _pick_lowest_market_player(
-    out: TeamOutgoingCatalog,
-    *,
-    buckets: Tuple[BucketId, ...],
-    banned_players: Set[str],
-) -> Optional[str]:
-    """여러 버킷에서 market.total이 가장 낮은 플레이어를 선택(필러용)."""
-
-    best_pid: Optional[str] = None
-    best_mkt = float("inf")
-    for b in buckets:
-        for pid in out.player_ids_by_bucket.get(b, tuple()):
-            if pid in banned_players:
-                continue
-            c = out.players.get(pid)
-            m = float(c.market.total) if c is not None else 0.0
-            if m < best_mkt:
-                best_mkt = m
-                best_pid = pid
-    return best_pid
-
-
 def _split_young_candidates(
     out: TeamOutgoingCatalog,
     *,
@@ -810,30 +788,6 @@ def _pick_from_id_pool_for_need(
     return str(picked[0].player_id) if picked else None
 
 
-def _pick_youngish_player(
-    out: TeamOutgoingCatalog,
-    *,
-    config: DealGeneratorConfig,
-    banned_players: Set[str],
-    receiver_team_id: Optional[str] = None,
-    banned_receivers_by_player: Optional[Dict[str, Set[str]]] = None,
-    must_be_aggregation_friendly: bool = True,
-) -> Optional[str]:
-    """(legacy wrapper) young 후보 1명을 반환.
-    - prospect/throw-in split 로직은 _split_young_candidates가 SSOT.
-    - 이 함수는 기존 호출 호환을 위해 'prospect 우선, 없으면 throw-in'을 반환한다.
-    """
-    prospect_ids, throwin_ids = _split_young_candidates(
-        out,
-        config=config,
-        banned_players=banned_players,
-        receiver_team_id=receiver_team_id,
-        banned_receivers_by_player=banned_receivers_by_player,
-        must_be_aggregation_friendly=must_be_aggregation_friendly,
-    )
-    pool = prospect_ids if prospect_ids else throwin_ids
-    return pool[0] if pool else None
-
 def _pick_filler_player_for_salary(
     out: TeamOutgoingCatalog,
     *,
@@ -949,29 +903,6 @@ def _pick_best_pick_id(out_cat: TeamOutgoingCatalog, *, bucket: PickBucketId, ex
             continue
         return str(pid)
     return None
-
-
-def _pick_pick_id_matching_value(
-    out_cat: TeamOutgoingCatalog,
-    bucket: PickBucketId,
-    *,
-    excluded: Set[str],
-    target_value: float,
-) -> Optional[str]:
-    """bucket 내 pick 중 market.total이 target_value와 가장 가까운 것을 선택."""
-
-    cands = [str(pid) for pid in out_cat.pick_ids_by_bucket.get(bucket, tuple()) if str(pid) not in excluded]
-    if not cands:
-        return None
-
-    # picks dict에는 market 포함
-    def key(pid: str) -> float:
-        p = out_cat.picks.get(pid)
-        mv = float(p.market.total) if p is not None else 0.0
-        return abs(mv - float(target_value))
-
-    cands.sort(key=key)
-    return cands[0]
 
 
 # =============================================================================
