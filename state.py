@@ -341,7 +341,73 @@ def start_new_season(
                 to_season_year=int(target_year),
                 decision_policy=None,
                 draft_pick_order_by_pick_id=draft_pick_order_by_pick_id,
+                settle_draft_picks=False,
             )
+
+            # --- NBA Draft execution (selection + apply)
+            # Guard against double-running the same draft_year.
+            from league_repo import LeagueRepo
+
+            meta_key = f"draft_completed_{draft_year}"
+            with LeagueRepo(db_path) as _repo:
+                _repo.init_db()
+                row = _repo._conn.execute("SELECT value FROM meta WHERE key=?;", (meta_key,)).fetchone()
+                _already_done = bool(row is not None and str(row["value"]) == "1")
+
+            draft_result = {
+                "draft_year": int(draft_year),
+                "completed": False,
+                "skipped": False,
+                "reason": None,
+                "picks_count": 0,
+            }
+
+            if _already_done:
+                draft_result["skipped"] = True
+                draft_result["reason"] = "already_completed"
+            else:
+                from draft.engine import prepare_bundle_from_state, auto_run_draft
+
+                bundle = prepare_bundle_from_state(
+                    state,
+                    rng_seed=int(prev_year) + 100_003,
+                    tie_break_seed=int(prev_year) + 200_017,
+                    use_lottery=True,
+                    settle_db=True,
+                    db_path=db_path,
+                    draft_year=draft_year,
+                    pool_season_year=int(prev_year),
+                    session_meta={"trigger": "start_new_season"},
+                )
+
+                # Fail fast if the pool is smaller than the number of turns (auto_run would crash mid-way).
+                if len(bundle.pool.available_temp_ids) < len(bundle.session.turns):
+                    raise RuntimeError(
+                        f"draft pool too small: available={len(bundle.pool.available_temp_ids)} < turns={len(bundle.session.turns)} "
+                        f"(draft_year={draft_year}). Check college declaration rates or add a pool-fill fallback."
+                    )
+
+                tx_date_iso = str(league.get("current_date") or "")
+                picks = auto_run_draft(
+                    bundle=bundle,
+                    tx_date_iso=(tx_date_iso if tx_date_iso else None),
+                    source="start_new_season",
+                )
+                draft_result["completed"] = True
+                draft_result["picks_count"] = len(picks)
+
+                with LeagueRepo(db_path) as _repo:
+                    _repo.init_db()
+                    _repo._conn.execute(
+                        "INSERT INTO meta(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+                        (meta_key, "1"),
+                    )
+                    _repo._conn.commit()
+
+            if isinstance(offseason_result, dict):
+                offseason_result = dict(offseason_result)
+                offseason_result["draft"] = draft_result
 
             # --- College offseason advance (class_year++ / graduation / freshmen for to_season_year)
             # NOTE: once the NBA draft is executed (college entrants consumed),
