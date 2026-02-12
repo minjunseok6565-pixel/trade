@@ -30,6 +30,15 @@ from playoffs import (
 from news_ai import refresh_playoff_news, refresh_weekly_news
 from stats_util import compute_league_leaders, compute_playoff_league_leaders
 from team_utils import get_conference_standings, get_team_cards, get_team_detail, ui_cache_rebuild_all, ui_cache_refresh_players
+
+from college.ui import (
+    get_college_meta,
+    get_college_team_cards,
+    get_college_team_detail,
+    list_college_players,
+    get_college_player_detail,
+    get_college_draft_pool,
+)
 from season_report_ai import generate_season_report
 from trades.errors import TradeError
 from trades.models import canonicalize_deal, parse_deal, serialize_deal
@@ -298,6 +307,109 @@ async def api_team_detail(team_id: str):
         return get_team_detail(team_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# -------------------------------------------------------------------------
+# College (Read-only / UI) API
+# -------------------------------------------------------------------------
+
+
+@app.get("/api/college/meta")
+async def api_college_meta():
+    try:
+        return get_college_meta()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/college/teams")
+async def api_college_teams(season_year: Optional[int] = None):
+    try:
+        return get_college_team_cards(season_year=season_year)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/college/team-detail/{college_team_id}")
+async def api_college_team_detail(
+    college_team_id: str,
+    season_year: Optional[int] = None,
+    include_attrs: bool = False,
+):
+    try:
+        return get_college_team_detail(
+            college_team_id,
+            season_year=season_year,
+            include_attrs=include_attrs,
+        )
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg)
+
+
+@app.get("/api/college/players")
+async def api_college_players(
+    season_year: Optional[int] = None,
+    status: Optional[str] = None,
+    college_team_id: Optional[str] = None,
+    draft_year: Optional[int] = None,
+    declared_only: bool = False,
+    q: Optional[str] = None,
+    sort: str = "ovr",
+    order: str = "desc",
+    include_attrs: bool = False,
+    include_decision: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+):
+    try:
+        return list_college_players(
+            season_year=season_year,
+            status=status,
+            college_team_id=college_team_id,
+            draft_year=draft_year,
+            declared_only=declared_only,
+            q=q,
+            sort=sort,
+            order=order,
+            include_attrs=include_attrs,
+            include_decision=include_decision,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/college/player/{player_id}")
+async def api_college_player(
+    player_id: str,
+    draft_year: Optional[int] = None,
+    include_stats_history: bool = True,
+):
+    try:
+        return get_college_player_detail(
+            player_id,
+            draft_year=draft_year,
+            include_stats_history=include_stats_history,
+        )
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg)
+
+
+@app.get("/api/college/draft-pool/{draft_year}")
+async def api_college_draft_pool(
+    draft_year: int,
+    season_year: Optional[int] = None,
+    limit: Optional[int] = None,
+):
+    try:
+        return get_college_draft_pool(draft_year, season_year=season_year, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # -------------------------------------------------------------------------
@@ -1058,6 +1170,7 @@ async def state_summary():
 async def debug_schedule_summary():
     """마스터 스케줄 생성/검증용 디버그 엔드포인트."""
     return state.get_schedule_summary()
+
 
 
 
