@@ -9,6 +9,15 @@ from ...models import Deal, canonicalize_deal, serialize_deal
 # Dedupe / misc
 # =============================================================================
 
+def deal_signature_payload(deal: Deal):
+    """Canonical payload used for signature comparisons (includes meta).
+
+    NOTE: sweetener 등에서 '딜이 실제로 변했는지' 비교 용도로 사용.
+    """
+    try:
+        return serialize_deal(canonicalize_deal(deal))
+    except Exception:
+        return repr(deal)
 
 def dedupe_hash(deal: Deal) -> str:
     """Deal identity hash for dedupe.
