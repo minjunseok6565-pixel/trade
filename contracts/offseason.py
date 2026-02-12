@@ -34,11 +34,8 @@ def process_offseason(
     from_season_year: int,
     to_season_year: int,
     decision_policy=None,
-    draft_pick_order_by_pick_id: dict[str, int] | None = None,
 ) -> dict:
 
-
-    from trades.errors import TradeError
     from contracts.options_policy import default_option_decision_policy
 
     # Validate years early (avoid partial writes with invalid inputs).
@@ -80,77 +77,14 @@ def process_offseason(
         # NOTE: UI cache updates are handled outside via state.start_new_season() post-mutation
         # (ui_cache_rebuild_all). Do not mutate legacy game_state["players"] here.
 
-        # 2) (선택) 드래프트 정산 (SSOT)
-        draft_year_to_settle = fy + 1
-
-        pick_order: Optional[Dict[str, int]] = None
-        if isinstance(draft_pick_order_by_pick_id, dict) and draft_pick_order_by_pick_id:
-            pick_order = draft_pick_order_by_pick_id
-        else:
-            orders = game_state.get("draft_pick_orders")
-            if isinstance(orders, dict) and draft_year_to_settle is not None:
-                pick_order_candidate = orders.get(draft_year_to_settle) or orders.get(str(draft_year_to_settle))
-                if isinstance(pick_order_candidate, dict) and pick_order_candidate:
-                    pick_order = pick_order_candidate
-
-        if draft_year_to_settle is None:
-            settlement_result: Dict[str, Any] = {
-                "draft_year": None,
-                "ok": False,
-                "skipped": True,
-                "reason": "invalid_draft_year",
-            }
-        elif not pick_order:
-            settlement_result = {
-                "draft_year": draft_year_to_settle,
-                "ok": False,
-                "skipped": True,
-                "reason": "missing_pick_order",
-            }
-        else:
-            # sanitize pick_order values to int to avoid downstream type surprises
-            pick_order_i: Dict[str, int] = {}
-            for k, v in dict(pick_order).items():
-                try:
-                    pick_order_i[str(k)] = int(v)
-                except (TypeError, ValueError):
-                    _warn_limited(
-                        "PICK_ORDER_INT_COERCE_FAILED",
-                        f"pick_id={k!r} value={v!r}",
-                        limit=3,
-                    )
-                    continue
-            try:
-                events = svc.settle_draft_year(int(draft_year_to_settle), pick_order_i)
-            except TradeError as exc:
-                settlement_result = {
-                    "draft_year": draft_year_to_settle,
-                    "ok": False,
-                    "error": {
-                        "code": exc.code,
-                        "message": exc.message,
-                        "details": exc.details,
-                    },
-                }
-            except Exception as exc:
-                _warn_limited("DRAFT_SETTLEMENT_ERROR", f"draft_year={draft_year_to_settle!r}", limit=3)
-                settlement_result = {
-                    "draft_year": draft_year_to_settle,
-                    "ok": False,
-                    "error": {
-                        "code": "SETTLEMENT_ERROR",
-                        "message": str(exc),
-                        "exc_type": type(exc).__name__,
-                        "details": {},
-                    },
-                }
-            else:
-                settlement_result = {
-                    "draft_year": draft_year_to_settle,
-                    "ok": True,
-                    "events_count": len(events),
-                    "events": events,
-                }
+        # 2) 드래프트 정산(보호/스왑)은 draft 엔진(draft.finalize / draft.engine)에서 수행한다.
+        # contracts.offseason은 계약/옵션 처리만 담당한다.
+        settlement_result: Dict[str, Any] = {
+            "draft_year": int(fy + 1),
+            "ok": False,
+            "skipped": True,
+            "reason": "handled_by_draft_engine",
+        }
 
         svc.repo.validate_integrity()
 
