@@ -103,6 +103,12 @@ class DealGeneratorConfig:
     sweetener_enabled: bool = True
     sweetener_max_additions: int = 2
     sweetener_max_deficit: float = 10.0  # "조금 부족"(margin deficit)만 수리
+    # Sweetener activation window (v2 absorption: scale by receiver's outgoing_total)
+    # corridor = clamp(floor, ratio * max(outgoing_total, 6.0), cap)
+    # effective corridor = min(corridor, sweetener_max_deficit)  # 기존 상한은 안전장치로 존중
+    sweetener_close_corridor_ratio: float = 0.12
+    sweetener_close_floor: float = 0.6
+    sweetener_close_cap: float = 8.0
     sweetener_min_improvement: float = 0.25  # score 또는 margin 개선이 거의 없으면 중단
     sweetener_try_buckets: Tuple[str, ...] = (
         "SECOND",
