@@ -315,24 +315,6 @@ def start_new_season(
                 draft_year=draft_year,
             )
 
-            # --- Draft pick order computation (pick_id -> slot), then pass into offseason settlement.
-            from draft.finalize import compute_plan_from_state
-            plan = compute_plan_from_state(
-                state,
-                draft_year=draft_year,
-                rng_seed=int(prev_year) + 100_003,
-                tie_break_seed=int(prev_year) + 200_017,
-                use_lottery=True,
-            )
-            draft_pick_order_by_pick_id = dict(plan.pick_order_by_pick_id)
-
-            # Cache for UI / fallback readers (contracts.offseason can also read this).
-            orders = state.get("draft_pick_orders")
-            if not isinstance(orders, dict):
-                orders = {}
-                state["draft_pick_orders"] = orders
-            orders[str(draft_year)] = draft_pick_order_by_pick_id
-
             from contracts.offseason import process_offseason
 
             offseason_result = process_offseason(
@@ -340,8 +322,6 @@ def start_new_season(
                 from_season_year=int(prev_year),
                 to_season_year=int(target_year),
                 decision_policy=None,
-                draft_pick_order_by_pick_id=draft_pick_order_by_pick_id,
-                settle_draft_picks=False,
             )
 
             # --- NBA Draft execution (selection + apply)
@@ -379,6 +359,17 @@ def start_new_season(
                     pool_season_year=int(prev_year),
                     session_meta={"trigger": "start_new_season"},
                 )
+
+                # Cache computed pick order for UI / debugging (single source of truth: draft engine plan).
+                orders = state.get("draft_pick_orders")
+                if not isinstance(orders, dict):
+                    orders = {}
+                    state["draft_pick_orders"] = orders
+                try:
+                    orders[str(draft_year)] = dict(bundle.plan.pick_order_by_pick_id)
+                except Exception:
+                    # Non-fatal: draft can proceed without this cache.
+                    pass
 
                 # Fail fast if the pool is smaller than the number of turns (auto_run would crash mid-way).
                 if len(bundle.pool.available_temp_ids) < len(bundle.session.turns):
