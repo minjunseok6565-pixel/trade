@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import random
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ...models import Deal, PlayerAsset, PickAsset, SwapAsset
 from ...valuation.types import DealDecision, TeamDealEvaluation
@@ -18,7 +18,6 @@ from .utils import (
     _get_trade_deadline_date,
     _get_second_apron_threshold,
     _estimate_team_payroll_after_dollars,
-    _cap_space_m,
     _can_absorb_without_outgoing,
 )
 from .dedupe import dedupe_hash
