@@ -108,6 +108,33 @@ class DealGeneratorConfig:
     # fit-swap 카운터에서 허용하는 최대 repair 횟수(최소 수리)
     fit_swap_max_repairs: int = 1
 
+    # --- fit swap horizon-aware scoring (v2 absorption)
+    # receiver(=FIT_FAILS 낸 팀)의 타임라인/포스처 성향에 따라
+    # replacement 후보 랭킹 primary_score를 youth/fit/market_norm 가중합으로 계산한다.
+    # primary_score = w_youth*youth + w_fit*fit + w_market*market_norm
+    #
+    # - REBUILD: youth/years 우선, market은 약하게 감점
+    # - WIN_NOW: fit + market(즉시전력) 우선
+    # - NEUTRAL: 균형
+    #
+    # NOTE: fit_swap.py에서만 사용하며, False면 기존(v1)처럼 fit 중심으로 랭킹한다.
+    fit_swap_use_horizon_weights: bool = True
+
+    # market normalization: market_norm = market_total / divisor
+    fit_swap_market_norm_divisor: float = 50.0
+
+    # youth score shaping:
+    # youth = max(0, age_anchor - age) / age_span  +  min(years_cap, remaining_years) / years_span
+    fit_swap_youth_age_anchor: float = 30.0
+    fit_swap_youth_age_span: float = 10.0
+    fit_swap_youth_years_cap: float = 4.0
+    fit_swap_youth_years_span: float = 4.0
+
+    # weights are (w_youth, w_fit, w_market)
+    fit_swap_weights_rebuild: Tuple[float, float, float] = (0.55, 0.40, -0.05)
+    fit_swap_weights_win_now: Tuple[float, float, float] = (0.05, 0.70, 0.25)
+    fit_swap_weights_neutral: Tuple[float, float, float] = (0.20, 0.60, 0.20)
+
     # --- target selection / incoming pool
     need_tags_max: int = 4
     incoming_pool_per_tag: int = 60
