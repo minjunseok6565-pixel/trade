@@ -19,6 +19,7 @@ from .utils import (
     _get_second_apron_threshold,
     _estimate_team_payroll_after_dollars,
     _can_absorb_without_outgoing,
+    _count_players,
 )
 from .dedupe import dedupe_hash
 from .targets import select_targets_buy, select_targets_sell, select_buyers_for_sale_asset
