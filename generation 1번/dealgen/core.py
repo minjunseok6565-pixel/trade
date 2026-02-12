@@ -14,7 +14,13 @@ from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, build_trade_
 from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, DealProposal, DealCandidate
 from .config import _scale_budget
 from .rng import _compute_seed, _compute_sweetener_seed
-from .utils import _get_trade_deadline_date, _get_second_apron_threshold, _estimate_team_payroll_after_dollars
+from .utils import (
+    _get_trade_deadline_date,
+    _get_second_apron_threshold,
+    _estimate_team_payroll_after_dollars,
+    _cap_space_m,
+    _can_absorb_without_outgoing,
+)
 from .dedupe import dedupe_hash
 from .targets import select_targets_buy, select_targets_sell, select_buyers_for_sale_asset
 from .skeletons import build_offer_skeletons_buy, build_offer_skeletons_sell, expand_variants
@@ -1066,23 +1072,6 @@ def _soft_guard_second_apron_candidates(
 # =============================================================================
 # Beam selection helpers (cheap heuristic pre-score)
 # =============================================================================
-
-
-def _cap_space_m(ts: Any) -> float:
-    """TeamConstraints.cap_space는 달러 단위로 들어오는 경우가 많아서(프로젝트 코드 기준) M 단위로 변환."""
-    try:
-        c = getattr(ts, "constraints", None)
-        v = float(getattr(c, "cap_space", 0.0) or 0.0)
-    except Exception:
-        return 0.0
-    return v / 1_000_000.0
-
-
-def _can_absorb_without_outgoing(ts: Any, incoming_salary_m: float, *, buffer_m: float = 0.25) -> bool:
-    """플레이어를 보내지 않고(incoming only) salary를 흡수 가능한지(=cap space로 커버)."""
-    cap_m = _cap_space_m(ts)
-    return cap_m >= float(incoming_salary_m) + float(buffer_m)
-
 
 def _sum_leg_player_salary_m(
     deal: Deal, *, team_id: str, out_cat: Optional[TeamOutgoingCatalog]
