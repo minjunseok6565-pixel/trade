@@ -6,7 +6,7 @@ import random
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ...models import Deal, PlayerAsset, PickAsset, SwapAsset
-from ...valuation.types import DealDecision, DealVerdict, TeamDealEvaluation
+from ...valuation.types import DealDecision, TeamDealEvaluation
 
 from ..generation_tick import TradeGenerationTickContext
 from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, build_trade_asset_catalog
