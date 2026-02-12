@@ -1,53 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import date
-from enum import Enum
-import hashlib
-import json
-import math
+from dataclasses import replace
 import random
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from ...errors import (
-    TradeError,
-    DEAL_INVALIDATED,
-    ROSTER_LIMIT,
-    ASSET_LOCKED,
-    PLAYER_NOT_OWNED,
-    PICK_NOT_OWNED,
-    SWAP_NOT_OWNED,
-    TRADE_DEADLINE_PASSED,
-    DUPLICATE_ASSET,
-)
-from ...models import (
-    Deal,
-    PlayerAsset,
-    PickAsset,
-    SwapAsset,
-    Asset,
-    asset_key,
-    canonicalize_deal,
-    serialize_deal,
-    resolve_asset_receiver,
-)
-from ...valuation.service import evaluate_deal_for_team
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from ...models import Deal, PlayerAsset, PickAsset, SwapAsset
 from ...valuation.types import DealDecision, DealVerdict, TeamDealEvaluation
 
 from ..generation_tick import TradeGenerationTickContext
-from ..asset_catalog import (
-    TradeAssetCatalog,
-    IncomingPlayerRef,
-    TeamOutgoingCatalog,
-    PlayerTradeCandidate,
-    PickTradeCandidate,
-    SwapTradeCandidate,
-    PickBucketId,
-    BucketId,
-    build_trade_asset_catalog,
-)
+from ..asset_catalog import TradeAssetCatalog, TeamOutgoingCatalog, build_trade_asset_catalog
 
-from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, DealProposal, DealCandidate, TargetCandidate, SellAssetCandidate
+from .types import DealGeneratorConfig, DealGeneratorBudget, DealGeneratorStats, DealProposal, DealCandidate
 from .config import _scale_budget
 from .rng import _compute_seed, _compute_sweetener_seed
 from .utils import _get_trade_deadline_date, _get_second_apron_threshold, _estimate_team_payroll_after_dollars
