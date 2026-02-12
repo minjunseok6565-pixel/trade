@@ -397,49 +397,6 @@ def maybe_apply_sweeteners(
     return current_best, extra_v, extra_e
 
 
-def _try_add_one_sweetener(
-    deal: Deal,
-    *,
-    giver_team: str,
-    receiver_team: str,
-    out_cat: TeamOutgoingCatalog,
-    catalog: TradeAssetCatalog,
-    config: DealGeneratorConfig,
-    target_value: float,
-    bucket: str,
-    banned_asset_keys: Set[str],
-    rng: random.Random,
-) -> bool:
-    """(Deprecated) deal에 sweetener 1개를 추가(성공 시 deal mutate).
-
-    NOTE
-    - v2-style sweetener loop에서는 후보를 여러 개 수집한 뒤 best-of-N으로 평가한다.
-    - 이 함수는 이전 구현과의 호환을 위해 남겨두되, 내부는 후보 수집 후 1개만 적용한다.
-
-    """
-
-    cands = _collect_sweetener_candidates(
-        deal,
-        giver_team=str(giver_team).upper(),
-        receiver_team=str(receiver_team).upper(),
-        out_cat=out_cat,
-        catalog=catalog,
-        config=config,
-        target_value=float(target_value),
-        bucket=str(bucket),
-        banned_asset_keys=set(banned_asset_keys),
-        rng=rng,
-        limit=1,
-        allow_locked_by_deal_id=None,
-    )
-    if not cands:
-        return False
-
-    deal.legs.setdefault(str(giver_team).upper(), [])
-    deal.legs[str(giver_team).upper()].append(cands[0])
-    return True
-
-
 def _is_locked_candidate(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
     """LockInfo precheck.
 
@@ -587,17 +544,6 @@ def _collect_sweetener_candidates(
             break
 
     return out
-
-
-def _rollback_last_asset_from_leg(deal: Deal, team_id: str) -> None:
-    tid = str(team_id).upper()
-    leg = deal.legs.get(tid)
-    if not leg:
-        return
-    try:
-        leg.pop()
-    except Exception:
-        return
 
 
 def _asset_in_deal(deal: Deal, asset: Asset) -> bool:
