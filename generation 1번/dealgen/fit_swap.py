@@ -169,6 +169,116 @@ def _pick_replacement_pool(
     return pool
 
 
+def _team_posture(ts: Any) -> str:
+    return str(getattr(ts, "trade_posture", "") or "").upper()
+
+
+def _team_time_horizon(ts: Any) -> str:
+    return str(getattr(ts, "time_horizon", "") or "").upper()
+
+
+def _team_competitive_tier(ts: Any) -> str:
+    return str(getattr(ts, "competitive_tier", "") or "").upper()
+
+
+def _fit_swap_mode_for_receiver(ts: Any) -> str:
+    """Return one of: 'REBUILD', 'WIN_NOW', 'NEUTRAL'."""
+    if ts is None:
+        return "NEUTRAL"
+
+    horizon = _team_time_horizon(ts)
+    posture = _team_posture(ts)
+    tier = _team_competitive_tier(ts)
+
+    rebuild_like = (
+        horizon in {"REBUILD", "RE_TOOL", "RETOOL"}
+        or tier in {"REBUILD", "RESET", "TANK"}
+    )
+    win_now_like = (
+        horizon in {"WIN_NOW", "CONTEND", "COMPETE"}
+        or posture in {"AGGRESSIVE_BUY", "SOFT_BUY"}
+        or tier in {"CONTENDER", "PLAYOFF_BUYER"}
+    )
+
+    if rebuild_like:
+        return "REBUILD"
+    if win_now_like:
+        return "WIN_NOW"
+    return "NEUTRAL"
+
+
+def _fit_swap_youth_score(c: PlayerTradeCandidate, cfg: DealGeneratorConfig) -> float:
+    """
+    youth = max(0, age_anchor - age) / age_span  +  min(years_cap, remaining_years) / years_span
+    (v2 absorption; parameters configurable in DealGeneratorConfig)
+    """
+    age = None
+    try:
+        snap = getattr(c, "snap", None)
+        if snap is not None and getattr(snap, "age", None) is not None:
+            age = float(getattr(snap, "age"))
+    except Exception:
+        age = None
+
+    try:
+        ry = float(getattr(c, "remaining_years", 0.0) or 0.0)
+    except Exception:
+        ry = 0.0
+
+    age_anchor = float(getattr(cfg, "fit_swap_youth_age_anchor", 30.0) or 30.0)
+    age_span = float(getattr(cfg, "fit_swap_youth_age_span", 10.0) or 10.0)
+    years_cap = float(getattr(cfg, "fit_swap_youth_years_cap", 4.0) or 4.0)
+    years_span = float(getattr(cfg, "fit_swap_youth_years_span", 4.0) or 4.0)
+
+    youth = 0.0
+    if age is not None and age_span > 0:
+        youth += max(0.0, age_anchor - float(age)) / age_span
+    if years_span > 0:
+        youth += min(years_cap, max(0.0, float(ry))) / years_span
+    return float(youth)
+
+
+def _fit_swap_primary_score(
+    c: PlayerTradeCandidate,
+    *,
+    fit: float,
+    mode: str,
+    cfg: DealGeneratorConfig,
+) -> float:
+    """
+    primary_score = w_youth*youth + w_fit*fit + w_market*market_norm
+    - if fit_swap_use_horizon_weights is False, fall back to fit-only ranking (v1 behavior)
+    """
+    if not bool(getattr(cfg, "fit_swap_use_horizon_weights", True)):
+        return float(fit)
+
+    market_total = 0.0
+    try:
+        market_total = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+    except Exception:
+        market_total = 0.0
+
+    div = float(getattr(cfg, "fit_swap_market_norm_divisor", 50.0) or 50.0)
+    market_norm = (market_total / div) if div > 0 else market_total
+
+    youth = _fit_swap_youth_score(c, cfg)
+
+    mm = str(mode).upper()
+    if mm == "REBUILD":
+        w = getattr(cfg, "fit_swap_weights_rebuild", (0.55, 0.40, -0.05))
+    elif mm == "WIN_NOW":
+        w = getattr(cfg, "fit_swap_weights_win_now", (0.05, 0.70, 0.25))
+    else:
+        w = getattr(cfg, "fit_swap_weights_neutral", (0.20, 0.60, 0.20))
+
+    try:
+        wy, wf, wm = float(w[0]), float(w[1]), float(w[2])
+    except Exception:
+        wy, wf, wm = 0.20, 0.60, 0.20
+
+    return float(wy * youth + wf * float(fit) + wm * float(market_norm))
+
+
 def maybe_apply_fit_swap(
     base_prop: DealProposal,
     *,
@@ -219,6 +329,14 @@ def maybe_apply_fit_swap(
     receiver_need_map = _team_need_map(tick_ctx, receiver_id)
     if not receiver_need_map:
         return None
+
+    # receiver(=FIT_FAILS 낸 팀)의 타임라인/포스처 기반 선호 모드 (v2 absorption)
+    receiver_ts = None
+    try:
+        receiver_ts = tick_ctx.get_team_situation(receiver_id)
+    except Exception:
+        receiver_ts = None
+    fit_swap_mode = _fit_swap_mode_for_receiver(receiver_ts)
 
     giver_out = catalog.outgoing_by_team.get(giver_id)
     if giver_out is None:
@@ -301,7 +419,9 @@ def maybe_apply_fit_swap(
     max_salary_diff = float(getattr(config, "fit_swap_max_salary_diff_m", 3.5) or 3.5)
     min_improve = float(getattr(config, "fit_swap_min_fit_improvement", 0.03) or 0.03)
 
-    # 후보 랭킹: fit 개선 + salary 근접 + market 급변 억제
+    # 후보 랭킹:
+    # - (유지) 최소 fit 개선 + salary diff 제한 + market 급변 억제
+    # - (추가) receiver 타임라인/포스처에 따라 youth/fit/market 가중치로 primary_score를 계산 (v2 absorption)
     ranked: list[Tuple[float, float, float, str, float]] = []
     for c in pool:
         new_fit = _need_fit_score(getattr(c, "supply", None) or {}, receiver_need_map)
@@ -310,9 +430,17 @@ def maybe_apply_fit_swap(
         sal = float(getattr(c, "salary_m", 0.0) or 0.0)
         if abs(sal - float(worst_salary)) > max_salary_diff:
             continue
-        mkt = float(getattr(c.market, "total", 0.0) or 0.0)
-        # primary desc, salary diff asc, market diff asc
-        ranked.append((float(new_fit), abs(sal - float(worst_salary)), abs(mkt - float(worst_market)), str(c.player_id), float(new_fit)))
+        mkt = float(getattr(getattr(c, "market", None), "total", 0.0) or 0.0)
+
+        primary = _fit_swap_primary_score(
+            c,
+            fit=float(new_fit),
+            mode=str(fit_swap_mode).upper(),
+            cfg=config,
+        )
+
+        # primary desc, salary diff asc, market diff asc, pid asc
+        ranked.append((float(primary), abs(sal - float(worst_salary)), abs(mkt - float(worst_market)), str(c.player_id), float(new_fit)))
 
     if not ranked:
         return None
@@ -355,7 +483,7 @@ def maybe_apply_fit_swap(
             seller_id=seller_id,
             focal_player_id=str(protected_player_id) if protected_player_id else "",
             archetype="fit_swap",
-            tags=list(base_prop.tags) + ["counter:fit_swap"],
+            tags=list(base_prop.tags) + ["counter:fit_swap", f"fit_swap_mode:{str(fit_swap_mode).lower()}"],
             repairs_used=0,
         )
 
