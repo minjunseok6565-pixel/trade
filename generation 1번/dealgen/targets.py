@@ -8,6 +8,7 @@ from ..generation_tick import TradeGenerationTickContext
 from ..asset_catalog import TradeAssetCatalog, IncomingPlayerRef, TeamOutgoingCatalog
 
 from .types import DealGeneratorConfig, DealGeneratorBudget, TargetCandidate, SellAssetCandidate
+from .utils import _is_locked_candidate
 
 
 # =============================================================================
@@ -316,23 +317,6 @@ def _is_ban_active(current_date: date, until_iso: Optional[str]) -> bool:
     """until_iso(YYYY-MM-DD)가 현재 날짜 기준으로 아직 남아있으면 True."""
     d = _parse_iso_ymd(until_iso)
     return bool(d is not None and current_date < d)
-
-
-def _is_locked_candidate(lock: Any, *, allow_locked_by_deal_id: Optional[str]) -> bool:
-    """LockInfo precheck (v2와 동일 정책).
-
-    - is_locked=True 이고 allow_locked_by_deal_id와 무관하면 잠김.
-    - allow_locked_by_deal_id가 lock.deal_id와 같으면(동일 딜 수정) 잠김으로 보지 않는다.
-    """
-    try:
-        if not bool(getattr(lock, "is_locked", False)):
-            return False
-        lock_deal = getattr(lock, "deal_id", None)
-        if allow_locked_by_deal_id and lock_deal and str(lock_deal) == str(allow_locked_by_deal_id):
-            return False
-        return True
-    except Exception:
-        return False
 
 
 def _is_seller_willing_to_move_player(player_id: str, seller_out: TeamOutgoingCatalog) -> bool:
