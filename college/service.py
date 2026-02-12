@@ -501,7 +501,7 @@ def finalize_season_and_generate_entries(db_path: str, season_year: int, draft_y
 def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) -> None:
     """
     Advance college world from from_season_year -> to_season_year:
-    - Increment class_year
+    - Increment class_year (+ age)
     - Graduate/remove players beyond 4
     - Reset DECLARED -> ACTIVE (undrafted return-to-school model; can be expanded later)
     - Generate freshmen for to_season_year and insert
@@ -523,7 +523,7 @@ def advance_offseason(db_path: str, from_season_year: int, to_season_year: int) 
         # First increment class_year for all ACTIVE
         with repo.transaction() as cur:
             cur.execute(
-                "UPDATE college_players SET class_year = class_year + 1 WHERE status='ACTIVE';"
+                "UPDATE college_players SET class_year = class_year + 1, age = age + 1 WHERE status='ACTIVE';"
             )
 
         # Remove those now beyond 4 (graduated)
