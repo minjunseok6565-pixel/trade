@@ -14,6 +14,7 @@ MVP focus:
 """
 
 import datetime as _dt
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -23,6 +24,51 @@ from .pool import DraftPool, Prospect, load_pool_from_db
 from .session import DraftSession, DraftPick
 from .ai import DraftAIPolicy, DraftAIContext, BPAByOVRPolicy
 from .apply import apply_pick_to_db, RookieContractPolicy, SimpleRookieScalePolicy
+
+
+def _fetch_applied_draft_results(*, db_path: str, draft_year: int) -> List[Dict[str, Any]]:
+    """Load applied draft results (SSOT) for resume/idempotency.
+
+    Returns rows ordered by overall_no. If draft_results doesn't exist yet, returns [].
+    """
+    # Local import to avoid heavier deps / potential cycles at module import time.
+    from league_repo import LeagueRepo
+
+    sql = """
+    SELECT
+      pick_id,
+      overall_no,
+      drafting_team,
+      prospect_temp_id,
+      player_id,
+      contract_id
+    FROM draft_results
+    WHERE draft_year = ?
+    ORDER BY overall_no ASC;
+    """.strip()
+
+    with LeagueRepo(str(db_path)) as repo:
+        repo.init_db()
+        try:
+            rows = repo._conn.execute(sql, (int(draft_year),)).fetchall()
+        except sqlite3.OperationalError:
+            # Backward-compat: older DBs may not have draft_results yet.
+            return []
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            out.append(dict(r))
+        except Exception:
+            # Extremely defensive fallback
+            d: Dict[str, Any] = {}
+            try:
+                for k in getattr(r, "keys", lambda: [])():
+                    d[str(k)] = r[k]
+            except Exception:
+                d = {}
+            out.append(d)
+    return out
 
 
 def _today_iso() -> str:
@@ -101,6 +147,8 @@ def prepare_bundle_from_state(
     settlement_events = list(finalized.get("settlement_events") or [])
 
     # Pool + session
+    # NOTE: resume/idempotency is handled after pool/session creation by consulting
+    # draft_results (applied SSOT).
     pool = load_pool_from_db(
         db_path=dbp,
         draft_year=int(plan.draft_year),
@@ -115,6 +163,67 @@ def prepare_bundle_from_state(
         picks_by_turn_index={},
         meta=dict(session_meta or {}),
     )
+
+    # Resume safety: mark already-applied picks/prospects from SSOT and advance cursor.
+    applied_rows = _fetch_applied_draft_results(db_path=dbp, draft_year=int(plan.draft_year))
+    applied_pick_ids: List[str] = []
+    if applied_rows:
+        idx_by_overall = {int(t.overall_no): i for i, t in enumerate(turns)}
+        applied_set = set()
+
+        for row in applied_rows:
+            try:
+                overall_no = int(row.get("overall_no") or 0)
+            except Exception:
+                overall_no = 0
+            idx = idx_by_overall.get(int(overall_no))
+            if idx is None:
+                raise RuntimeError(
+                    f"draft_results has overall_no not present in turns: overall_no={overall_no} draft_year={plan.draft_year}"
+                )
+            turn = turns[int(idx)]
+
+            pick_id_db = str(row.get("pick_id") or "")
+            drafting_team_db = norm_team_id(row.get("drafting_team") or "")
+            if pick_id_db and str(turn.pick_id) != pick_id_db:
+                raise RuntimeError(
+                    "draft resume mismatch (pick_id): "
+                    f"overall_no={overall_no} db={pick_id_db!r} plan={turn.pick_id!r}"
+                )
+            if drafting_team_db and drafting_team_db != norm_team_id(turn.drafting_team):
+                raise RuntimeError(
+                    "draft resume mismatch (drafting_team): "
+                    f"overall_no={overall_no} db={drafting_team_db!r} plan={turn.drafting_team!r}"
+                )
+
+            prospect_temp_id = str(row.get("prospect_temp_id") or "")
+            player_id = str(row.get("player_id") or "")
+            contract_id = str(row.get("contract_id") or "")
+
+            # Ensure already-applied prospect cannot be selected again.
+            if prospect_temp_id and session.pool.is_available(prospect_temp_id):
+                session.pool.mark_picked(prospect_temp_id)
+
+            # Populate pick history from DB (useful for debugging / stable session state).
+            session.picks_by_turn_index[int(idx)] = DraftPick(
+                overall_no=int(turn.overall_no),
+                round=int(turn.round),
+                slot=int(turn.slot),
+                pick_id=str(turn.pick_id),
+                drafting_team=turn.drafting_team,
+                prospect_temp_id=prospect_temp_id,
+                player_id=player_id or None,
+                contract_id=contract_id or None,
+                meta={"resumed_from_db": True},
+            )
+
+            applied_set.add(str(turn.pick_id))
+
+        # Advance cursor across the already-applied prefix.
+        while not session.is_complete() and str(session.current_turn().pick_id) in applied_set:
+            session.cursor += 1
+
+        applied_pick_ids = sorted(applied_set)
 
     bundle = DraftEngineBundle(
         draft_year=int(plan.draft_year),
@@ -132,6 +241,9 @@ def prepare_bundle_from_state(
             "pool_season_year": int(pool_season_year) if pool_season_year is not None else None,
             "use_lottery": bool(use_lottery),
             "settle_db": bool(settle_db),
+            "applied_pick_ids": list(applied_pick_ids),
+            "applied_picks_count": int(len(applied_pick_ids)),
+            "resume_cursor": int(session.cursor),
         },
     )
     return bundle
@@ -232,9 +344,22 @@ def auto_run_draft(
     picks: List[DraftPick] = []
     limit = int(max_picks) if max_picks is not None else None
 
+    # Local working set for already-applied pick_ids (resume safety).
+    try:
+        applied_ids = set(bundle.meta.get("applied_pick_ids") or [])
+    except Exception:
+        applied_ids = set()
+
     while not sess.is_complete():
         if limit is not None and len(picks) >= limit:
             break
+
+        # Skip turns that are already applied (e.g., after a crash/re-run).
+        while not sess.is_complete() and str(sess.current_turn().pick_id) in applied_ids:
+            sess.cursor += 1
+        if sess.is_complete():
+            break
+
         tid = choose_ai_pick(policy=pol, session=sess)
         dp = apply_pick_and_record(
             bundle=bundle,
@@ -245,6 +370,7 @@ def auto_run_draft(
             source=str(source),
         )
         picks.append(dp)
+        applied_ids.add(str(dp.pick_id))
 
     return picks
 

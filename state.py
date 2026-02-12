@@ -371,11 +371,14 @@ def start_new_season(
                     # Non-fatal: draft can proceed without this cache.
                     pass
 
-                # Fail fast if the pool is smaller than the number of turns (auto_run would crash mid-way).
-                if len(bundle.pool.available_temp_ids) < len(bundle.session.turns):
+                # Fail fast if the pool is smaller than the number of remaining turns (auto_run would crash mid-way).
+                # NOTE: bundle.session.cursor may be advanced when resuming from applied draft_results.
+                remaining_turns = max(0, len(bundle.session.turns) - int(bundle.session.cursor))
+                if len(bundle.pool.available_temp_ids) < remaining_turns:
                     raise RuntimeError(
-                        f"draft pool too small: available={len(bundle.pool.available_temp_ids)} < turns={len(bundle.session.turns)} "
-                        f"(draft_year={draft_year}). Check college declaration rates or add a pool-fill fallback."
+                        f"draft pool too small: available={len(bundle.pool.available_temp_ids)} < remaining_turns={remaining_turns} "
+                        f"(draft_year={draft_year}, cursor={int(bundle.session.cursor)}). "
+                        f"Check college declaration rates or add a pool-fill fallback."
                     )
 
                 tx_date_iso = str(league.get("current_date") or "")
